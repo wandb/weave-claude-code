@@ -1,0 +1,38 @@
+{
+  "name": "weave-claude-plugin",
+  "version": "0.1.0",
+  "description": "Track Claude Code sessions in Weave for observability and debugging",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "weave-claude-plugin": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "uuidv7": "^0.6.3",
+    "weave": "^0.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "files": [
+    "dist/",
+    "hooks/",
+    "skills/",
+    ".claude-plugin/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/weave-claude-plugin"
+  },
+  "license": "MIT"
+}

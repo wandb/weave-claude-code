@@ -1,0 +1,15 @@
+# Claude Code local settings (machine-specific, may contain secrets)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# TypeScript build output
+dist/
+
+# Logs
+*.log
+weaveErrors.log
