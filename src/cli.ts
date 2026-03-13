@@ -18,6 +18,7 @@ import {
   type Settings,
 } from './setup.js';
 import { prompt, sendToSocket } from './utils.js';
+import { runDaemon } from './daemon.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -114,8 +115,6 @@ async function cmdConfig(args: string[]): Promise<void> {
         : 'not set';
 
     console.log('Current configuration:');
-    console.log(`  node_path:     ${settings.node_path}`);
-    console.log(`  cli_path:      ${settings.cli_path}`);
     console.log(`  log_file:      ${settings.log_file}`);
     console.log(`  daemon_socket: ${settings.daemon_socket}`);
     console.log(`  weave_project: ${effectiveProject ?? '(not set)'} [${projectSource}]`);
@@ -214,13 +213,13 @@ async function cmdStatus(): Promise<void> {
 
   console.log(`✓ Configuration: ${SETTINGS_FILE}`);
 
-  // Check node binary
-  if (fs.existsSync(settings.node_path)) {
-    const result = spawnSync(settings.node_path, ['--version'], { encoding: 'utf8' });
-    const version = result.stdout?.trim() ?? '';
-    console.log(`✓ Node.js runtime: ${settings.node_path} (${version})`);
+  // Check weave-claude-plugin is on PATH
+  const whichResult = spawnSync('which', ['weave-claude-plugin'], { encoding: 'utf8' });
+  if (whichResult.status === 0 && whichResult.stdout.trim()) {
+    console.log(`✓ CLI: ${whichResult.stdout.trim()}`);
   } else {
-    console.log(`✗ Node.js runtime: not found at ${settings.node_path}`);
+    console.log('✗ CLI: weave-claude-plugin not found in PATH');
+    console.log('  Run: npm install -g weave-claude-plugin');
   }
 
   // Check weave_project
@@ -315,7 +314,7 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
       // Settings may be corrupt — continue with cleanup
     }
 
-    const socketPath = settings?.daemon_socket ?? '/tmp/weave-claude-daemon.sock';
+    const socketPath = settings?.daemon_socket ?? path.join(CONFIG_DIR, 'daemon.sock');
 
     if (fs.existsSync(socketPath)) {
       try {
@@ -413,9 +412,8 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'daemon') {
-    // Implemented in PR 3
-    console.error('Daemon not yet implemented. Coming in PR 3.');
-    process.exit(1);
+    await runDaemon(args.slice(1));
+    return;
   }
 
   console.error(`Unknown command: ${cmd}\nRun 'weave-claude-plugin --help' for usage.`);
