@@ -36,13 +36,21 @@ function buildSession(lines: unknown[]): ParsedSession {
   for (const line of lines) {
     const l = line as Record<string, unknown>;
     const msg = l['message'] as Record<string, unknown> | undefined;
-    const role = msg?.['role'] ?? l['type'];
+    const type = l['type'] as string | undefined;
+    const role = (msg?.['role'] as string | undefined) ?? type;
 
     if (role === 'assistant') {
       currentAssistantMsgs.push(line);
-    } else if (role === 'human' && currentAssistantMsgs.length > 0) {
-      turns.push(buildTurn(currentAssistantMsgs));
-      currentAssistantMsgs = [];
+    } else if (role === 'user') {
+      const rawContent = msg?.['content'];
+      const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
+
+      // A user message with text content marks the end of the previous turn.
+      const hasText = typeof rawContent === 'string' || content.some(b => b['type'] === 'text');
+      if (hasText && currentAssistantMsgs.length > 0) {
+        turns.push(buildTurn(currentAssistantMsgs));
+        currentAssistantMsgs = [];
+      }
     }
   }
 
