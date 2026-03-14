@@ -44,7 +44,7 @@ export function findClaudeCLI(): string | null {
 /**
  * Append a timestamped log line to logFile. Best-effort — never throws.
  */
-export function appendToLog(logFile: string, level: 'INFO' | 'WARN' | 'ERROR', message: string): void {
+export function appendToLog(logFile: string, level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR', message: string): void {
   const line = `${new Date().toISOString()} | ${level} | ${message}\n`;
   try {
     fs.mkdirSync(path.dirname(logFile), { recursive: true });

@@ -8,7 +8,7 @@ export interface Settings {
   log_file: string;
   weave_project: string | null;
   wandb_api_key: string | null;
-  debug?: boolean;
+  debug: boolean;
   installed_at: string;
   version: string;
   daemon_socket: string;
@@ -67,6 +67,7 @@ export function createConfig(configDir: string): ConfigResult {
     log_file: logFile,
     weave_project: null,
     wandb_api_key: null,
+    debug: false,
     installed_at: new Date().toISOString(),
     version: VERSION,
     daemon_socket: path.join(configDir, 'daemon.sock'),
