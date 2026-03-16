@@ -5,7 +5,7 @@ import * as path from 'path';
 import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
-import { appendToLog } from './utils.js';
+import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFile } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +32,9 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
 interface PendingToolCall {
   weaveCallId: string;
   toolName: string;
+  toolInput: Record<string, unknown>;
+  permissionWeaveCallId?: string;   // set when PermissionRequest fires; closed in Post/PostFailure
+  permissionStartedAt?: string;     // same value used as ended_at — zero-duration, tool execution time is not permission decision time
 }
 
 /**
@@ -193,6 +196,9 @@ export class GlobalDaemon {
         case 'PreToolUse':
           await this.handlePreToolUse(sessionId, agentId, payload);
           break;
+        case 'PermissionRequest':
+          await this.handlePermissionRequest(sessionId, payload);
+          break;
         case 'PostToolUse':
           await this.handlePostToolUse(sessionId, payload);
           break;
@@ -314,7 +320,7 @@ export class GlobalDaemon {
       : (session.currentTurnCallId ?? null);
 
     const weaveCallId = uuidv7();
-    session.pendingToolCalls.set(toolUseId, { weaveCallId, toolName });
+    session.pendingToolCalls.set(toolUseId, { weaveCallId, toolName, toolInput });
 
     this.weaveClient.saveCallStart({
       project_id: this.weaveClient.projectId,
@@ -342,6 +348,51 @@ export class GlobalDaemon {
     }
   }
 
+  private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.weaveClient) return;
+
+    const toolName = payload['tool_name'] as string | undefined;
+    if (!toolName) return;
+
+    // Correlate to a pending tool call by tool_name + tool_input so we can close the
+    // permission call with the approval outcome in PostToolUse / PostToolUseFailure.
+    let pending: PendingToolCall | undefined;
+    for (const call of session.pendingToolCalls.values()) {
+      if (call.toolName === toolName && !call.permissionWeaveCallId && deepEqual(call.toolInput, payload['tool_input'])) {
+        pending = call;
+        break;
+      }
+    }
+    if (!pending) {
+      this.log('DEBUG', `PermissionRequest: no pending tool call for tool_name=${toolName}`);
+      return;
+    }
+
+    const permCallId = uuidv7();
+    const permStartedAt = new Date().toISOString();
+    pending.permissionWeaveCallId = permCallId;
+    pending.permissionStartedAt = permStartedAt;
+
+    this.weaveClient.saveCallStart({
+      project_id: this.weaveClient.projectId,
+      id: permCallId,
+      op_name: 'claude_code.permission_request',
+      trace_id: session.traceId,
+      parent_id: pending.weaveCallId,
+      started_at: permStartedAt,
+      display_name: `Permission: ${toolName}`,
+      inputs: {
+        tool_name: toolName,
+        tool_input: payload['tool_input'],
+        permission_suggestions: payload['permission_suggestions'],
+      },
+      attributes: { kind: 'tool' },
+    });
+
+    this.log('DEBUG', `Permission request for ${toolName}`);
+  }
+
   private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.weaveClient) return;
@@ -352,10 +403,22 @@ export class GlobalDaemon {
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
+    const now = new Date().toISOString();
+
+    if (pending.permissionWeaveCallId) {
+      this.weaveClient.saveCallEnd({
+        project_id: this.weaveClient.projectId,
+        id: pending.permissionWeaveCallId,
+        ended_at: pending.permissionStartedAt!,
+        output: { approved: true },
+        summary: {},
+      });
+    }
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: pending.weaveCallId,
-      ended_at: new Date().toISOString(),
+      ended_at: now,
       output: { result: payload['tool_response'] },
       summary: {},
     });
@@ -375,10 +438,22 @@ export class GlobalDaemon {
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
+    const now = new Date().toISOString();
+
+    if (pending.permissionWeaveCallId) {
+      this.weaveClient.saveCallEnd({
+        project_id: this.weaveClient.projectId,
+        id: pending.permissionWeaveCallId,
+        ended_at: pending.permissionStartedAt!,
+        output: { approved: false },
+        summary: {},
+      });
+    }
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: pending.weaveCallId,
-      ended_at: new Date().toISOString(),
+      ended_at: now,
       output: { error: payload['error'] ?? payload['tool_response'] },
       summary: { is_error: true },
     });
