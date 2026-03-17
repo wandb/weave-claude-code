@@ -84,6 +84,7 @@ export class GlobalDaemon {
   private running = false;
   private lastActivity = Date.now();
   private sessions = new Map<string, SessionState>();
+  private sessionQueues = new Map<string, Promise<void>>();
   private weaveClient: WeaveClient | null = null;
 
   constructor(
@@ -162,7 +163,13 @@ export class GlobalDaemon {
         return;
       }
 
-      void this.routeEvent(payload as HookPayload);
+      const hookPayload = payload as HookPayload;
+      const sessionId = hookPayload['session_id'] as string | undefined;
+      if (sessionId) {
+        this.enqueueForSession(sessionId, () => this.routeEvent(hookPayload));
+      } else {
+        void this.routeEvent(hookPayload);
+      }
     });
 
     socket.on('error', (err: Error) => {
@@ -553,8 +560,9 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurnCallId || !this.weaveClient) return;
 
-    // Parse transcript for usage + model (not available in hook payloads)
-    const parsedSession = parseSessionFile(session.transcriptPath);
+    // Parse transcript for usage + model (not available in hook payloads).
+    // Retry up to 3 times — the file may still be flushing when Stop fires.
+    const parsedSession = await this.parseSessionFileWithRetry(session.transcriptPath);
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
     const usage = currentTurn?.totalUsage();
     const model = currentTurn?.primaryModel();
@@ -593,6 +601,7 @@ export class GlobalDaemon {
     }
 
     this.sessions.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -648,6 +657,29 @@ export class GlobalDaemon {
         return first ? `${toolName}: ${GlobalDaemon.promptSnippet(first, 60)}` : toolName;
       }
     }
+  }
+
+  /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
+   *  The transcript file may still be flushing when Stop fires. */
+  private async parseSessionFileWithRetry(
+    transcriptPath: string,
+    attempts = 3,
+    delayMs = 500,
+  ): Promise<ReturnType<typeof parseSessionFile>> {
+    for (let i = 0; i < attempts; i++) {
+      const result = parseSessionFile(transcriptPath);
+      if (result?.turns.length) return result;
+      if (i < attempts - 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return parseSessionFile(transcriptPath);
+  }
+
+  private enqueueForSession(sessionId: string, fn: () => Promise<void>): void {
+    const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(fn).catch((err) => this.log('ERROR', `Queue error for session ${sessionId}: ${err}`));
+    this.sessionQueues.set(sessionId, next);
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
