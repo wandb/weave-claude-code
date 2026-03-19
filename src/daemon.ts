@@ -221,7 +221,7 @@ export class GlobalDaemon {
         trace_id: session.traceId,
         parent_id: null,
         started_at: new Date().toISOString(),
-        display_name: 'Claude Session',
+        display_name: `Claude Code: ${GlobalDaemon.promptSnippet(prompt)}`,
         inputs: { prompt },
         attributes: {
           session_id: session.sessionId,
@@ -244,7 +244,7 @@ export class GlobalDaemon {
         trace_id: session.traceId,
         parent_id: session.sessionCallId ?? null,
         started_at: new Date().toISOString(),
-        display_name: `Turn ${session.turnNumber}`,
+        display_name: `Turn ${session.turnNumber}: ${GlobalDaemon.promptSnippet(prompt)}`,
         inputs: { prompt },
         attributes: {},
       });
@@ -319,6 +319,12 @@ export class GlobalDaemon {
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
+
+  /** Truncate a prompt to a readable display name, collapsing whitespace. */
+  private static promptSnippet(prompt: string, maxLen = 60): string {
+    const oneLine = prompt.replace(/\s+/g, ' ').trim();
+    return oneLine.length <= maxLen ? oneLine : oneLine.slice(0, maxLen - 1) + '…';
+  }
 
   private log(level: 'INFO' | 'ERROR', msg: string): void {
     appendToLog(this.logFile, level, msg);
