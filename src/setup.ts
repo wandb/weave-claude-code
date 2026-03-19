@@ -5,10 +5,10 @@ import { spawnSync } from 'child_process';
 import { findClaudeCLI, appendToLog } from './utils.js';
 
 export interface Settings {
-  node_path: string;
-  cli_path: string;
   log_file: string;
   weave_project: string | null;
+  wandb_api_key: string | null;
+  debug?: boolean;
   installed_at: string;
   version: string;
   daemon_socket: string;
@@ -38,7 +38,7 @@ export interface PluginResult {
   pluginStatus: PluginStatus;
 }
 
-export const CONFIG_DIR = path.join(os.homedir(), '.claude_code_weave_plugin');
+export const CONFIG_DIR = path.join(os.homedir(), '.weave_claude_plugin');
 export const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 export const VERSION = '0.1.0';
 
@@ -64,13 +64,12 @@ export function createConfig(configDir: string): ConfigResult {
   fs.mkdirSync(logDir, { recursive: true });
 
   const settings: Settings = {
-    node_path: process.execPath,
-    cli_path: process.argv[1]!,
     log_file: logFile,
     weave_project: null,
+    wandb_api_key: null,
     installed_at: new Date().toISOString(),
     version: VERSION,
-    daemon_socket: '/tmp/weave-claude-daemon.sock',
+    daemon_socket: path.join(configDir, 'daemon.sock'),
   };
 
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));

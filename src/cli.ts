@@ -18,6 +18,7 @@ import {
   type Settings,
 } from './setup.js';
 import { prompt, sendToSocket } from './utils.js';
+import { runDaemon } from './daemon.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -86,8 +87,9 @@ async function cmdInstall(force: boolean): Promise<void> {
   console.log(`✓ Plugin ${pluginResult.pluginStatus === PluginStatus.AlreadyInstalled ? 'already installed' : 'installed'}`);
   console.log('\n✓ Installation complete!');
   console.log('\nNext steps:');
-  console.log('  1. Set Weave project: weave-claude-plugin config set weave_project ENTITY/PROJECT');
-  console.log('  2. Reload plugins in Claude Code: /reload-plugins');
+  console.log('  1. Set Weave project:  weave-claude-plugin config set weave_project ENTITY/PROJECT');
+  console.log('  2. Set W&B API key:    weave-claude-plugin config set wandb_api_key <your-api-key>');
+  console.log('  3. Reload plugins:     /reload-plugins in Claude Code');
 }
 
 // ---------------------------------------------------------------------------
@@ -106,19 +108,27 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const effectiveProject = settings.weave_project ?? process.env['WEAVE_PROJECT'] ?? null;
-    const projectSource = settings.weave_project
-      ? 'settings.json'
-      : process.env['WEAVE_PROJECT']
-        ? 'WEAVE_PROJECT env var'
+    const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+    const projectSource = process.env['WEAVE_PROJECT']
+      ? 'WEAVE_PROJECT env var'
+      : settings.weave_project
+        ? 'settings.json'
         : 'not set';
 
+    const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+    const apiKeySource = process.env['WANDB_API_KEY']
+      ? 'WANDB_API_KEY env var'
+      : settings.wandb_api_key
+        ? 'settings.json'
+        : 'not set';
+    const apiKeyDisplay = effectiveApiKey ? `${effectiveApiKey.slice(0, 4)}… [${apiKeySource}]` : `(not set)`;
+
     console.log('Current configuration:');
-    console.log(`  node_path:     ${settings.node_path}`);
-    console.log(`  cli_path:      ${settings.cli_path}`);
     console.log(`  log_file:      ${settings.log_file}`);
     console.log(`  daemon_socket: ${settings.daemon_socket}`);
     console.log(`  weave_project: ${effectiveProject ?? '(not set)'} [${projectSource}]`);
+    console.log(`  wandb_api_key: ${apiKeyDisplay}`);
+    console.log(`  debug:         ${!!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug} ${process.env['WEAVE_CLAUDE_DEBUG'] ? '[WEAVE_CLAUDE_DEBUG env var]' : ''}`);
     console.log(`  installed_at:  ${settings.installed_at}`);
     console.log(`  version:       ${settings.version}`);
     return;
@@ -142,9 +152,9 @@ async function cmdConfig(args: string[]): Promise<void> {
       console.error(`Unknown key: ${key}`);
       process.exit(1);
     }
-    // For weave_project, resolve effective value (settings > env)
+    // For weave_project and wandb_api_key, env var takes priority over settings file
     if (key === 'weave_project') {
-      const effective = settings.weave_project ?? process.env['WEAVE_PROJECT'] ?? null;
+      const effective = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
       console.log(effective ?? '(not set)');
     } else {
       console.log(value ?? '(not set)');
@@ -160,7 +170,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const writableKeys = ['weave_project', 'daemon_socket'];
+    const writableKeys = ['weave_project', 'wandb_api_key', 'daemon_socket', 'debug'];
     if (!writableKeys.includes(key)) {
       console.error(`Cannot set '${key}'. Writable keys: ${writableKeys.join(', ')}`);
       process.exit(1);
@@ -214,13 +224,13 @@ async function cmdStatus(): Promise<void> {
 
   console.log(`✓ Configuration: ${SETTINGS_FILE}`);
 
-  // Check node binary
-  if (fs.existsSync(settings.node_path)) {
-    const result = spawnSync(settings.node_path, ['--version'], { encoding: 'utf8' });
-    const version = result.stdout?.trim() ?? '';
-    console.log(`✓ Node.js runtime: ${settings.node_path} (${version})`);
+  // Check weave-claude-plugin is on PATH
+  const whichResult = spawnSync('which', ['weave-claude-plugin'], { encoding: 'utf8' });
+  if (whichResult.status === 0 && whichResult.stdout.trim()) {
+    console.log(`✓ CLI: ${whichResult.stdout.trim()}`);
   } else {
-    console.log(`✗ Node.js runtime: not found at ${settings.node_path}`);
+    console.log('✗ CLI: weave-claude-plugin not found in PATH');
+    console.log('  Run: npm install -g weave-claude-plugin');
   }
 
   // Check weave_project
@@ -315,7 +325,7 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
       // Settings may be corrupt — continue with cleanup
     }
 
-    const socketPath = settings?.daemon_socket ?? '/tmp/weave-claude-daemon.sock';
+    const socketPath = settings?.daemon_socket ?? path.join(CONFIG_DIR, 'daemon.sock');
 
     if (fs.existsSync(socketPath)) {
       try {
@@ -413,9 +423,8 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'daemon') {
-    // Implemented in PR 3
-    console.error('Daemon not yet implemented. Coming in PR 3.');
-    process.exit(1);
+    await runDaemon();
+    return;
   }
 
   console.error(`Unknown command: ${cmd}\nRun 'weave-claude-plugin --help' for usage.`);
