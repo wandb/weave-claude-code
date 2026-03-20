@@ -44,8 +44,8 @@ export const VERSION = '0.1.0';
 
 // Claude Code plugin marketplace coordinates
 export const MARKETPLACE_REPO = 'wandb/claude_code_weave_plugin';
-export const MARKETPLACE_NAME = 'wandb-claude_code_weave_plugin';
-export const PLUGIN_NAME = 'weave-claude';
+export const MARKETPLACE_NAME = 'weave-claude-plugin';
+export const PLUGIN_NAME = 'weave';
 
 /**
  * Create (or recreate) the config directory, log directory, and settings.json.

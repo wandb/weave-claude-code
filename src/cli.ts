@@ -85,11 +85,59 @@ async function cmdInstall(force: boolean): Promise<void> {
 
   console.log(`✓ Marketplace ${pluginResult.marketplaceStatus === MarketplaceStatus.AlreadyRegistered ? 'already registered' : 'registered'}`);
   console.log(`✓ Plugin ${pluginResult.pluginStatus === PluginStatus.AlreadyInstalled ? 'already installed' : 'installed'}`);
+
+  // Interactive prompts for missing config
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (err) {
+    console.error(`✗ Could not load settings: ${err}`);
+    process.exit(1);
+  }
+
+  const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+  const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+
+  if (process.stdin.isTTY) {
+    if (!effectiveProject) {
+      const answer = await prompt('\nWeave project (ENTITY/PROJECT): ');
+      const value = answer.trim();
+      if (value) {
+        if (!value.includes('/')) {
+          console.error(`✗ Invalid format: '${value}' — expected entity/project`);
+          process.exit(1);
+        }
+        settings.weave_project = value;
+        saveSettings(settings);
+        console.log(`✓ Set weave_project = ${value}`);
+      } else {
+        console.log('- Skipped weave_project (set later: weave-claude-plugin config set weave_project ENTITY/PROJECT)');
+      }
+    }
+
+    if (!effectiveApiKey) {
+      const answer = await prompt('W&B API key: ');
+      const value = answer.trim();
+      if (value) {
+        settings = loadSettings();
+        settings.wandb_api_key = value;
+        saveSettings(settings);
+        console.log(`✓ Set wandb_api_key = ${value.slice(0, 4)}…`);
+      } else {
+        console.log('- Skipped wandb_api_key (set later: weave-claude-plugin config set wandb_api_key <key>)');
+      }
+    }
+  } else {
+    if (!effectiveProject) {
+      console.log('- weave_project not set. Run: weave-claude-plugin config set weave_project ENTITY/PROJECT');
+    }
+    if (!effectiveApiKey) {
+      console.log('- wandb_api_key not set. Run: weave-claude-plugin config set wandb_api_key <your-api-key>');
+    }
+  }
+
   console.log('\n✓ Installation complete!');
-  console.log('\nNext steps:');
-  console.log('  1. Set Weave project:  weave-claude-plugin config set weave_project ENTITY/PROJECT');
-  console.log('  2. Set W&B API key:    weave-claude-plugin config set wandb_api_key <your-api-key>');
-  console.log('  3. Reload plugins:     /reload-plugins in Claude Code');
+  console.log('  Reload plugins in Claude Code: /reload-plugins');
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +291,16 @@ async function cmdStatus(): Promise<void> {
     console.log('  Run: weave-claude-plugin config set weave_project ENTITY/PROJECT');
   }
 
+  // Check WANDB_API_KEY
+  const effectiveApiKey = settings.wandb_api_key ?? process.env['WANDB_API_KEY'] ?? null;
+  if (effectiveApiKey) {
+    const apiKeySource = settings.wandb_api_key ? 'settings.json' : 'WANDB_API_KEY env var';
+    console.log(`✓ W&B API key: ${effectiveApiKey.slice(0, 4)}… (from ${apiKeySource})`);
+  } else {
+    console.log('✗ W&B API key: not configured');
+    console.log('  Run: weave-claude-plugin config set wandb_api_key <your-api-key>');
+  }
+
   // Check daemon socket
   const socketPath = settings.daemon_socket;
   if (fs.existsSync(socketPath)) {
@@ -262,10 +320,14 @@ async function cmdStatus(): Promise<void> {
   }
 
   console.log('');
-  if (effectiveProject) {
+  if (effectiveProject && effectiveApiKey) {
     console.log('Status: Ready to trace');
   } else {
-    console.log('Status: Configuration incomplete — set weave_project to start tracing');
+    const missing = [
+      !effectiveProject && 'weave_project',
+      !effectiveApiKey && 'wandb_api_key',
+    ].filter(Boolean).join(', ');
+    console.log(`Status: Configuration incomplete — set ${missing} to start tracing`);
   }
 }
 
