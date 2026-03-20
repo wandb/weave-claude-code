@@ -1,5 +1,5 @@
 {
-  "name": "weave-claude",
+  "name": "weave",
   "version": "0.1.0",
   "description": "Track Claude Code sessions in Weave for observability and debugging"
 }
