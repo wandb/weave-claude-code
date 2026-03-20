@@ -34,6 +34,20 @@ interface PendingToolCall {
   toolName: string;
 }
 
+/**
+ * Created when a Task tool with subagent_type is detected in PreToolUse.
+ * agentId and subagentWeaveCallId are filled in when the matching SubagentStart event arrives.
+ */
+interface SubagentTracker {
+  toolUseId: string;
+  traceId: string;               // Shared trace ID for the whole session
+  subagentType: string;
+  detectedAt: Date;              // Used for temporal proximity matching at SubagentStart
+  taskToolWeaveCallId: string;   // Weave call ID of the Agent tool itself (opened at PreToolUse)
+  agentId?: string;              // Set when SubagentStart fires
+  subagentWeaveCallId?: string;  // Weave call ID of the subagent call (opened at SubagentStart)
+}
+
 interface SessionState {
   sessionId: string;
   transcriptPath: string;
@@ -49,6 +63,10 @@ interface SessionState {
   totalToolCalls: number;
   toolCounts: Record<string, number>;
   pendingToolCalls: Map<string, PendingToolCall>;
+
+  // Subagent tracking (keyed by toolUseId; secondary index by agentId)
+  subagentTrackers: Map<string, SubagentTracker>;
+  subagentByAgentId: Map<string, SubagentTracker>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +87,7 @@ export class GlobalDaemon {
     private readonly socketPath: string,
     private readonly logFile: string,
     private readonly weaveProject: string | null,
+    private readonly debugEnabled: boolean,
   ) {}
 
   async start(): Promise<void> {
@@ -154,13 +173,14 @@ export class GlobalDaemon {
   private async routeEvent(payload: HookPayload): Promise<void> {
     const eventName = payload['hook_event_name'] as string | undefined;
     const sessionId = payload['session_id'] as string | undefined;
+    const agentId = payload['agent_id'] as string | undefined;
 
     if (!sessionId) {
       this.log('ERROR', 'Missing session_id in payload');
       return;
     }
 
-    this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}`);
+    this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
 
     try {
       switch (eventName) {
@@ -171,13 +191,19 @@ export class GlobalDaemon {
           await this.handleUserPromptSubmit(sessionId, payload);
           break;
         case 'PreToolUse':
-          await this.handlePreToolUse(sessionId, payload);
+          await this.handlePreToolUse(sessionId, agentId, payload);
           break;
         case 'PostToolUse':
           await this.handlePostToolUse(sessionId, payload);
           break;
         case 'PostToolUseFailure':
           await this.handlePostToolUseFailure(sessionId, payload);
+          break;
+        case 'SubagentStart':
+          await this.handleSubagentStart(sessionId, payload);
+          break;
+        case 'SubagentStop':
+          await this.handleSubagentStop(sessionId, payload);
           break;
         case 'Stop':
           await this.handleStop(sessionId, payload);
@@ -213,6 +239,8 @@ export class GlobalDaemon {
       totalToolCalls: 0,
       toolCounts: {},
       pendingToolCalls: new Map(),
+      subagentTrackers: new Map(),
+      subagentByAgentId: new Map(),
     });
 
     this.log('INFO', `Session created: ${sessionId}`);
@@ -270,17 +298,20 @@ export class GlobalDaemon {
     }
   }
 
-  private async handlePreToolUse(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurnCallId || !this.weaveClient) return;
+    if (!session || !this.weaveClient) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     const toolName = payload['tool_name'] as string | undefined;
     if (!toolUseId || !toolName) return;
 
-    // Task tools with subagent_type are tracked in PR 6 — skip here
     const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
-    if (toolName === 'Task' && toolInput['subagent_type']) return;
+
+    // For subagent tool calls, parent is the subagent's Weave call; otherwise the current turn.
+    const parentId = agentId
+      ? (session.subagentByAgentId.get(agentId)?.subagentWeaveCallId ?? null)
+      : (session.currentTurnCallId ?? null);
 
     const weaveCallId = uuidv7();
     session.pendingToolCalls.set(toolUseId, { weaveCallId, toolName });
@@ -290,12 +321,25 @@ export class GlobalDaemon {
       id: weaveCallId,
       op_name: `claude_code.tool.${toolName}`,
       trace_id: session.traceId,
-      parent_id: session.currentTurnCallId,
+      parent_id: parentId,
       started_at: new Date().toISOString(),
       display_name: GlobalDaemon.toolDisplayName(toolName, toolInput),
       inputs: toolInput,
       attributes: { kind: 'tool', tool_use_id: toolUseId },
     });
+
+    // Agent tools with subagent_type spawn subagents (parent session only). Record the Weave
+    // call ID so handleSubagentStart can nest the subagent call underneath it.
+    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
+      const tracker: SubagentTracker = {
+        toolUseId,
+        traceId: session.traceId,
+        subagentType: toolInput['subagent_type'] as string,
+        detectedAt: new Date(),
+        taskToolWeaveCallId: weaveCallId,
+      };
+      session.subagentTrackers.set(toolUseId, tracker);
+    }
   }
 
   private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
@@ -342,6 +386,92 @@ export class GlobalDaemon {
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
+  }
+
+  private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.weaveClient) return;
+
+    const agentId = payload['agent_id'] as string | undefined;
+    if (!agentId) return;
+
+    // Temporal proximity matching: find the closest unmatched SubagentTracker within 5 s.
+    // SubagentStart has no explicit parent pointer, so we correlate by timing.
+    const PROXIMITY_MS = 5_000;
+    const now = Date.now();
+    let bestTracker: SubagentTracker | undefined;
+    let bestDelta = Infinity;
+
+    for (const tracker of session.subagentTrackers.values()) {
+      if (tracker.agentId) continue; // already matched
+      const delta = now - tracker.detectedAt.getTime();
+      if (delta >= 0 && delta < PROXIMITY_MS && delta < bestDelta) {
+        bestDelta = delta;
+        bestTracker = tracker;
+      }
+    }
+
+    const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
+
+    if (!bestTracker) {
+      // No matching Agent tool call — create an orphan tracker parented to the turn.
+      this.log('ERROR', `SubagentStart: no unmatched tracker for agentId=${agentId}, parenting to turn`);
+      bestTracker = {
+        toolUseId: agentId,
+        traceId: session.traceId,
+        subagentType: agentType,
+        detectedAt: new Date(),
+        taskToolWeaveCallId: session.currentTurnCallId ?? '',
+        agentId,
+      };
+      session.subagentTrackers.set(agentId, bestTracker);
+    }
+
+    const subagentWeaveCallId = uuidv7();
+    bestTracker.agentId = agentId;
+    bestTracker.subagentWeaveCallId = subagentWeaveCallId;
+    session.subagentByAgentId.set(agentId, bestTracker);
+
+    this.weaveClient.saveCallStart({
+      project_id: this.weaveClient.projectId,
+      id: subagentWeaveCallId,
+      op_name: `claude_code.subagent.${bestTracker.subagentType}`,
+      trace_id: bestTracker.traceId,
+      parent_id: bestTracker.taskToolWeaveCallId,
+      started_at: new Date().toISOString(),
+      display_name: bestTracker.subagentType,
+      inputs: { subagent_type: bestTracker.subagentType },
+      attributes: { kind: 'agent', agent_id: agentId },
+    });
+
+    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${bestTracker.toolUseId !== agentId}`);
+  }
+
+  private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.weaveClient) return;
+
+    const agentId = payload['agent_id'] as string | undefined;
+    if (!agentId) return;
+
+    const tracker = session.subagentByAgentId.get(agentId);
+    if (!tracker?.subagentWeaveCallId) {
+      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId}`);
+      return;
+    }
+
+    this.weaveClient.saveCallEnd({
+      project_id: this.weaveClient.projectId,
+      id: tracker.subagentWeaveCallId,
+      ended_at: new Date().toISOString(),
+      output: { reason: (payload['reason'] as string | undefined) ?? '' },
+      summary: {},
+    });
+
+    this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`);
+
+    session.subagentTrackers.delete(tracker.toolUseId);
+    session.subagentByAgentId.delete(agentId);
   }
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
@@ -445,7 +575,8 @@ export class GlobalDaemon {
     }
   }
 
-  private log(level: 'INFO' | 'ERROR', msg: string): void {
+  private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
+    if (level === 'DEBUG' && !this.debugEnabled) return;
     appendToLog(this.logFile, level, msg);
   }
 
@@ -482,7 +613,8 @@ export async function runDaemon(): Promise<void> {
   // settings.json or was already in the environment.
   process.env['WANDB_API_KEY'] = apiKey;
 
-  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject);
+  const debugEnabled = !!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true;
+  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, debugEnabled);
 
   try {
     await daemon.start();
