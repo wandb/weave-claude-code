@@ -6,6 +6,7 @@ import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog } from './utils.js';
+import { parseSessionFile } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -27,6 +28,12 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   );
 }
 
+/** Stores the Weave call ID opened at PreToolUse so PostToolUse can close it. */
+interface PendingToolCall {
+  weaveCallId: string;
+  toolName: string;
+}
+
 interface SessionState {
   sessionId: string;
   transcriptPath: string;
@@ -41,6 +48,7 @@ interface SessionState {
   turnNumber: number;
   totalToolCalls: number;
   toolCounts: Record<string, number>;
+  pendingToolCalls: Map<string, PendingToolCall>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +170,15 @@ export class GlobalDaemon {
         case 'UserPromptSubmit':
           await this.handleUserPromptSubmit(sessionId, payload);
           break;
+        case 'PreToolUse':
+          await this.handlePreToolUse(sessionId, payload);
+          break;
+        case 'PostToolUse':
+          await this.handlePostToolUse(sessionId, payload);
+          break;
+        case 'PostToolUseFailure':
+          await this.handlePostToolUseFailure(sessionId, payload);
+          break;
         case 'Stop':
           await this.handleStop(sessionId, payload);
           break;
@@ -169,7 +186,6 @@ export class GlobalDaemon {
           await this.handleSessionEnd(sessionId, payload);
           break;
         default:
-          // Unhandled events are logged above; no further action needed in PR 5.
           break;
       }
     } catch (err) {
@@ -196,6 +212,7 @@ export class GlobalDaemon {
       turnNumber: 0,
       totalToolCalls: 0,
       toolCounts: {},
+      pendingToolCalls: new Map(),
     });
 
     this.log('INFO', `Session created: ${sessionId}`);
@@ -224,6 +241,7 @@ export class GlobalDaemon {
         display_name: `Claude Code: ${GlobalDaemon.promptSnippet(prompt)}`,
         inputs: { prompt },
         attributes: {
+          kind: 'agent',
           session_id: session.sessionId,
           cwd: session.cwd,
         },
@@ -246,27 +264,108 @@ export class GlobalDaemon {
         started_at: new Date().toISOString(),
         display_name: `Turn ${session.turnNumber}: ${GlobalDaemon.promptSnippet(prompt)}`,
         inputs: { prompt },
-        attributes: {},
+        attributes: { kind: 'llm' },
       });
       this.log('INFO', `Created turn call: ${turnCallId} (turn ${session.turnNumber})`);
     }
+  }
+
+  private async handlePreToolUse(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session?.currentTurnCallId || !this.weaveClient) return;
+
+    const toolUseId = payload['tool_use_id'] as string | undefined;
+    const toolName = payload['tool_name'] as string | undefined;
+    if (!toolUseId || !toolName) return;
+
+    // Task tools with subagent_type are tracked in PR 6 — skip here
+    const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
+    if (toolName === 'Task' && toolInput['subagent_type']) return;
+
+    const weaveCallId = uuidv7();
+    session.pendingToolCalls.set(toolUseId, { weaveCallId, toolName });
+
+    this.weaveClient.saveCallStart({
+      project_id: this.weaveClient.projectId,
+      id: weaveCallId,
+      op_name: `claude_code.tool.${toolName}`,
+      trace_id: session.traceId,
+      parent_id: session.currentTurnCallId,
+      started_at: new Date().toISOString(),
+      display_name: GlobalDaemon.toolDisplayName(toolName, toolInput),
+      inputs: toolInput,
+      attributes: { kind: 'tool', tool_use_id: toolUseId },
+    });
+  }
+
+  private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.weaveClient) return;
+
+    const toolUseId = payload['tool_use_id'] as string | undefined;
+    if (!toolUseId) return;
+
+    const pending = session.pendingToolCalls.get(toolUseId);
+    if (!pending) return;
+
+    this.weaveClient.saveCallEnd({
+      project_id: this.weaveClient.projectId,
+      id: pending.weaveCallId,
+      ended_at: new Date().toISOString(),
+      output: { result: payload['tool_response'] },
+      summary: {},
+    });
+
+    session.pendingToolCalls.delete(toolUseId);
+    session.totalToolCalls += 1;
+    session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
+  }
+
+  private async handlePostToolUseFailure(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.weaveClient) return;
+
+    const toolUseId = payload['tool_use_id'] as string | undefined;
+    if (!toolUseId) return;
+
+    const pending = session.pendingToolCalls.get(toolUseId);
+    if (!pending) return;
+
+    this.weaveClient.saveCallEnd({
+      project_id: this.weaveClient.projectId,
+      id: pending.weaveCallId,
+      ended_at: new Date().toISOString(),
+      output: { error: payload['error'] ?? payload['tool_response'] },
+      summary: { is_error: true },
+    });
+
+    session.pendingToolCalls.delete(toolUseId);
+    session.totalToolCalls += 1;
+    session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurnCallId || !this.weaveClient) return;
 
-    const assistantMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
+    // Parse transcript for usage + model (not available in hook payloads)
+    const parsedSession = parseSessionFile(session.transcriptPath);
+    const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
+    const usage = currentTurn?.totalUsage();
+    const model = currentTurn?.primaryModel();
+
+    // Weave expects summary.usage keyed by model name: { "model-name": { input_tokens, output_tokens } }
+    const usageSummary = usage && model ? { [model]: usage } : {};
 
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: session.currentTurnCallId,
       ended_at: new Date().toISOString(),
-      output: { assistant_message: assistantMessage },
-      summary: {},
+      output: { assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
+      summary: { usage: usageSummary, tool_count: session.totalToolCalls },
     });
 
-    this.log('INFO', `Finished turn ${session.turnNumber}`);
+    this.log('INFO', `Finished turn ${session.turnNumber} (${session.totalToolCalls} tools)`);
   }
 
   private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
@@ -324,6 +423,26 @@ export class GlobalDaemon {
   private static promptSnippet(prompt: string, maxLen = 60): string {
     const oneLine = prompt.replace(/\s+/g, ' ').trim();
     return oneLine.length <= maxLen ? oneLine : oneLine.slice(0, maxLen - 1) + '…';
+  }
+
+  /** Build a human-readable display name for a tool call, e.g. "Read: src/foo.ts". */
+  private static toolDisplayName(toolName: string, input: Record<string, unknown>): string {
+    const s = (v: unknown) => GlobalDaemon.promptSnippet(String(v ?? ''), 60);
+    switch (toolName) {
+      case 'Read':
+      case 'Edit':
+      case 'Write':        return `${toolName}: ${s(input['file_path'])}`;
+      case 'Glob':         return `Glob: ${s(input['pattern'])}`;
+      case 'Grep':         return `Grep: ${s(input['pattern'])}`;
+      case 'Bash':         return `Bash: ${s(input['command'])}`;
+      case 'Agent':        return `Agent: ${s(input['description'] ?? input['subagent_type'])}`;
+      case 'WebFetch':     return `WebFetch: ${s(input['url'])}`;
+      case 'WebSearch':    return `WebSearch: ${s(input['query'])}`;
+      default: {
+        const first = Object.values(input).find((v) => typeof v === 'string') as string | undefined;
+        return first ? `${toolName}: ${GlobalDaemon.promptSnippet(first, 60)}` : toolName;
+      }
+    }
   }
 
   private log(level: 'INFO' | 'ERROR', msg: string): void {
