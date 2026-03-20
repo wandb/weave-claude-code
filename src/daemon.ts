@@ -292,7 +292,7 @@ export class GlobalDaemon {
       trace_id: session.traceId,
       parent_id: session.currentTurnCallId,
       started_at: new Date().toISOString(),
-      display_name: toolName,
+      display_name: GlobalDaemon.toolDisplayName(toolName, toolInput),
       inputs: toolInput,
       attributes: { kind: 'tool', tool_use_id: toolUseId },
     });
@@ -423,6 +423,26 @@ export class GlobalDaemon {
   private static promptSnippet(prompt: string, maxLen = 60): string {
     const oneLine = prompt.replace(/\s+/g, ' ').trim();
     return oneLine.length <= maxLen ? oneLine : oneLine.slice(0, maxLen - 1) + '…';
+  }
+
+  /** Build a human-readable display name for a tool call, e.g. "Read: src/foo.ts". */
+  private static toolDisplayName(toolName: string, input: Record<string, unknown>): string {
+    const s = (v: unknown) => GlobalDaemon.promptSnippet(String(v ?? ''), 60);
+    switch (toolName) {
+      case 'Read':
+      case 'Edit':
+      case 'Write':        return `${toolName}: ${s(input['file_path'])}`;
+      case 'Glob':         return `Glob: ${s(input['pattern'])}`;
+      case 'Grep':         return `Grep: ${s(input['pattern'])}`;
+      case 'Bash':         return `Bash: ${s(input['command'])}`;
+      case 'Agent':        return `Agent: ${s(input['description'] ?? input['subagent_type'])}`;
+      case 'WebFetch':     return `WebFetch: ${s(input['url'])}`;
+      case 'WebSearch':    return `WebSearch: ${s(input['query'])}`;
+      default: {
+        const first = Object.values(input).find((v) => typeof v === 'string') as string | undefined;
+        return first ? `${toolName}: ${GlobalDaemon.promptSnippet(first, 60)}` : toolName;
+      }
+    }
   }
 
   private log(level: 'INFO' | 'ERROR', msg: string): void {
