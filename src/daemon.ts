@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { init, WeaveClient } from 'weave';
+import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog } from './utils.js';
 
@@ -25,6 +27,22 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   );
 }
 
+interface SessionState {
+  sessionId: string;
+  transcriptPath: string;
+  cwd: string;
+  traceId: string;
+
+  // Weave call IDs
+  sessionCallId?: string;
+  currentTurnCallId?: string;
+
+  // Tracking
+  turnNumber: number;
+  totalToolCalls: number;
+  toolCounts: Record<string, number>;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,13 +54,29 @@ export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
   private lastActivity = Date.now();
+  private sessions = new Map<string, SessionState>();
+  private weaveClient: WeaveClient | null = null;
 
   constructor(
     private readonly socketPath: string,
     private readonly logFile: string,
+    private readonly weaveProject: string | null,
   ) {}
 
   async start(): Promise<void> {
+    // Initialize Weave client if a project is configured
+    if (this.weaveProject) {
+      try {
+        this.weaveClient = await init(this.weaveProject);
+        this.log('INFO', `Weave initialized for project: ${this.weaveProject}`);
+      } catch (err) {
+        this.log('ERROR', `Failed to initialize Weave: ${err} — continuing without Weave`);
+        this.weaveClient = null;
+      }
+    } else {
+      this.log('INFO', 'No weave_project configured — Weave tracking disabled');
+    }
+
     // Remove any stale socket left by a previous crash
     if (fs.existsSync(this.socketPath)) {
       fs.unlinkSync(this.socketPath);
@@ -60,8 +94,8 @@ export class GlobalDaemon {
     this.running = true;
     this.log('INFO', `Daemon started — socket: ${this.socketPath}`);
 
-    process.on('SIGTERM', () => this.shutdown('SIGTERM'));
-    process.on('SIGINT',  () => this.shutdown('SIGINT'));
+    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
+    process.on('SIGINT',  () => void this.shutdown('SIGINT'));
 
     setInterval(() => this.checkInactivity(), 60_000).unref();
   }
@@ -94,11 +128,11 @@ export class GlobalDaemon {
       this.lastActivity = Date.now();
 
       if (isControlMessage(payload)) {
-        this.shutdown('control message');
+        void this.shutdown('control message');
         return;
       }
 
-      this.logEvent(payload as HookPayload);
+      void this.routeEvent(payload as HookPayload);
     });
 
     socket.on('error', (err: Error) => {
@@ -107,16 +141,154 @@ export class GlobalDaemon {
     });
   }
 
-  // ── event logging ─────────────────────────────────────────────────────────
+  // ── event routing ─────────────────────────────────────────────────────────
 
-  /**
-   * Log every incoming hook event as a single JSON line.
-   * PR 5+ will replace this with real Weave call tracking.
-   */
-  private logEvent(payload: HookPayload): void {
-    const eventName = (payload['hook_event_name'] as string | undefined) ?? 'unknown';
-    const sessionId = (payload['session_id'] as string | undefined) ?? '-';
-    this.log('EVENT', `${eventName} session=${sessionId} ${JSON.stringify(payload)}`);
+  private async routeEvent(payload: HookPayload): Promise<void> {
+    const eventName = payload['hook_event_name'] as string | undefined;
+    const sessionId = payload['session_id'] as string | undefined;
+
+    if (!sessionId) {
+      this.log('ERROR', 'Missing session_id in payload');
+      return;
+    }
+
+    this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}`);
+
+    try {
+      switch (eventName) {
+        case 'SessionStart':
+          await this.handleSessionStart(sessionId, payload);
+          break;
+        case 'UserPromptSubmit':
+          await this.handleUserPromptSubmit(sessionId, payload);
+          break;
+        case 'Stop':
+          await this.handleStop(sessionId, payload);
+          break;
+        case 'SessionEnd':
+          await this.handleSessionEnd(sessionId, payload);
+          break;
+        default:
+          // Unhandled events are logged above; no further action needed in PR 5.
+          break;
+      }
+    } catch (err) {
+      this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
+    }
+  }
+
+  // ── event handlers ────────────────────────────────────────────────────────
+
+  private async handleSessionStart(sessionId: string, payload: HookPayload): Promise<void> {
+    if (this.sessions.has(sessionId)) return; // idempotent
+
+    const transcriptPath = payload['transcript_path'] as string | undefined;
+    if (!transcriptPath || !GlobalDaemon.validateTranscriptPath(transcriptPath)) {
+      this.log('ERROR', `Invalid or missing transcript_path for session ${sessionId}`);
+      return;
+    }
+
+    this.sessions.set(sessionId, {
+      sessionId,
+      transcriptPath,
+      cwd: (payload['cwd'] as string | undefined) ?? '',
+      traceId: uuidv7(),
+      turnNumber: 0,
+      totalToolCalls: 0,
+      toolCounts: {},
+    });
+
+    this.log('INFO', `Session created: ${sessionId}`);
+  }
+
+  private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      this.log('ERROR', `Unknown session: ${sessionId}`);
+      return;
+    }
+
+    const prompt = (payload['prompt'] as string | undefined) ?? '';
+
+    // Create the top-level session call on the first turn
+    if (!session.sessionCallId && this.weaveClient) {
+      const callId = uuidv7();
+      session.sessionCallId = callId;
+      this.weaveClient.saveCallStart({
+        project_id: this.weaveClient.projectId,
+        id: callId,
+        op_name: 'claude_code.session',
+        trace_id: session.traceId,
+        parent_id: null,
+        started_at: new Date().toISOString(),
+        display_name: `Claude Code: ${GlobalDaemon.promptSnippet(prompt)}`,
+        inputs: { prompt },
+        attributes: {
+          session_id: session.sessionId,
+          cwd: session.cwd,
+        },
+      });
+      this.log('INFO', `Created session call: ${callId}`);
+    }
+
+    // Create a turn call for every prompt
+    session.turnNumber += 1;
+    const turnCallId = uuidv7();
+    session.currentTurnCallId = turnCallId;
+
+    if (this.weaveClient) {
+      this.weaveClient.saveCallStart({
+        project_id: this.weaveClient.projectId,
+        id: turnCallId,
+        op_name: 'claude_code.turn',
+        trace_id: session.traceId,
+        parent_id: session.sessionCallId ?? null,
+        started_at: new Date().toISOString(),
+        display_name: `Turn ${session.turnNumber}: ${GlobalDaemon.promptSnippet(prompt)}`,
+        inputs: { prompt },
+        attributes: {},
+      });
+      this.log('INFO', `Created turn call: ${turnCallId} (turn ${session.turnNumber})`);
+    }
+  }
+
+  private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session?.currentTurnCallId || !this.weaveClient) return;
+
+    const assistantMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
+
+    this.weaveClient.saveCallEnd({
+      project_id: this.weaveClient.projectId,
+      id: session.currentTurnCallId,
+      ended_at: new Date().toISOString(),
+      output: { assistant_message: assistantMessage },
+      summary: {},
+    });
+
+    this.log('INFO', `Finished turn ${session.turnNumber}`);
+  }
+
+  private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (session.sessionCallId && this.weaveClient) {
+      this.weaveClient.saveCallEnd({
+        project_id: this.weaveClient.projectId,
+        id: session.sessionCallId,
+        ended_at: new Date().toISOString(),
+        output: { reason: (payload['reason'] as string | undefined) ?? '' },
+        summary: {
+          turn_count: session.turnNumber,
+          tool_count: session.totalToolCalls,
+          tool_counts: session.toolCounts,
+        },
+      });
+      this.log('INFO', `Finished session ${sessionId}`);
+    }
+
+    this.sessions.delete(sessionId);
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -124,15 +296,22 @@ export class GlobalDaemon {
   private checkInactivity(): void {
     if (Date.now() - this.lastActivity > INACTIVITY_TIMEOUT_MS) {
       this.log('INFO', 'Inactivity timeout — shutting down');
-      this.shutdown('inactivity');
+      void this.shutdown('inactivity');
     }
   }
 
-  private shutdown(reason: string): void {
+  private async shutdown(reason: string): Promise<void> {
     if (!this.running) return;
     this.running = false;
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
+    if (this.weaveClient) {
+      try {
+        await this.weaveClient.waitForBatchProcessing();
+      } catch (err) {
+        this.log('ERROR', `Error flushing Weave batch: ${err}`);
+      }
+    }
     if (fs.existsSync(this.socketPath)) {
       fs.unlinkSync(this.socketPath);
     }
@@ -141,8 +320,14 @@ export class GlobalDaemon {
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
-  private log(level: 'INFO' | 'ERROR' | 'EVENT', msg: string): void {
-    appendToLog(this.logFile, level === 'EVENT' ? 'INFO' : level, msg);
+  /** Truncate a prompt to a readable display name, collapsing whitespace. */
+  private static promptSnippet(prompt: string, maxLen = 60): string {
+    const oneLine = prompt.replace(/\s+/g, ' ').trim();
+    return oneLine.length <= maxLen ? oneLine : oneLine.slice(0, maxLen - 1) + '…';
+  }
+
+  private log(level: 'INFO' | 'ERROR', msg: string): void {
+    appendToLog(this.logFile, level, msg);
   }
 
   /** Validate that a transcript path is within the user's home directory. */
@@ -178,7 +363,7 @@ export async function runDaemon(): Promise<void> {
   // settings.json or was already in the environment.
   process.env['WANDB_API_KEY'] = apiKey;
 
-  const daemon = new GlobalDaemon(socketPath, logFile);
+  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject);
 
   try {
     await daemon.start();
