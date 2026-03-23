@@ -64,6 +64,7 @@ interface SessionState {
   // Tracking
   turnNumber: number;
   totalToolCalls: number;
+  turnToolCalls: number;
   toolCounts: Record<string, number>;
   pendingToolCalls: Map<string, PendingToolCall>;
 
@@ -250,6 +251,7 @@ export class GlobalDaemon {
       traceId: uuidv7(),
       turnNumber: 0,
       totalToolCalls: 0,
+      turnToolCalls: 0,
       toolCounts: {},
       pendingToolCalls: new Map(),
       subagentTrackers: new Map(),
@@ -292,6 +294,7 @@ export class GlobalDaemon {
 
     // Create a turn call for every prompt
     session.turnNumber += 1;
+    session.turnToolCalls = 0;
     const turnCallId = uuidv7();
     session.currentTurnCallId = turnCallId;
 
@@ -432,6 +435,7 @@ export class GlobalDaemon {
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
+    session.turnToolCalls += 1;
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
@@ -467,6 +471,7 @@ export class GlobalDaemon {
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
+    session.turnToolCalls += 1;
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
@@ -575,10 +580,10 @@ export class GlobalDaemon {
       id: session.currentTurnCallId,
       ended_at: new Date().toISOString(),
       output: { assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
-      summary: { usage: usageSummary, tool_count: session.totalToolCalls },
+      summary: { usage: usageSummary, tool_count: session.turnToolCalls },
     });
 
-    this.log('INFO', `Finished turn ${session.turnNumber} (${session.totalToolCalls} tools)`);
+    this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
 
   private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
