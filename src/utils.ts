@@ -16,16 +16,26 @@ export function prompt(question: string): Promise<string> {
 
 export function sendToSocket(socketPath: string, message: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
     const client = net.createConnection(socketPath, () => {
       client.write(message);
       client.end();
     });
-    client.on('close', resolve);
-    client.on('error', reject);
-    // Resolve after timeout — daemon may have already exited and closed the socket
-    setTimeout(() => {
-      client.destroy();
-      resolve();
+    client.on('close', () => settle(resolve));
+    client.on('error', (err) => settle(() => reject(err)));
+
+    const timer = setTimeout(() => {
+      settle(() => {
+        client.destroy();
+        resolve();
+      });
     }, 2000);
   });
 }

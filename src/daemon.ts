@@ -585,18 +585,71 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    if (session.sessionCallId && this.weaveClient) {
-      this.weaveClient.saveCallEnd({
-        project_id: this.weaveClient.projectId,
-        id: session.sessionCallId,
-        ended_at: new Date().toISOString(),
-        output: { reason: (payload['reason'] as string | undefined) ?? '' },
-        summary: {
-          turn_count: session.turnNumber,
-          tool_count: session.totalToolCalls,
-          tool_counts: session.toolCounts,
-        },
-      });
+    if (this.weaveClient) {
+      const now = new Date().toISOString();
+
+      // Close any pending tool calls that were never completed
+      for (const [toolUseId, pending] of session.pendingToolCalls) {
+        if (pending.permissionWeaveCallId) {
+          this.weaveClient.saveCallEnd({
+            project_id: this.weaveClient.projectId,
+            id: pending.permissionWeaveCallId,
+            ended_at: now,
+            output: { approved: null, reason: 'session_ended' },
+            summary: {},
+          });
+        }
+        this.weaveClient.saveCallEnd({
+          project_id: this.weaveClient.projectId,
+          id: pending.weaveCallId,
+          ended_at: now,
+          output: { error: 'session ended before tool completed' },
+          summary: { is_error: true },
+        });
+        this.log('DEBUG', `Closed orphaned tool call: ${toolUseId} (${pending.toolName})`);
+      }
+
+      // Close any open subagent calls
+      for (const [agentId, tracker] of session.subagentByAgentId) {
+        if (tracker.subagentWeaveCallId) {
+          this.weaveClient.saveCallEnd({
+            project_id: this.weaveClient.projectId,
+            id: tracker.subagentWeaveCallId,
+            ended_at: now,
+            output: { reason: 'session_ended' },
+            summary: {},
+          });
+          this.log('DEBUG', `Closed orphaned subagent: ${agentId}`);
+        }
+      }
+
+      // Close the current turn if still open
+      if (session.currentTurnCallId) {
+        this.weaveClient.saveCallEnd({
+          project_id: this.weaveClient.projectId,
+          id: session.currentTurnCallId,
+          ended_at: now,
+          output: { reason: 'session_ended' },
+          summary: {},
+        });
+        this.log('DEBUG', `Closed orphaned turn call: ${session.currentTurnCallId}`);
+      }
+
+      // Close the session call
+      if (session.sessionCallId) {
+        this.weaveClient.saveCallEnd({
+          project_id: this.weaveClient.projectId,
+          id: session.sessionCallId,
+          ended_at: now,
+          output: { reason: (payload['reason'] as string | undefined) ?? '' },
+          summary: {
+            turn_count: session.turnNumber,
+            tool_count: session.totalToolCalls,
+            tool_counts: session.toolCounts,
+          },
+        });
+      }
+
       this.log('INFO', `Finished session ${sessionId}`);
     }
 
