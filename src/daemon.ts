@@ -89,9 +89,10 @@ interface TraceResolution {
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
 
-const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000; // 10 minutes
+const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
 export class GlobalDaemon {
   private server?: net.Server;
@@ -153,16 +154,30 @@ export class GlobalDaemon {
 
   private handleConnection(socket: net.Socket): void {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let rejectedForSize = false;
 
     const timer = setTimeout(() => {
       this.log('ERROR', 'Connection timed out — closing');
       socket.destroy();
     }, CONNECTION_TIMEOUT_MS);
 
-    socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+    socket.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_SOCKET_PAYLOAD_BYTES) {
+        rejectedForSize = true;
+        clearTimeout(timer);
+        this.log('ERROR', `Socket payload exceeded ${MAX_SOCKET_PAYLOAD_BYTES} bytes — closing connection`);
+        socket.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
 
     socket.on('end', () => {
       clearTimeout(timer);
+      if (rejectedForSize) return;
       const raw = Buffer.concat(chunks).toString('utf8').trim();
       if (!raw) return;
 
