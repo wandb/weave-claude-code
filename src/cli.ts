@@ -15,8 +15,10 @@ import {
   VERSION,
   MarketplaceStatus,
   PluginStatus,
+  RemovalStatus,
   createConfig,
   registerPlugin,
+  unregisterPlugin,
   loadSettings,
   saveSettings,
   type Settings,
@@ -391,30 +393,49 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
     return;
   }
 
+  let settings: Settings | null = null;
+
   if (fs.existsSync(SETTINGS_FILE)) {
-    let settings: Settings | null = null;
     try {
       settings = loadSettings();
     } catch {
       // Settings may be corrupt — continue with cleanup
     }
+  }
 
-    const socketPath = settings?.daemon_socket ?? path.join(CONFIG_DIR, 'daemon.sock');
-
-    if (fs.existsSync(socketPath)) {
-      try {
-        await sendToSocket(socketPath, JSON.stringify({ command: 'shutdown' }));
-        console.log('✓ Stopped daemon');
-      } catch {
-        console.warn('⚠ Could not stop daemon (may already be stopped)');
-      }
-      try {
-        fs.unlinkSync(socketPath);
-      } catch {
-        // May have been removed by daemon itself
-      }
+  const socketPath = settings?.daemon_socket ?? path.join(CONFIG_DIR, 'daemon.sock');
+  if (fs.existsSync(socketPath)) {
+    try {
+      await sendToSocket(socketPath, JSON.stringify({ command: 'shutdown' }));
+      console.log('✓ Stopped daemon');
+    } catch {
+      console.warn('⚠ Could not stop daemon (may already be stopped)');
     }
+  }
 
+  if (fs.existsSync(socketPath)) {
+    try {
+      fs.unlinkSync(socketPath);
+      console.log('✓ Removed daemon socket');
+    } catch {
+      console.warn('⚠ Could not remove daemon socket');
+    }
+  }
+
+  const pluginResult = unregisterPlugin();
+  if (pluginResult.pluginStatus === RemovalStatus.Failed) {
+    console.warn(`⚠ ${pluginResult.pluginError}`);
+  } else {
+    console.log(`✓ Claude plugin ${pluginResult.pluginStatus === RemovalStatus.AlreadyAbsent ? 'already removed' : 'removed'}`);
+  }
+
+  if (pluginResult.marketplaceStatus === RemovalStatus.Failed) {
+    console.warn(`⚠ ${pluginResult.marketplaceError}`);
+  } else {
+    console.log(`✓ Claude marketplace ${pluginResult.marketplaceStatus === RemovalStatus.AlreadyAbsent ? 'already removed' : 'removed'}`);
+  }
+
+  if (fs.existsSync(SETTINGS_FILE)) {
     fs.unlinkSync(SETTINGS_FILE);
     console.log('✓ Removed configuration');
   } else {
@@ -437,10 +458,7 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
     // Non-empty (e.g., logs kept) — leave it
   }
 
-  console.log(`\n✓ Uninstall complete!`);
-  console.log(`\nNote: The Claude Code plugin is still installed.`);
-  console.log(`To remove it, run in Claude Code:`);
-  console.log(`  /plugin uninstall ${PLUGIN_NAME}@${MARKETPLACE_NAME}`);
+  console.log('\n✓ Uninstall complete!');
 }
 
 // ---------------------------------------------------------------------------
