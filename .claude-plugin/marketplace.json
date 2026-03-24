@@ -16,7 +16,7 @@
       "description": "Track Claude Code sessions in Weave for observability and debugging",
       "source": {
         "source": "github",
-        "repo": "wandb/claude_code_weave_plugin"
+        "repo": "wandb/claude_code_weave_plugin#v0.1.0"
       },
       "category": "observability"
     }

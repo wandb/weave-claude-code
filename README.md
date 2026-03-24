@@ -21,6 +21,13 @@ This will:
 - Register the plugin in Claude Code
 - Prompt for your Weave project (`entity/project`) and W&B API key if not already set
 
+Marketplace installs are pinned to a specific release tag rather than the
+repository default branch. When cutting a new release, create the matching
+protected tag (for example `v0.1.0`) and update the pinned ref in
+[`src/setup.ts`](/Users/chance.an/develop/claude_code_plugin/src/setup.ts) and
+[`./.claude-plugin/marketplace.json`](/Users/chance.an/develop/claude_code_plugin/.claude-plugin/marketplace.json)
+before publishing.
+
 Your W&B API key is available at https://wandb.ai/authorize.
 
 **3. Launch Claude Code from any folder**

@@ -62,24 +62,37 @@ Examples:
 // ---------------------------------------------------------------------------
 
 async function cmdInstall(force: boolean): Promise<void> {
-  if (fs.existsSync(SETTINGS_FILE) && !force) {
-    console.log('✓ Installation already exists');
-    console.log(`  Config: ${SETTINGS_FILE}`);
-    console.log('\nRun with --force to reinstall.');
-    return;
-  }
-
   let configResult;
-  try {
-    configResult = createConfig(CONFIG_DIR);
-  } catch (err) {
-    console.error(`✗ Installation failed: ${err}`);
-    process.exit(1);
-  }
+  if (fs.existsSync(SETTINGS_FILE) && !force) {
+    let settings: Settings;
+    try {
+      settings = loadSettings();
+    } catch (err) {
+      console.error(`✗ Could not load existing settings: ${err}`);
+      process.exit(1);
+    }
 
-  console.log('✓ Configuration created');
-  console.log(`  Config: ${configResult.settingsFile}`);
-  console.log(`  Logs:   ${configResult.logFile}`);
+    configResult = {
+      settingsFile: SETTINGS_FILE,
+      logFile: settings.log_file,
+    };
+
+    console.log('✓ Configuration already exists');
+    console.log(`  Config: ${configResult.settingsFile}`);
+    console.log(`  Logs:   ${configResult.logFile}`);
+    console.log('  Re-validating marketplace and plugin installation...');
+  } else {
+    try {
+      configResult = createConfig(CONFIG_DIR);
+    } catch (err) {
+      console.error(`✗ Installation failed: ${err}`);
+      process.exit(1);
+    }
+
+    console.log('✓ Configuration created');
+    console.log(`  Config: ${configResult.settingsFile}`);
+    console.log(`  Logs:   ${configResult.logFile}`);
+  }
 
   let pluginResult;
   try {
