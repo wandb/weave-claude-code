@@ -233,6 +233,11 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    if (key === 'debug' && value !== 'true' && value !== 'false') {
+      console.error(`Invalid value for debug: '${value}'\nExpected: true or false`);
+      process.exit(1);
+    }
+
     let settings: Settings;
     try {
       settings = loadSettings();
@@ -241,7 +246,8 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    (settings as unknown as Record<string, unknown>)[key] = value;
+    const coerced = key === 'debug' ? value === 'true' : value;
+    (settings as unknown as Record<string, unknown>)[key] = coerced;
     saveSettings(settings);
     console.log(`✓ Set ${key} = ${value}`);
     return;
