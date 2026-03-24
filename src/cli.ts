@@ -204,9 +204,11 @@ async function cmdConfig(args: string[]): Promise<void> {
       console.error(`Unknown key: ${key}`);
       process.exit(1);
     }
-    // For weave_project and wandb_api_key, env var takes priority over settings file
     if (key === 'weave_project') {
       const effective = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+      console.log(effective ?? '(not set)');
+    } else if (key === 'wandb_api_key') {
+      const effective = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
       console.log(effective ?? '(not set)');
     } else {
       console.log(value ?? '(not set)');
@@ -291,20 +293,20 @@ async function cmdStatus(): Promise<void> {
     console.log('  Run: npm install -g weave-claude-plugin');
   }
 
-  // Check weave_project
-  const effectiveProject = settings.weave_project ?? process.env['WEAVE_PROJECT'] ?? null;
+  // Check weave_project (env var takes precedence over settings file)
+  const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   if (effectiveProject) {
-    const source = settings.weave_project ? 'settings.json' : 'WEAVE_PROJECT env var';
+    const source = process.env['WEAVE_PROJECT'] ? 'WEAVE_PROJECT env var' : 'settings.json';
     console.log(`✓ Weave project: ${effectiveProject} (from ${source})`);
   } else {
     console.log('✗ Weave project: not configured');
     console.log('  Run: weave-claude-plugin config set weave_project ENTITY/PROJECT');
   }
 
-  // Check WANDB_API_KEY
-  const effectiveApiKey = settings.wandb_api_key ?? process.env['WANDB_API_KEY'] ?? null;
+  // Check WANDB_API_KEY (env var takes precedence over settings file)
+  const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
   if (effectiveApiKey) {
-    const apiKeySource = settings.wandb_api_key ? 'settings.json' : 'WANDB_API_KEY env var';
+    const apiKeySource = process.env['WANDB_API_KEY'] ? 'WANDB_API_KEY env var' : 'settings.json';
     console.log(`✓ W&B API key: ${effectiveApiKey.slice(0, 4)}… (from ${apiKeySource})`);
   } else {
     console.log('✗ W&B API key: not configured');
