@@ -21,8 +21,16 @@ export interface ParsedSession {
 }
 
 export function parseSessionFile(filePath: string): ParsedSession | null {
+  return parseSessionReader(() => fs.readFileSync(filePath, 'utf8'));
+}
+
+export function parseSessionFd(fd: number): ParsedSession | null {
+  return parseSessionReader(() => readUtf8FromFd(fd));
+}
+
+function parseSessionReader(read: () => string): ParsedSession | null {
   try {
-    const lines = fs.readFileSync(filePath, 'utf8')
+    const lines = read()
       .split('\n')
       .filter(l => l.trim())
       .map(l => JSON.parse(l) as unknown);
@@ -31,6 +39,25 @@ export function parseSessionFile(filePath: string): ParsedSession | null {
   } catch {
     return null;
   }
+}
+
+function readUtf8FromFd(fd: number): string {
+  const stat = fs.fstatSync(fd);
+  const size = stat.size;
+  if (size === 0) {
+    return '';
+  }
+
+  const buffer = Buffer.allocUnsafe(size);
+  let bytesRead = 0;
+
+  while (bytesRead < size) {
+    const n = fs.readSync(fd, buffer, bytesRead, size - bytesRead, bytesRead);
+    if (n === 0) break;
+    bytesRead += n;
+  }
+
+  return buffer.toString('utf8', 0, bytesRead);
 }
 
 function buildSession(lines: unknown[]): ParsedSession {

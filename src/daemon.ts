@@ -9,8 +9,8 @@ import * as path from 'path';
 import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
-import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFile } from './parser.js';
+import { appendToLog, deepEqual, isPathWithinBase } from './utils.js';
+import { parseSessionFd } from './parser.js';
 import { TraceRegistry } from './traceRegistry.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +59,7 @@ interface SubagentTracker {
 interface SessionState {
   sessionId: string;
   transcriptPath: string;
+  transcriptFd: number;
   cwd: string;
   traceId: string;
 
@@ -90,6 +91,7 @@ interface TraceResolution {
 
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000; // 10 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
+const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
 
 export class GlobalDaemon {
   private server?: net.Server;
@@ -254,7 +256,8 @@ export class GlobalDaemon {
     if (this.sessions.has(sessionId)) return; // idempotent
 
     const transcriptPath = payload['transcript_path'] as string | undefined;
-    if (!transcriptPath || !GlobalDaemon.validateTranscriptPath(transcriptPath)) {
+    const transcript = transcriptPath ? GlobalDaemon.openTranscriptForRead(transcriptPath) : null;
+    if (!transcript) {
       this.log('ERROR', `Invalid or missing transcript_path for session ${sessionId}`);
       return;
     }
@@ -262,12 +265,13 @@ export class GlobalDaemon {
     const source = (payload['source'] as string | undefined) ?? 'unknown';
     const model = (payload['model'] as string | undefined) ?? 'unknown';
     const cwd = (payload['cwd'] as string | undefined) ?? '';
-    const traceResolution = await this.resolveTraceForSession(sessionId, transcriptPath, source);
-    const existingTurnCount = parseSessionFile(transcriptPath)?.turns.length ?? 0;
+    const traceResolution = await this.resolveTraceForSession(sessionId, transcript.realPath, source);
+    const existingTurnCount = parseSessionFd(transcript.fd)?.turns.length ?? 0;
 
     this.sessions.set(sessionId, {
       sessionId,
-      transcriptPath,
+      transcriptPath: transcript.realPath,
+      transcriptFd: transcript.fd,
       cwd,
       traceId: traceResolution.traceId,
       sessionCallId: traceResolution.sessionCallId,
@@ -282,7 +286,7 @@ export class GlobalDaemon {
     this.upsertTraceRegistry(
       sessionId,
       traceResolution.traceId,
-      transcriptPath,
+      transcript.realPath,
       source,
       traceResolution.sessionCallId,
     );
@@ -290,7 +294,7 @@ export class GlobalDaemon {
     this.log('INFO', `Session created: ${sessionId}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcriptPath} transcript_file=${path.basename(transcriptPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} existing_turns=${existingTurnCount} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcript.realPath} transcript_file=${path.basename(transcript.realPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} existing_turns=${existingTurnCount} active_sessions=${this.sessions.size}`,
     );
   }
 
@@ -611,7 +615,7 @@ export class GlobalDaemon {
 
     // Parse transcript for usage + model (not available in hook payloads).
     // Retry up to 3 times — the file may still be flushing when Stop fires.
-    const parsedSession = await this.parseSessionFileWithRetry(session.transcriptPath);
+    const parsedSession = await this.parseSessionFileWithRetry(session.transcriptFd);
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
     const usage = currentTurn?.totalUsage();
     const model = currentTurn?.primaryModel();
@@ -722,6 +726,11 @@ export class GlobalDaemon {
 
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
+    try {
+      fs.closeSync(session.transcriptFd);
+    } catch (err) {
+      this.log('ERROR', `Failed to close transcript fd for session ${sessionId}: ${err}`);
+    }
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -743,6 +752,13 @@ export class GlobalDaemon {
         await this.weaveClient.waitForBatchProcessing();
       } catch (err) {
         this.log('ERROR', `Error flushing Weave batch: ${err}`);
+      }
+    }
+    for (const session of this.sessions.values()) {
+      try {
+        fs.closeSync(session.transcriptFd);
+      } catch (err) {
+        this.log('ERROR', `Failed to close transcript fd for session ${session.sessionId} during shutdown: ${err}`);
       }
     }
     if (fs.existsSync(this.socketPath)) {
@@ -782,18 +798,18 @@ export class GlobalDaemon {
   /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
    *  The transcript file may still be flushing when Stop fires. */
   private async parseSessionFileWithRetry(
-    transcriptPath: string,
+    transcriptFd: number,
     attempts = 3,
     delayMs = 500,
-  ): Promise<ReturnType<typeof parseSessionFile>> {
+  ): Promise<ReturnType<typeof parseSessionFd>> {
     for (let i = 0; i < attempts; i++) {
-      const result = parseSessionFile(transcriptPath);
+      const result = parseSessionFd(transcriptFd);
       if (result?.turns.length) return result;
       if (i < attempts - 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
       }
     }
-    return parseSessionFile(transcriptPath);
+    return parseSessionFd(transcriptFd);
   }
 
   private enqueueForSession(sessionId: string, fn: () => Promise<void>): void {
@@ -849,12 +865,25 @@ export class GlobalDaemon {
     appendToLog(this.logFile, level, msg);
   }
 
-  /** Validate that a transcript path is within the user's home directory. */
-  static validateTranscriptPath(transcriptPath: string): boolean {
+  /** Open a transcript from within the user's home directory without following symlinks. */
+  static openTranscriptForRead(transcriptPath: string): { fd: number; realPath: string } | null {
     try {
-      return path.resolve(transcriptPath).startsWith(os.homedir() + path.sep);
+      const homeRealPath = fs.realpathSync.native(os.homedir());
+      const realPath = fs.realpathSync.native(transcriptPath);
+      if (!isPathWithinBase(realPath, homeRealPath)) {
+        return null;
+      }
+
+      const fd = fs.openSync(transcriptPath, O_RDONLY_NOFOLLOW);
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) {
+        fs.closeSync(fd);
+        return null;
+      }
+
+      return { fd, realPath };
     } catch {
-      return false;
+      return null;
     }
   }
 }
