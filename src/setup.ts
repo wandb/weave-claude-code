@@ -38,6 +38,19 @@ export interface PluginResult {
   pluginStatus: PluginStatus;
 }
 
+export enum RemovalStatus {
+  Removed = 'removed',
+  AlreadyAbsent = 'already_absent',
+  Failed = 'failed',
+}
+
+export interface UninstallResult {
+  marketplaceStatus: RemovalStatus;
+  pluginStatus: RemovalStatus;
+  marketplaceError?: string;
+  pluginError?: string;
+}
+
 export const CONFIG_DIR = path.join(os.homedir(), '.weave_claude_plugin');
 export const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 export const VERSION = '0.1.0';
@@ -130,6 +143,76 @@ export function registerPlugin(logFile: string): PluginResult {
   return {
     marketplaceStatus: mktAlready ? MarketplaceStatus.AlreadyRegistered : MarketplaceStatus.Registered,
     pluginStatus: pluginAlready ? PluginStatus.AlreadyInstalled : PluginStatus.Installed,
+  };
+}
+
+/**
+ * Uninstall the plugin from Claude Code and remove its marketplace.
+ *
+ * Requires the `claude` CLI to be in PATH. Idempotent — already-removed
+ * plugins or marketplaces are treated as success.
+ */
+export function unregisterPlugin(): UninstallResult {
+  const claudePath = findClaudeCLI();
+  if (!claudePath) {
+    const msg = "'claude' CLI not found in PATH. Skipping Claude plugin and marketplace removal.";
+    return {
+      pluginStatus: RemovalStatus.Failed,
+      marketplaceStatus: RemovalStatus.Failed,
+      pluginError: msg,
+      marketplaceError: msg,
+    };
+  }
+
+  let pluginStatus: RemovalStatus = RemovalStatus.Removed;
+  let pluginError: string | undefined;
+
+  const pluginResult = spawnSync(
+    claudePath,
+    ['plugin', 'uninstall', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  const pluginAlreadyAbsent = /not installed|not found|unknown plugin|no installed plugin/i
+    .test((pluginResult.stderr ?? '') + (pluginResult.stdout ?? ''));
+  if (pluginResult.status !== 0) {
+    if (pluginAlreadyAbsent) {
+      pluginStatus = RemovalStatus.AlreadyAbsent;
+    } else {
+      const output = ((pluginResult.stderr ?? '') + (pluginResult.stdout ?? '')).trim();
+      pluginStatus = RemovalStatus.Failed;
+      pluginError = `Failed to uninstall plugin '${PLUGIN_NAME}': ${output}`;
+    }
+  } else if (pluginAlreadyAbsent) {
+    pluginStatus = RemovalStatus.AlreadyAbsent;
+  }
+
+  let marketplaceStatus: RemovalStatus = RemovalStatus.Removed;
+  let marketplaceError: string | undefined;
+
+  const mktResult = spawnSync(
+    claudePath,
+    ['plugin', 'marketplace', 'remove', MARKETPLACE_NAME],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  const marketplaceAlreadyAbsent = /not found|unknown marketplace|no configured marketplace/i
+    .test((mktResult.stderr ?? '') + (mktResult.stdout ?? ''));
+  if (mktResult.status !== 0) {
+    if (marketplaceAlreadyAbsent) {
+      marketplaceStatus = RemovalStatus.AlreadyAbsent;
+    } else {
+      const output = ((mktResult.stderr ?? '') + (mktResult.stdout ?? '')).trim();
+      marketplaceStatus = RemovalStatus.Failed;
+      marketplaceError = `Failed to remove marketplace '${MARKETPLACE_NAME}': ${output}`;
+    }
+  } else if (marketplaceAlreadyAbsent) {
+    marketplaceStatus = RemovalStatus.AlreadyAbsent;
+  }
+
+  return {
+    pluginStatus,
+    marketplaceStatus,
+    pluginError,
+    marketplaceError,
   };
 }
 
