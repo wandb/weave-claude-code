@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: MIT
+# SPDX-PackageName: weave-claude-plugin
+
 # Receives a Claude Code lifecycle event on stdin (JSON) and forwards it to the
 # Weave daemon via Unix socket. Starts the daemon first if it is not running.
 #
