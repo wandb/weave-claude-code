@@ -78,3 +78,8 @@ export function appendToLog(logFile: string, level: 'DEBUG' | 'INFO' | 'WARN' | 
     // If we can't write to the log we've already printed to console — swallow
   }
 }
+
+/** Return true when targetPath is equal to basePath or nested beneath it. */
+export function isPathWithinBase(targetPath: string, basePath: string): boolean {
+  return targetPath === basePath || targetPath.startsWith(basePath + path.sep);
+}
