@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+// SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+// SPDX-License-Identifier: MIT
+// SPDX-PackageName: weave-claude-plugin
+
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync, spawn } from 'child_process';
