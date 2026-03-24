@@ -59,8 +59,12 @@ export const CONFIG_DIR = path.join(os.homedir(), '.weave_claude_plugin');
 export const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 export const VERSION = '0.1.0';
 
-// Claude Code plugin marketplace coordinates
+// Claude Code plugin marketplace coordinates. Pin installs to a release tag so
+// new users never consume whatever happens to be on the default branch at
+// install time.
 export const MARKETPLACE_REPO = 'wandb/claude_code_weave_plugin';
+export const MARKETPLACE_REF = `v${VERSION}`;
+export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#${MARKETPLACE_REF}`;
 export const MARKETPLACE_NAME = 'weave-claude-plugin';
 export const PLUGIN_NAME = 'weave';
 
@@ -119,13 +123,13 @@ export function registerPlugin(logFile: string): PluginResult {
   // Register marketplace
   const mktResult = spawnSync(
     claudePath,
-    ['plugin', 'marketplace', 'add', MARKETPLACE_REPO],
+    ['plugin', 'marketplace', 'add', MARKETPLACE_SOURCE],
     { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
   );
   const mktAlready = /already/i.test((mktResult.stderr ?? '') + (mktResult.stdout ?? ''));
   if (mktResult.status !== 0 && !mktAlready) {
     const output = ((mktResult.stderr ?? '') + (mktResult.stdout ?? '')).trim();
-    const msg = `Failed to register marketplace '${MARKETPLACE_REPO}': ${output}`;
+    const msg = `Failed to register marketplace '${MARKETPLACE_SOURCE}': ${output}`;
     appendToLog(logFile, 'ERROR', msg);
     throw new Error(msg);
   }
