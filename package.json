@@ -10,7 +10,11 @@
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
-    "dev": "tsx src/cli.ts"
+    "dev": "tsx src/cli.ts",
+    "secrets:scan": "gitleaks dir . --no-banner --redact",
+    "secrets:scan:staged": "gitleaks git --pre-commit --staged --redact --verbose",
+    "check": "npm run build && npm run secrets:scan",
+    "setup-hooks": "node scripts/install-git-hooks.mjs"
   },
   "dependencies": {
     "uuidv7": "1.2.1",

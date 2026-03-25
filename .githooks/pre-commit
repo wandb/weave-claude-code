@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+npm run secrets:scan:staged
+npm run build
