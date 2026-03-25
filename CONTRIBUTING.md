@@ -2,6 +2,17 @@
 
 Until further notice, this project does not accept external contributions as of March 2026.
 
+## Local checks
+
+This repository uses npm-driven checks and a repo-managed Git pre-commit hook,
+including secret scanning with `gitleaks`.
+
+```shell
+npm install
+npm run setup-hooks
+npm run check
+```
+
 ## License headers
 <!--- REUSE-IgnoreStart -->
 
