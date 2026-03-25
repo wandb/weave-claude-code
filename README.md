@@ -53,6 +53,29 @@ Sessions are traced automatically from this point. Open your Weave project to se
 
 ---
 
+## Data Disclosure
+
+This plugin sends Claude Code session data to W&B Weave.
+
+That data can include sensitive content, including:
+- user prompts
+- Claude responses
+- tool inputs
+- tool outputs
+- file paths and file contents read by Claude Code tools
+- shell commands and shell output
+- fetched URLs and fetched page content
+
+If Claude Code accesses secrets, credentials, proprietary source code, personal
+data, or other confidential material during a session, that information may be
+logged to W&B Weave as part of the trace.
+
+PII scrubbing and sensitive-data redaction are **not yet implemented** in the
+current version. If you cannot send this data to W&B Weave under your security
+or compliance requirements, do not install or enable this plugin yet.
+
+---
+
 ## Configuration
 
 ```bash
@@ -151,7 +174,14 @@ claude_code.session
             └─ claude_code.tool.*
 ```
 
-Each trace includes token usage, model name, tool inputs/outputs, and timing.
+Each trace includes token usage, model name, tool inputs/outputs, timing, and
+the textual content associated with prompts and responses.
+
+Important: tool inputs and outputs may contain sensitive information. In
+practice this can include file contents, command output, URLs, fetched content,
+and other data handled by Claude Code during a session. That information is sent
+to W&B Weave. PII scrubbing/redaction is planned for a future release, but is
+not available today.
 
 ---
 
