@@ -1,6 +1,6 @@
 {
   "name": "weave-claude-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Track Claude Code sessions in Weave for observability and debugging",
   "type": "module",
   "main": "dist/index.js",
@@ -13,7 +13,7 @@
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
-    "uuidv7": "^0.6.3",
+    "uuidv7": "1.2.1",
     "weave": "^0.12.1"
   },
   "devDependencies": {
