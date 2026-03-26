@@ -83,33 +83,35 @@ The log file is also directly at `~/.weave_claude_plugin/logs/daemon.log`.
 
 Once the plugin is installed, three skills are available directly inside any Claude Code session:
 
-### `/weave:install`
+To avoid collisions with Claude Code's built-in skills, the config and status skills use unique hyphenated names. Their user-facing commands are `/weave:weave-config` and `/weave:weave-status`.
+
+### `/weave:weave-install`
 
 Walks through the full installation and configuration flow interactively. Use this on a fresh machine or to diagnose a broken setup. Claude will check for the CLI, run the installer, prompt for missing config values, and verify everything is working.
 
 ```
-/weave:install
+/weave:weave-install
 ```
 
-### `/weave:status`
+### `/weave:weave-status`
 
 Checks the current plugin status and explains any issues. Equivalent to running `weave-claude-plugin status` but Claude interprets the output and tells you exactly what to fix.
 
 ```
-/weave:status
+/weave:weave-status
 ```
 
-### `/weave:config`
+### `/weave:weave-config`
 
 Read or update plugin configuration without leaving Claude Code.
 
 ```
 # Show current config
-/weave:config
+/weave:weave-config
 
 # Set a value directly
-/weave:config set weave_project my-entity/my-project
-/weave:config set wandb_api_key <your-api-key>
+/weave:weave-config set weave_project my-entity/my-project
+/weave:weave-config set wandb_api_key <your-api-key>
 ```
 
 ---
