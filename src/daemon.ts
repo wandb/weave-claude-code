@@ -11,6 +11,7 @@ import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFile } from './parser.js';
+import { TraceRegistry } from './traceRegistry.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -77,6 +78,12 @@ interface SessionState {
   subagentByAgentId: Map<string, SubagentTracker>;
 }
 
+interface TraceResolution {
+  traceId: string;
+  sessionCallId?: string;
+  source: 'new' | 'registry-session' | 'registry-transcript';
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +98,7 @@ export class GlobalDaemon {
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private weaveClient: WeaveClient | null = null;
+  private traceRegistry = new TraceRegistry();
 
   constructor(
     private readonly socketPath: string,
@@ -100,6 +108,9 @@ export class GlobalDaemon {
   ) {}
 
   async start(): Promise<void> {
+    const loadedRegistryEntries = this.traceRegistry.load();
+    this.log('DEBUG', `Loaded trace registry: ${loadedRegistryEntries} entries`);
+
     // Initialize Weave client if a project is configured
     if (this.weaveProject) {
       try {
@@ -248,12 +259,19 @@ export class GlobalDaemon {
       return;
     }
 
+    const source = (payload['source'] as string | undefined) ?? 'unknown';
+    const model = (payload['model'] as string | undefined) ?? 'unknown';
+    const cwd = (payload['cwd'] as string | undefined) ?? '';
+    const traceResolution = await this.resolveTraceForSession(sessionId, transcriptPath, source);
+    const existingTurnCount = parseSessionFile(transcriptPath)?.turns.length ?? 0;
+
     this.sessions.set(sessionId, {
       sessionId,
       transcriptPath,
-      cwd: (payload['cwd'] as string | undefined) ?? '',
-      traceId: uuidv7(),
-      turnNumber: 0,
+      cwd,
+      traceId: traceResolution.traceId,
+      sessionCallId: traceResolution.sessionCallId,
+      turnNumber: existingTurnCount,
       totalToolCalls: 0,
       turnToolCalls: 0,
       toolCounts: {},
@@ -261,8 +279,19 @@ export class GlobalDaemon {
       subagentTrackers: new Map(),
       subagentByAgentId: new Map(),
     });
+    this.upsertTraceRegistry(
+      sessionId,
+      traceResolution.traceId,
+      transcriptPath,
+      source,
+      traceResolution.sessionCallId,
+    );
 
     this.log('INFO', `Session created: ${sessionId}`);
+    this.log(
+      'DEBUG',
+      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcriptPath} transcript_file=${path.basename(transcriptPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} existing_turns=${existingTurnCount} active_sessions=${this.sessions.size}`,
+    );
   }
 
   private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
@@ -273,6 +302,10 @@ export class GlobalDaemon {
     }
 
     const prompt = (payload['prompt'] as string | undefined) ?? '';
+    this.log(
+      'DEBUG',
+      `UserPromptSubmit: session=${sessionId} trace_id=${session.traceId} existing_session_call=${session.sessionCallId ?? 'none'} current_turn_call=${session.currentTurnCallId ?? 'none'} turn_number=${session.turnNumber} prompt=${GlobalDaemon.promptSnippet(prompt, 120)}`,
+    );
 
     // Create the top-level session call on the first turn
     if (!session.sessionCallId && this.weaveClient) {
@@ -294,6 +327,13 @@ export class GlobalDaemon {
         },
       });
       this.log('INFO', `Created session call: ${callId}`);
+      this.upsertTraceRegistry(
+        session.sessionId,
+        session.traceId,
+        session.transcriptPath,
+        'session_call_created',
+        session.sessionCallId,
+      );
     }
 
     // Create a turn call for every prompt
@@ -575,6 +615,11 @@ export class GlobalDaemon {
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
     const usage = currentTurn?.totalUsage();
     const model = currentTurn?.primaryModel();
+    const transcriptTurns = parsedSession?.turns.length ?? 0;
+    this.log(
+      'DEBUG',
+      `Stop: session=${sessionId} trace_id=${session.traceId} turn_call=${session.currentTurnCallId} transcript_path=${session.transcriptPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+    );
 
     // Weave expects summary.usage keyed by model name: { "model-name": { input_tokens, output_tokens } }
     const usageSummary = usage && model ? { [model]: usage } : {};
@@ -586,6 +631,7 @@ export class GlobalDaemon {
       output: { assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
       summary: { usage: usageSummary, tool_count: session.turnToolCalls },
     });
+    session.currentTurnCallId = undefined;
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
@@ -593,6 +639,18 @@ export class GlobalDaemon {
   private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+
+    this.log(
+      'DEBUG',
+      `SessionEnd: session=${sessionId} trace_id=${session.traceId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcriptPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagentByAgentId.size}`,
+    );
+    this.upsertTraceRegistry(
+      session.sessionId,
+      session.traceId,
+      session.transcriptPath,
+      (payload['reason'] as string | undefined) ?? 'session_end',
+      session.sessionCallId,
+    );
 
     if (this.weaveClient) {
       const now = new Date().toISOString();
@@ -742,6 +800,48 @@ export class GlobalDaemon {
     const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve();
     const next = prev.then(fn).catch((err) => this.log('ERROR', `Queue error for session ${sessionId}: ${err}`));
     this.sessionQueues.set(sessionId, next);
+  }
+
+  private upsertTraceRegistry(
+    sessionId: string,
+    traceId: string,
+    transcriptPath: string,
+    source: string,
+    sessionCallId?: string,
+  ): void {
+    try {
+      this.traceRegistry.upsert(sessionId, traceId, transcriptPath, source, sessionCallId);
+    } catch (err) {
+      this.log('ERROR', `Failed to update trace registry: ${err}`);
+    }
+  }
+
+  private async resolveTraceForSession(
+    sessionId: string,
+    transcriptPath: string,
+    sessionSource: string,
+  ): Promise<TraceResolution> {
+    if (sessionSource === 'resume') {
+      const bySession = this.traceRegistry.getBySessionId(sessionId);
+      if (bySession) {
+        return {
+          traceId: bySession.traceId,
+          sessionCallId: bySession.sessionCallId,
+          source: 'registry-session',
+        };
+      }
+
+      const byTranscript = this.traceRegistry.getByTranscriptPath(transcriptPath);
+      if (byTranscript) {
+        return {
+          traceId: byTranscript.traceId,
+          sessionCallId: byTranscript.sessionCallId,
+          source: 'registry-transcript',
+        };
+      }
+    }
+
+    return { traceId: uuidv7(), source: 'new' };
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
