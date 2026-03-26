@@ -1,5 +1,5 @@
 ---
-name: install
+name: weave-install
 description: This skill should be used when the user wants to "install the weave plugin", "set up weave", "install weave-claude-plugin", "configure weave for the first time", "get started with weave tracing", or needs to complete the initial setup of the Weave Claude Code plugin including dependency installation and project configuration.
 ---
 
