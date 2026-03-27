@@ -23,9 +23,9 @@ This will:
 
 Marketplace installs are pinned to a specific release tag rather than the
 repository default branch. When cutting a new release, create the matching
-protected tag (for example `v0.1.0`) and update the pinned ref in
-[`src/setup.ts`](/Users/chance.an/develop/claude_code_plugin/src/setup.ts) and
-[`./.claude-plugin/marketplace.json`](/Users/chance.an/develop/claude_code_plugin/.claude-plugin/marketplace.json)
+protected tag (for example `v0.1.1`) and update the pinned ref and sha in
+[`src/setup.ts`](src/setup.ts) and in
+[`./.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)
 before publishing.
 
 Your W&B API key is available at https://wandb.ai/authorize.
