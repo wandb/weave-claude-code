@@ -49,9 +49,11 @@ Commands:
 Options:
   --version, -v      Print version
   --help, -h         Print this help message
+  --non-interactive  Skip install prompts and rely on env/config values
 
 Examples:
   weave-claude-plugin install
+  weave-claude-plugin install --non-interactive
   weave-claude-plugin config set weave_project my-entity/my-project
   weave-claude-plugin status
   weave-claude-plugin logs --tail 100
@@ -61,8 +63,7 @@ Examples:
 // install
 // ---------------------------------------------------------------------------
 
-async function cmdInstall(force: boolean): Promise<void> {
-  let configResult;
+async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void> {
   if (fs.existsSync(SETTINGS_FILE) && !force) {
     let settings: Settings;
     try {
@@ -117,7 +118,28 @@ async function cmdInstall(force: boolean): Promise<void> {
   const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
 
-  if (process.stdin.isTTY) {
+  if (nonInteractive) {
+    console.log('\n- Non-interactive install: skipping setup prompts');
+
+    const envProject = process.env['WEAVE_PROJECT'];
+    const envApiKey = process.env['WANDB_API_KEY'];
+
+    if (envProject) {
+      if (!envProject.includes('/')) {
+        console.error(`✗ Invalid WEAVE_PROJECT: '${effectiveProject}' — expected entity/project`);
+        process.exit(1);
+      }
+      console.warn(`⚠ Using WEAVE_PROJECT from environment: ${envProject}`);
+    } else if (!effectiveProject) {
+      console.warn('- WEAVE_PROJECT not set. Run: weave-claude-plugin config set weave_project ENTITY/PROJECT');
+    }
+
+    if (envApiKey) {
+      console.warn(`⚠ Using WANDB_API_KEY from environment: ${envApiKey.slice(0, 4)}…`);
+    } else if (!effectiveApiKey) {
+      console.warn('- WANDB_API_KEY not set. Run: weave-claude-plugin config set wandb_api_key <your-api-key>');
+    }
+  } else if (process.stdin.isTTY) {
     if (!effectiveProject) {
       const answer = await prompt('\nWeave project (ENTITY/PROJECT): ');
       const value = answer.trim();
@@ -493,7 +515,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'install') {
-    await cmdInstall(args.includes('--force'));
+    await cmdInstall(args.includes('--force'), args.includes('--non-interactive'));
     return;
   }
 

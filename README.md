@@ -30,6 +30,19 @@ before publishing.
 
 Your W&B API key is available at https://wandb.ai/authorize.
 
+For CI, bootstrap scripts, or other automated systems, you can skip prompts:
+
+```bash
+WEAVE_PROJECT=my-entity/my-project \
+WANDB_API_KEY=<your-api-key> \
+weave-claude-plugin install --non-interactive
+```
+
+In non-interactive mode, the installer still creates config, registers the Claude marketplace, and installs the plugin. It does not prompt for missing values. Instead, it:
+- Uses `WEAVE_PROJECT` and `WANDB_API_KEY` from the environment when present
+- Warns and continues if either value is missing
+- Leaves environment-provided values in the environment rather than writing them into `settings.json`
+
 **3. Launch Claude Code from any folder**
 
 ```bash
@@ -59,6 +72,8 @@ You can also set these via environment variables — they take precedence over t
 export WEAVE_PROJECT=my-entity/my-project
 export WANDB_API_KEY=<your-api-key>
 ```
+
+This is especially useful with `weave-claude-plugin install --non-interactive`, where the installer checks these variables instead of prompting.
 
 ---
 
