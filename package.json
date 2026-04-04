@@ -8,7 +8,7 @@
     "weave-claude-plugin": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/build/copy-version-module.mjs",
     "build:watch": "tsc --watch",
     "dev": "tsx src/cli.ts",
     "secrets:scan": "gitleaks dir . --no-banner --redact",
@@ -21,7 +21,7 @@
     "weave": "^0.12.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^24.12.2",
     "tsx": "^4.19.0",
     "typescript": "^5.9.3"
   },
