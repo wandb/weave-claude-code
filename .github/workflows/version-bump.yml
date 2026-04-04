@@ -1,0 +1,68 @@
+name: Version Bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 0.1.2
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: version-bump-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version-bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create version bump commit
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/release/bump-version.mjs "$VERSION"
+          git add src/version.mjs package.json package-lock.json .claude-plugin/plugin.json .claude-plugin/marketplace.json
+          git commit -m "chore: bump version to $VERSION"
+
+      - name: Create marketplace sha commit
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          FIRST_COMMIT_SHA="$(git rev-parse HEAD)"
+          node scripts/release/update-marketplace-sha.mjs "$FIRST_COMMIT_SHA"
+          git add .claude-plugin/marketplace.json
+          git commit -m "chore: update marketplace sha for v$VERSION"
+
+      - name: Create runtime marketplace ref commit
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          SECOND_COMMIT_SHA="$(git rev-parse HEAD)"
+          node scripts/release/update-version-module-ref.mjs "$SECOND_COMMIT_SHA"
+          git add src/version.mjs
+          git commit -m "chore: update marketplace ref for v$VERSION"
+
+      - name: Push commits
+        run: git push origin HEAD:${GITHUB_REF_NAME}
