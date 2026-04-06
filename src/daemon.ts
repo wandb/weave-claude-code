@@ -10,7 +10,7 @@ import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog, deepEqual, isPathWithinBase } from './utils.js';
-import { parseSessionFd } from './parser.js';
+import { parseSessionFd, UsageSummary } from './parser.js';
 import { TraceRegistry } from './traceRegistry.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +72,7 @@ interface SessionState {
   totalToolCalls: number;
   turnToolCalls: number;
   toolCounts: Record<string, number>;
+  totalUsage: Record<string, UsageSummary>;
   pendingToolCalls: Map<string, PendingToolCall>;
 
   // Subagent tracking (keyed by toolUseId; secondary index by agentId)
@@ -297,6 +298,7 @@ export class GlobalDaemon {
       pendingToolCalls: new Map(),
       subagentTrackers: new Map(),
       subagentByAgentId: new Map(),
+      totalUsage: {},
     });
     this.upsertTraceRegistry(
       sessionId,
@@ -643,6 +645,19 @@ export class GlobalDaemon {
     // Weave expects summary.usage keyed by model name: { "model-name": { input_tokens, output_tokens } }
     const usageSummary = usage && model ? { [model]: usage } : {};
 
+    // Accumulate into session totals for roll-up at SessionEnd
+    if (usage && model) {
+      const existing = session.totalUsage[model];
+      if (existing) {
+        existing.input_tokens += usage.input_tokens;
+        existing.output_tokens += usage.output_tokens;
+        existing.cache_read_input_tokens = (existing.cache_read_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+        existing.cache_creation_input_tokens = (existing.cache_creation_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+      } else {
+        session.totalUsage[model] = { ...usage };
+      }
+    }
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: session.currentTurnCallId,
@@ -729,6 +744,7 @@ export class GlobalDaemon {
           ended_at: now,
           output: { reason: (payload['reason'] as string | undefined) ?? '' },
           summary: {
+            usage: session.totalUsage,
             turn_count: session.turnNumber,
             tool_count: session.totalToolCalls,
             tool_counts: session.toolCounts,
