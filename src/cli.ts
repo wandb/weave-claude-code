@@ -64,6 +64,7 @@ Examples:
 // ---------------------------------------------------------------------------
 
 async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void> {
+  let configResult;
   if (fs.existsSync(SETTINGS_FILE) && !force) {
     let settings: Settings;
     try {
