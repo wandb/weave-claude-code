@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-plugin
 
-import * as fs from 'fs';
 import * as net from 'net';
-import * as os from 'os';
+import * as fs from 'fs';
 import * as path from 'path';
 import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
-import { appendToLog, deepEqual, isPathWithinBase } from './utils.js';
+import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd, UsageSummary } from './parser.js';
 import { TraceRegistry } from './traceRegistry.js';
+import { TranscriptFile } from './transcriptFile.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -58,8 +58,7 @@ interface SubagentTracker {
 
 interface SessionState {
   sessionId: string;
-  transcriptPath: string;
-  transcriptFd: number;
+  transcript: TranscriptFile;
   cwd: string;
   traceId: string;
 
@@ -92,7 +91,7 @@ interface TraceResolution {
 
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
-const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
 export class GlobalDaemon {
@@ -271,27 +270,34 @@ export class GlobalDaemon {
   private async handleSessionStart(sessionId: string, payload: HookPayload): Promise<void> {
     if (this.sessions.has(sessionId)) return; // idempotent
 
-    const transcriptPath = payload['transcript_path'] as string | undefined;
-    const transcript = transcriptPath ? GlobalDaemon.openTranscriptForRead(transcriptPath) : null;
-    if (!transcript) {
-      this.log('ERROR', `Invalid or missing transcript_path for session ${sessionId}`);
+    const rawPath = payload['transcript_path'] as string | undefined;
+    if (!rawPath) {
+      this.log('ERROR', `Missing transcript_path for session ${sessionId}`);
+      return;
+    }
+
+    // Validate path is within home dir — no file I/O required so this works even before
+    // Claude Code has written the transcript to disk.
+    let transcript: TranscriptFile;
+    try {
+      transcript = new TranscriptFile(rawPath);
+    } catch (err) {
+      this.log('ERROR', `Invalid transcript_path for session ${sessionId}: ${err}`);
       return;
     }
 
     const source = (payload['source'] as string | undefined) ?? 'unknown';
     const model = (payload['model'] as string | undefined) ?? 'unknown';
     const cwd = (payload['cwd'] as string | undefined) ?? '';
-    const traceResolution = await this.resolveTraceForSession(sessionId, transcript.realPath, source);
-    const existingTurnCount = parseSessionFd(transcript.fd)?.turns.length ?? 0;
+    const traceResolution = await this.resolveTraceForSession(sessionId, transcript.resolvedPath, source);
 
     this.sessions.set(sessionId, {
       sessionId,
-      transcriptPath: transcript.realPath,
-      transcriptFd: transcript.fd,
+      transcript,
       cwd,
       traceId: traceResolution.traceId,
       sessionCallId: traceResolution.sessionCallId,
-      turnNumber: existingTurnCount,
+      turnNumber: 0,
       totalToolCalls: 0,
       turnToolCalls: 0,
       toolCounts: {},
@@ -303,7 +309,7 @@ export class GlobalDaemon {
     this.upsertTraceRegistry(
       sessionId,
       traceResolution.traceId,
-      transcript.realPath,
+      transcript.resolvedPath,
       source,
       traceResolution.sessionCallId,
     );
@@ -311,7 +317,7 @@ export class GlobalDaemon {
     this.log('INFO', `Session created: ${sessionId}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcript.realPath} transcript_file=${path.basename(transcript.realPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} existing_turns=${existingTurnCount} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} active_sessions=${this.sessions.size}`,
     );
   }
 
@@ -351,7 +357,7 @@ export class GlobalDaemon {
       this.upsertTraceRegistry(
         session.sessionId,
         session.traceId,
-        session.transcriptPath,
+        session.transcript.resolvedPath,
         'session_call_created',
         session.sessionCallId,
       );
@@ -632,14 +638,14 @@ export class GlobalDaemon {
 
     // Parse transcript for usage + model (not available in hook payloads).
     // Retry up to 3 times — the file may still be flushing when Stop fires.
-    const parsedSession = await this.parseSessionFileWithRetry(session.transcriptFd);
+    const parsedSession = await this.parseSessionFileWithRetry(session.transcript);
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
     const usage = currentTurn?.totalUsage();
     const model = currentTurn?.primaryModel();
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.traceId} turn_call=${session.currentTurnCallId} transcript_path=${session.transcriptPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} trace_id=${session.traceId} turn_call=${session.currentTurnCallId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
     // Weave expects summary.usage keyed by model name: { "model-name": { input_tokens, output_tokens } }
@@ -676,12 +682,12 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} trace_id=${session.traceId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcriptPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagentByAgentId.size}`,
+      `SessionEnd: session=${sessionId} trace_id=${session.traceId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagentByAgentId.size}`,
     );
     this.upsertTraceRegistry(
       session.sessionId,
       session.traceId,
-      session.transcriptPath,
+      session.transcript.resolvedPath,
       (payload['reason'] as string | undefined) ?? 'session_end',
       session.sessionCallId,
     );
@@ -757,11 +763,7 @@ export class GlobalDaemon {
 
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
-    try {
-      fs.closeSync(session.transcriptFd);
-    } catch (err) {
-      this.log('ERROR', `Failed to close transcript fd for session ${sessionId}: ${err}`);
-    }
+    session.transcript.close();
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -786,11 +788,7 @@ export class GlobalDaemon {
       }
     }
     for (const session of this.sessions.values()) {
-      try {
-        fs.closeSync(session.transcriptFd);
-      } catch (err) {
-        this.log('ERROR', `Failed to close transcript fd for session ${session.sessionId} during shutdown: ${err}`);
-      }
+      session.transcript.close();
     }
     if (fs.existsSync(this.socketPath)) {
       fs.unlinkSync(this.socketPath);
@@ -829,18 +827,25 @@ export class GlobalDaemon {
   /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
    *  The transcript file may still be flushing when Stop fires. */
   private async parseSessionFileWithRetry(
-    transcriptFd: number,
+    transcript: TranscriptFile,
     attempts = 3,
     delayMs = 500,
   ): Promise<ReturnType<typeof parseSessionFd>> {
+    let fd: number;
+    try {
+      fd = transcript.getFd();
+    } catch (err) {
+      this.log('ERROR', `Cannot open transcript for parsing: ${err}`);
+      return null;
+    }
     for (let i = 0; i < attempts; i++) {
-      const result = parseSessionFd(transcriptFd);
+      const result = parseSessionFd(fd);
       if (result?.turns.length) return result;
       if (i < attempts - 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
       }
     }
-    return parseSessionFd(transcriptFd);
+    return parseSessionFd(fd);
   }
 
   private enqueueForSession(sessionId: string, fn: () => Promise<void>): void {
@@ -896,27 +901,6 @@ export class GlobalDaemon {
     appendToLog(this.logFile, level, msg);
   }
 
-  /** Open a transcript from within the user's home directory without following symlinks. */
-  static openTranscriptForRead(transcriptPath: string): { fd: number; realPath: string } | null {
-    try {
-      const homeRealPath = fs.realpathSync.native(os.homedir());
-      const realPath = fs.realpathSync.native(transcriptPath);
-      if (!isPathWithinBase(realPath, homeRealPath)) {
-        return null;
-      }
-
-      const fd = fs.openSync(transcriptPath, O_RDONLY_NOFOLLOW);
-      const stat = fs.fstatSync(fd);
-      if (!stat.isFile()) {
-        fs.closeSync(fd);
-        return null;
-      }
-
-      return { fd, realPath };
-    } catch {
-      return null;
-    }
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

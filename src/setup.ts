@@ -64,7 +64,7 @@ export const VERSION = '0.1.1';
 // install time.
 export const MARKETPLACE_REPO = 'wandb/claude_code_weave_plugin';
 export const MARKETPLACE_REF = `df2980951dcd409d9081771a90c4a9f897a7db3d`;
-export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#${MARKETPLACE_REF}`;
+export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#v${VERSION}`;
 export const MARKETPLACE_NAME = 'weave-claude-plugin';
 export const PLUGIN_NAME = 'weave';
 
