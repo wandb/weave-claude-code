@@ -24,7 +24,6 @@ if (currentMetadata.version === nextVersion) {
 
 writeVersionModule({
   version: nextVersion,
-  marketplaceRef: currentMetadata.marketplaceRef,
 });
 updateJsonFile('package.json', (data) => {
   data.version = nextVersion;

@@ -23,6 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
+          token: ${{ secrets.WANDBMACHINE_GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -32,8 +33,22 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name "wandbmachine"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Check tag conflict
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists locally"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q .; then
+            echo "Tag v$VERSION already exists on origin"
+            exit 1
+          fi
 
       - name: Create version bump commit
         env:
@@ -54,15 +69,17 @@ jobs:
           git add .claude-plugin/marketplace.json
           git commit -m "chore: update marketplace sha for v$VERSION"
 
-      - name: Create runtime marketplace ref commit
+      - name: Create release tag
         env:
           VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          SECOND_COMMIT_SHA="$(git rev-parse HEAD)"
-          node scripts/release/update-version-module-ref.mjs "$SECOND_COMMIT_SHA"
-          git add src/version.mjs
-          git commit -m "chore: update marketplace ref for v$VERSION"
+          git tag "v$VERSION"
 
-      - name: Push commits
-        run: git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Push commits and tag
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin "v$VERSION"
