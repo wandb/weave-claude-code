@@ -7,9 +7,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { findClaudeCLI, appendToLog } from './utils.js';
-import { MARKETPLACE_REF, VERSION } from './version.mjs';
+import { VERSION } from './version.mjs';
 
-export { MARKETPLACE_REF, VERSION };
+export { VERSION };
 
 export interface Settings {
   log_file: string;
@@ -65,7 +65,8 @@ export const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 // new users never consume whatever happens to be on the default branch at
 // install time.
 export const MARKETPLACE_REPO = 'wandb/claude_code_weave_plugin';
-export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#v${VERSION}`;
+export const MARKETPLACE_REF = `v${VERSION}`;
+export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#${MARKETPLACE_REF}`;
 export const MARKETPLACE_NAME = 'weave-claude-plugin';
 export const PLUGIN_NAME = 'weave';
 
