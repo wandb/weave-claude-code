@@ -21,7 +21,7 @@
     "weave": "^0.12.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^25.5.2",
     "tsx": "^4.19.0",
     "typescript": "^5.9.3"
   },
