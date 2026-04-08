@@ -36,7 +36,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/wandb/claude_code_weave_plugin"
+    "url": "git+https://github.com/wandb/claude_code_weave_plugin.git"
   },
   "license": "MIT"
 }
