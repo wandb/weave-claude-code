@@ -100,6 +100,42 @@ This is especially useful with `weave-claude-plugin install --non-interactive`, 
 
 ---
 
+## Sending Traces to a Dedicated or Private W&B Instance
+
+If you use W&B Dedicated Cloud or a self-hosted instance, set `WANDB_BASE_URL` to point the plugin at your deployment before launching Claude Code:
+
+```bash
+export WANDB_BASE_URL=https://your-instance.wandb.io
+```
+
+**Important:** The plugin runs a background daemon that creates the Weave client at startup. If `WANDB_BASE_URL` is set after the daemon is already running, it will have no effect — the daemon must be restarted with the variable present in its environment.
+
+**Workaround if the daemon is already running:**
+
+1. Shut down the daemon:
+   ```bash
+   printf '{"command":"shutdown"}' | nc -U -w1 ~/.weave_claude_plugin/daemon.sock
+   ```
+2. Point the plugin at your instance using either approach:
+
+   **Option A — environment variable** (takes effect for the current shell session):
+   ```bash
+   export WANDB_BASE_URL=https://your-instance.wandb.io
+   ```
+
+   **Option B — `wandb login`** (persists across sessions via `~/.config/wandb/settings`):
+   ```bash
+   wandb login --host https://your-instance.wandb.io
+   ```
+   This writes the host URL to `$HOME/.config/wandb/settings`, which the Weave client reads automatically — no env var required on future launches.
+
+3. Relaunch Claude Code — the daemon will start fresh and pick up the correct URL:
+   ```bash
+   claude
+   ```
+
+---
+
 ## Check Status
 
 ```bash
