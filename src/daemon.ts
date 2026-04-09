@@ -62,6 +62,8 @@ interface SessionState {
   cwd: string;
   traceId: string;
 
+  parentCallId?: string;  // set when WEAVE_PARENT_CALL_ID is injected by a parent op
+
   // Weave call IDs
   sessionCallId?: string;
   currentTurnCallId?: string;
@@ -289,13 +291,18 @@ export class GlobalDaemon {
     const source = (payload['source'] as string | undefined) ?? 'unknown';
     const model = (payload['model'] as string | undefined) ?? 'unknown';
     const cwd = (payload['cwd'] as string | undefined) ?? '';
+    const parentCallId = (payload['weave_parent_call_id'] as string | undefined) || undefined;
+    const parentTraceId = (payload['weave_trace_id'] as string | undefined) || undefined;
+
     const traceResolution = await this.resolveTraceForSession(sessionId, transcript.resolvedPath, source);
+    const traceId = parentTraceId ?? traceResolution.traceId;
 
     this.sessions.set(sessionId, {
       sessionId,
       transcript,
       cwd,
-      traceId: traceResolution.traceId,
+      traceId,
+      parentCallId,
       sessionCallId: traceResolution.sessionCallId,
       turnNumber: 0,
       totalToolCalls: 0,
@@ -308,7 +315,7 @@ export class GlobalDaemon {
     });
     this.upsertTraceRegistry(
       sessionId,
-      traceResolution.traceId,
+      traceId,
       transcript.resolvedPath,
       source,
       traceResolution.sessionCallId,
@@ -343,7 +350,7 @@ export class GlobalDaemon {
         id: callId,
         op_name: 'claude_code.session',
         trace_id: session.traceId,
-        parent_id: null,
+        parent_id: session.parentCallId ?? null,
         started_at: new Date().toISOString(),
         display_name: `Claude Code: ${GlobalDaemon.promptSnippet(prompt)}`,
         inputs: { prompt },

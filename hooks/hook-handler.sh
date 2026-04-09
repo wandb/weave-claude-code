@@ -87,6 +87,16 @@ fi
 # ── forward event to daemon ───────────────────────────────────────────────────
 
 EVENT_PAYLOAD=$(cat)
+
+# Inject parent Weave call context so the daemon can nest this session
+# under an external @weave.op (values are UUIDs — safe for literal embedding).
+EXTRA=""
+[ -n "${WEAVE_PARENT_CALL_ID:-}" ] && EXTRA="${EXTRA},\"weave_parent_call_id\":\"${WEAVE_PARENT_CALL_ID}\""
+[ -n "${WEAVE_TRACE_ID:-}" ] && EXTRA="${EXTRA},\"weave_trace_id\":\"${WEAVE_TRACE_ID}\""
+if [ -n "${EXTRA}" ]; then
+  EVENT_PAYLOAD="${EVENT_PAYLOAD%\}}${EXTRA}}"
+fi
+
 printf '%s' "${EVENT_PAYLOAD}" | nc -U -w1 "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
   echo "$(date -Iseconds) | ERROR | Failed to send event to daemon" >> "${ERROR_LOG}"
 }
