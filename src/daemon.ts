@@ -629,7 +629,7 @@ export class GlobalDaemon {
       project_id: this.weaveClient.projectId,
       id: tracker.subagentWeaveCallId,
       ended_at: new Date().toISOString(),
-      output: { reason: (payload['reason'] as string | undefined) ?? '' },
+      output: { last_assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
       summary: {},
     });
 
