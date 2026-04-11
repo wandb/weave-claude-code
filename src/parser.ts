@@ -14,6 +14,7 @@ export interface UsageSummary {
 export interface Turn {
   totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
+  textBlocks(): string[];
 }
 
 export interface ParsedSession {
@@ -117,8 +118,26 @@ function buildTurn(assistantMsgs: unknown[]): Turn {
     .filter(Boolean)
     .pop();
 
+  const texts: string[] = [];
+  for (const msg of assistantMsgs) {
+    const m = msg as Record<string, unknown>;
+    const message = m['message'] as Record<string, unknown> | undefined;
+    const content = message?.['content'];
+
+    if (typeof content === 'string' && content.trim()) {
+      texts.push(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content as Array<Record<string, unknown>>) {
+        if (block['type'] === 'text' && typeof block['text'] === 'string' && block['text'].trim()) {
+          texts.push(block['text']);
+        }
+      }
+    }
+  }
+
   return {
     totalUsage: () => usage,
     primaryModel: () => model,
+    textBlocks: () => texts,
   };
 }
