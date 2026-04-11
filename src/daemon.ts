@@ -700,11 +700,20 @@ export class GlobalDaemon {
       session.totalUsage[model] = existing ? addUsage(existing, usage) : { ...usage };
     }
 
+    const parsedTexts = currentTurn?.textBlocks() ?? [];
+    const lastMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
+
+    // Use parsed transcript texts if available; fall back to hook payload
+    const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: session.currentTurnCallId,
       ended_at: new Date().toISOString(),
-      output: { assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
+      output: {
+        assistant_message: lastMessage,                // backwards compat: final response
+        assistant_messages: assistantMessages,          // all text blocks in order
+      },
       summary: { usage: usageSummary, tool_count: session.turnToolCalls },
     });
     session.currentTurnCallId = undefined;
