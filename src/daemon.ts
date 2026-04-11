@@ -5,7 +5,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
-import { init, WeaveClient } from 'weave';
+import { init, WeaveClient, op } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
@@ -85,6 +85,15 @@ interface TraceResolution {
   source: 'new' | 'registry-session' | 'registry-transcript';
 }
 
+/** Registered Weave op refs, keyed by call-site name. Each value has a .uri() method. */
+interface OpRegistry {
+  session: { uri(): string };
+  turn: { uri(): string };
+  tool: { uri(): string };
+  permissionRequest: { uri(): string };
+  subagent: { uri(): string };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +110,7 @@ export class GlobalDaemon {
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private weaveClient: WeaveClient | null = null;
+  private opRegistry: OpRegistry | null = null;
   private traceRegistry = new TraceRegistry();
 
   constructor(
@@ -119,6 +129,13 @@ export class GlobalDaemon {
       try {
         this.weaveClient = await init(this.weaveProject);
         this.log('INFO', `Weave initialized for project: ${this.weaveProject}`);
+        try {
+          this.opRegistry = await this.registerOps(this.weaveClient);
+          this.log('INFO', `Registered ${Object.keys(this.opRegistry).length} Weave ops`);
+        } catch (err) {
+          this.log('ERROR', `Failed to register Weave ops: ${err} — using fallback op names`);
+          this.opRegistry = null;
+        }
       } catch (err) {
         this.log('ERROR', `Failed to initialize Weave: ${err} — continuing without Weave`);
         this.weaveClient = null;
@@ -148,6 +165,27 @@ export class GlobalDaemon {
     process.on('SIGINT',  () => void this.shutdown('SIGINT'));
 
     setInterval(() => this.checkInactivity(), 60_000).unref();
+  }
+
+  // ── op registration ─────────────────────────────────────────────────────
+
+  private async registerOps(client: WeaveClient): Promise<OpRegistry> {
+    const makeOp = (name: string, opKind: string) =>
+      op(() => {}, { name, opKind });
+
+    const [session, turn, tool, permissionRequest, subagent] = await Promise.all([
+      client.saveOp(makeOp('claude_code.session', 'agent')),
+      client.saveOp(makeOp('claude_code.turn', 'llm')),
+      client.saveOp(makeOp('claude_code.tool', 'tool')),
+      client.saveOp(makeOp('claude_code.permission_request', 'tool')),
+      client.saveOp(makeOp('claude_code.subagent', 'agent')),
+    ]);
+
+    return { session, turn, tool, permissionRequest, subagent };
+  }
+
+  private opName(key: keyof OpRegistry, fallback: string): string {
+    return this.opRegistry?.[key]?.uri() ?? fallback;
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -341,7 +379,7 @@ export class GlobalDaemon {
       this.weaveClient.saveCallStart({
         project_id: this.weaveClient.projectId,
         id: callId,
-        op_name: 'claude_code.session',
+        op_name: this.opName('session', 'claude_code.session'),
         trace_id: session.traceId,
         parent_id: null,
         started_at: new Date().toISOString(),
@@ -373,7 +411,7 @@ export class GlobalDaemon {
       this.weaveClient.saveCallStart({
         project_id: this.weaveClient.projectId,
         id: turnCallId,
-        op_name: 'claude_code.turn',
+        op_name: this.opName('turn', 'claude_code.turn'),
         trace_id: session.traceId,
         parent_id: session.sessionCallId ?? null,
         started_at: new Date().toISOString(),
@@ -406,7 +444,7 @@ export class GlobalDaemon {
     this.weaveClient.saveCallStart({
       project_id: this.weaveClient.projectId,
       id: weaveCallId,
-      op_name: `claude_code.tool.${toolName}`,
+      op_name: this.opName('tool', `claude_code.tool.${toolName}`),
       trace_id: session.traceId,
       parent_id: parentId,
       started_at: new Date().toISOString(),
@@ -458,7 +496,7 @@ export class GlobalDaemon {
     this.weaveClient.saveCallStart({
       project_id: this.weaveClient.projectId,
       id: permCallId,
-      op_name: 'claude_code.permission_request',
+      op_name: this.opName('permissionRequest', 'claude_code.permission_request'),
       trace_id: session.traceId,
       parent_id: pending.weaveCallId,
       started_at: permStartedAt,
@@ -593,7 +631,7 @@ export class GlobalDaemon {
     this.weaveClient.saveCallStart({
       project_id: this.weaveClient.projectId,
       id: subagentWeaveCallId,
-      op_name: `claude_code.subagent.${bestTracker.subagentType}`,
+      op_name: this.opName('subagent', `claude_code.subagent.${bestTracker.subagentType}`),
       trace_id: bestTracker.traceId,
       parent_id: bestTracker.taskToolWeaveCallId,
       started_at: new Date().toISOString(),
