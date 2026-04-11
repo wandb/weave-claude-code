@@ -9,7 +9,7 @@ import { init, WeaveClient } from 'weave';
 import { uuidv7 } from 'uuidv7';
 import { loadSettings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd, UsageSummary } from './parser.js';
+import { parseSessionFd, UsageSummary, rawToUsageSummary, addUsage } from './parser.js';
 import { TraceRegistry } from './traceRegistry.js';
 import { TranscriptFile } from './transcriptFile.js';
 
@@ -40,6 +40,7 @@ interface PendingToolCall {
   toolInput: Record<string, unknown>;
   permissionWeaveCallId?: string;   // set when PermissionRequest fires; closed in Post/PostFailure
   permissionStartedAt?: string;     // same value used as ended_at — zero-duration, tool execution time is not permission decision time
+  subagentModel?: string;           // set by SubagentStop for Agent tools; surfaced in PostToolUse summary
 }
 
 /**
@@ -503,12 +504,25 @@ export class GlobalDaemon {
       });
     }
 
+    // For Agent tool calls, normalize the usage from tool_response into a UsageSummary
+    // keyed by model name, consistent with the turn-level summary from handleStop.
+    let toolSummary: Record<string, unknown> = {};
+    if (pending.toolName === 'Agent' && pending.subagentModel) {
+      const rawUsage = (payload['tool_response'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
+      if (rawUsage) {
+        const usage = rawToUsageSummary(rawUsage);
+        toolSummary = { model: pending.subagentModel, usage: { [pending.subagentModel]: usage } };
+      } else {
+        toolSummary = { model: pending.subagentModel };
+      }
+    }
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: pending.weaveCallId,
       ended_at: now,
-      output: { result: payload['tool_response'] },
-      summary: {},
+      output: payload['tool_response'],
+      summary: toolSummary,
     });
 
     session.pendingToolCalls.delete(toolUseId);
@@ -625,15 +639,37 @@ export class GlobalDaemon {
       return;
     }
 
+    // Parse subagent transcript for model info.
+    const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
+    let model: string | undefined;
+    if (agentTranscriptPath) {
+      let agentTranscript: TranscriptFile | undefined;
+      try {
+        agentTranscript = new TranscriptFile(agentTranscriptPath);
+        const parsed = parseSessionFd(agentTranscript.getFd());
+        model = parsed?.turns[parsed.turns.length - 1]?.primaryModel();
+      } catch (err) {
+        this.log('DEBUG', `SubagentStop: could not parse transcript for model: ${err}`);
+      } finally {
+        agentTranscript?.close();
+      }
+    }
+
+    // Propagate model to the parent Agent tool call so PostToolUse can surface it.
+    if (model) {
+      const pendingTool = session.pendingToolCalls.get(tracker.toolUseId);
+      if (pendingTool) pendingTool.subagentModel = model;
+    }
+
     this.weaveClient.saveCallEnd({
       project_id: this.weaveClient.projectId,
       id: tracker.subagentWeaveCallId,
       ended_at: new Date().toISOString(),
       output: { last_assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
-      summary: {},
+      summary: model ? { model } : {},
     });
 
-    this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`);
+    this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`);
 
     session.subagentTrackers.delete(tracker.toolUseId);
     session.subagentByAgentId.delete(agentId);
@@ -661,14 +697,7 @@ export class GlobalDaemon {
     // Accumulate into session totals for roll-up at SessionEnd
     if (usage && model) {
       const existing = session.totalUsage[model];
-      if (existing) {
-        existing.input_tokens += usage.input_tokens;
-        existing.output_tokens += usage.output_tokens;
-        existing.cache_read_input_tokens = (existing.cache_read_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
-        existing.cache_creation_input_tokens = (existing.cache_creation_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
-      } else {
-        session.totalUsage[model] = { ...usage };
-      }
+      session.totalUsage[model] = existing ? addUsage(existing, usage) : { ...usage };
     }
 
     this.weaveClient.saveCallEnd({
