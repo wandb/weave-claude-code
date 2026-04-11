@@ -20,6 +20,24 @@ export interface ParsedSession {
   turns: Turn[];
 }
 
+export function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
+  return {
+    input_tokens: raw['input_tokens'] ?? 0,
+    output_tokens: raw['output_tokens'] ?? 0,
+    cache_read_input_tokens: raw['cache_read_input_tokens'],
+    cache_creation_input_tokens: raw['cache_creation_input_tokens'],
+  };
+}
+
+export function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
+  return {
+    input_tokens: a.input_tokens + b.input_tokens,
+    output_tokens: a.output_tokens + b.output_tokens,
+    cache_read_input_tokens: (a.cache_read_input_tokens ?? 0) + (b.cache_read_input_tokens ?? 0),
+    cache_creation_input_tokens: (a.cache_creation_input_tokens ?? 0) + (b.cache_creation_input_tokens ?? 0),
+  };
+}
+
 export function parseSessionFile(filePath: string): ParsedSession | null {
   return parseSessionReader(() => fs.readFileSync(filePath, 'utf8'));
 }
@@ -98,12 +116,7 @@ function buildTurn(assistantMsgs: unknown[]): Turn {
       const m = msg as Record<string, unknown>;
       const message = m['message'] as Record<string, unknown> | undefined;
       const u = (message?.['usage'] ?? m['usage'] ?? {}) as Record<string, number>;
-      return {
-        input_tokens: acc.input_tokens + (u['input_tokens'] ?? 0),
-        output_tokens: acc.output_tokens + (u['output_tokens'] ?? 0),
-        cache_read_input_tokens: (acc.cache_read_input_tokens ?? 0) + (u['cache_read_input_tokens'] ?? 0),
-        cache_creation_input_tokens: (acc.cache_creation_input_tokens ?? 0) + (u['cache_creation_input_tokens'] ?? 0),
-      };
+      return addUsage(acc, rawToUsageSummary(u));
     },
     { input_tokens: 0, output_tokens: 0 }
   );
