@@ -88,13 +88,16 @@ fi
 
 EVENT_PAYLOAD=$(cat)
 
-# Inject parent Weave call context so the daemon can nest this session
-# under an external @weave.op (values are UUIDs — safe for literal embedding).
-EXTRA=""
-[ -n "${WEAVE_PARENT_CALL_ID:-}" ] && EXTRA="${EXTRA},\"weave_parent_call_id\":\"${WEAVE_PARENT_CALL_ID}\""
-[ -n "${WEAVE_TRACE_ID:-}" ] && EXTRA="${EXTRA},\"weave_trace_id\":\"${WEAVE_TRACE_ID}\""
-if [ -n "${EXTRA}" ]; then
-  EVENT_PAYLOAD="${EVENT_PAYLOAD%\}}${EXTRA}}"
+# If parent Weave context is available, merge it into the payload using
+if [ -n "${WEAVE_PARENT_CALL_ID:-}" ] || [ -n "${WEAVE_TRACE_ID:-}" ]; then
+  EVENT_PAYLOAD=$(printf '%s' "${EVENT_PAYLOAD}" | node -e "
+    let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+      const o=JSON.parse(d);
+      if(process.env.WEAVE_PARENT_CALL_ID)o.weave_parent_call_id=process.env.WEAVE_PARENT_CALL_ID;
+      if(process.env.WEAVE_TRACE_ID)o.weave_trace_id=process.env.WEAVE_TRACE_ID;
+      process.stdout.write(JSON.stringify(o));
+    });
+  ")
 fi
 
 printf '%s' "${EVENT_PAYLOAD}" | nc -U -w1 "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
