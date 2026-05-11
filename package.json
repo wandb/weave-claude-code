@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "uuidv7": "1.2.1",
-    "weave": "^0.12.1"
+    "weave": "^0.13.1"
   },
   "devDependencies": {
     "@types/node": "^24.12.2",
