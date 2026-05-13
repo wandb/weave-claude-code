@@ -30,6 +30,7 @@ export const ATTR = {
   AGENT_NAME: 'gen_ai.agent.name',
   AGENT_ID: 'gen_ai.agent.id',
   AGENT_DESCRIPTION: 'gen_ai.agent.description',
+  AGENT_VERSION: 'gen_ai.agent.version',
   CONVERSATION_ID: 'gen_ai.conversation.id',
 
   // GenAI semconv — model
@@ -156,6 +157,7 @@ export function startSessionSpan(
         [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
         [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
         [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
+        [ATTR.AGENT_VERSION]: args.pluginVersion,
         [ATTR.CONVERSATION_ID]: args.sessionId,
         [ATTR.WEAVE_SESSION_ID]: args.sessionId,
         [ATTR.WEAVE_CWD]: args.cwd,
@@ -171,6 +173,7 @@ export interface TurnSpanArgs {
   sessionId: string;
   turnNumber: number;
   prompt: string;
+  pluginVersion: string;
   displayName?: string;
 }
 
@@ -179,6 +182,7 @@ export function startTurnSpan(tracer: Tracer, parentSpan: Span, args: TurnSpanAr
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
     [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
     [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
+    [ATTR.AGENT_VERSION]: args.pluginVersion,
     [ATTR.CONVERSATION_ID]: args.sessionId,
     [ATTR.WEAVE_TURN_NUMBER]: args.turnNumber,
     [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: args.prompt }]),
@@ -222,6 +226,7 @@ export interface SubagentSpanArgs {
   subagentType: string;
   agentId: string;
   spawningToolCallId: string;
+  pluginVersion: string;
 }
 
 export function startSubagentSpan(
@@ -238,6 +243,7 @@ export function startSubagentSpan(
         [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
         [ATTR.AGENT_NAME]: args.subagentType,
         [ATTR.AGENT_ID]: args.agentId,
+        [ATTR.AGENT_VERSION]: args.pluginVersion,
         [ATTR.CONVERSATION_ID]: `${args.sessionId}:${args.agentId}`,
         [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: args.spawningToolCallId,
       },

@@ -434,6 +434,7 @@ export class GlobalDaemon {
       sessionId: session.sessionId,
       turnNumber: session.turnNumber,
       prompt,
+      pluginVersion: VERSION,
       displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
     });
     session.currentTurnSpan = turnSpan;
@@ -611,6 +612,7 @@ export class GlobalDaemon {
       subagentType: bestTracker.subagentType,
       agentId,
       spawningToolCallId: bestTracker.spawningToolCallId,
+      pluginVersion: VERSION,
     });
     session.subagentByAgentId.set(agentId, bestTracker);
 
