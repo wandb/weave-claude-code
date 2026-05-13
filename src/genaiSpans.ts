@@ -162,6 +162,7 @@ export interface SessionSpanArgs {
   cwd: string;
   source: string;
   pluginVersion: string;
+  requestModel?: string;
 }
 
 export function startSessionSpan(
@@ -169,21 +170,21 @@ export function startSessionSpan(
   parentCtx: Context | undefined,
   args: SessionSpanArgs,
 ): Span {
+  const attrs: Record<string, string> = {
+    [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
+    [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
+    [ATTR.AGENT_VERSION]: args.pluginVersion,
+    [ATTR.CONVERSATION_ID]: args.sessionId,
+    [ATTR.WEAVE_SESSION_ID]: args.sessionId,
+    [ATTR.WEAVE_CWD]: args.cwd,
+    [ATTR.WEAVE_SOURCE]: args.source,
+    [ATTR.WEAVE_PLUGIN_VERSION]: args.pluginVersion,
+  };
+  if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
+
   return tracer.startSpan(
     `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}:session`,
-    {
-      kind: SpanKind.INTERNAL,
-      attributes: {
-        [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-        [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
-        [ATTR.AGENT_VERSION]: args.pluginVersion,
-        [ATTR.CONVERSATION_ID]: args.sessionId,
-        [ATTR.WEAVE_SESSION_ID]: args.sessionId,
-        [ATTR.WEAVE_CWD]: args.cwd,
-        [ATTR.WEAVE_SOURCE]: args.source,
-        [ATTR.WEAVE_PLUGIN_VERSION]: args.pluginVersion,
-      },
-    },
+    { kind: SpanKind.INTERNAL, attributes: attrs },
     parentCtx,
   );
 }

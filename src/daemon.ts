@@ -420,7 +420,8 @@ export class GlobalDaemon {
     }
 
     const source = (payload['source'] as string | undefined) ?? 'unknown';
-    const model = (payload['model'] as string | undefined) ?? 'unknown';
+    const rawModel = payload['model'] as string | undefined;
+    const model = rawModel ?? 'unknown';
     const cwd = (payload['cwd'] as string | undefined) ?? '';
     const envParentTraceId = (payload['weave_trace_id'] as string | undefined) || process.env['WEAVE_TRACE_ID'];
     const envParentSpanId = (payload['weave_parent_call_id'] as string | undefined) || process.env['WEAVE_PARENT_CALL_ID'];
@@ -446,6 +447,7 @@ export class GlobalDaemon {
         cwd,
         source,
         pluginVersion: VERSION,
+        requestModel: rawModel,
       });
     }
 
@@ -706,6 +708,7 @@ export class GlobalDaemon {
       );
     }
     if (model) {
+      tracker.span.setAttribute(ATTR.REQUEST_MODEL, model);
       tracker.span.setAttribute(ATTR.RESPONSE_MODEL, model);
     }
     tracker.span.end();
@@ -779,6 +782,10 @@ export class GlobalDaemon {
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {
       session.currentTurnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
+    }
+
+    if (model) {
+      session.currentTurnSpan.setAttribute(ATTR.REQUEST_MODEL, model);
     }
 
     session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
