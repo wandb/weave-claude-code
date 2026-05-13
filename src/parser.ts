@@ -11,10 +11,27 @@ export interface UsageSummary {
   cache_creation_input_tokens?: number;
 }
 
+/**
+ * Per-API-call detail for a single assistant message in the transcript.
+ * Each entry corresponds to one LLM invocation within a turn, used to emit
+ * one `chat <model>` span per call at Stop time.
+ */
+export interface AssistantCallDetail {
+  timestamp: string;            // ISO timestamp of the assistant message
+  prevTimestamp?: string;       // ISO timestamp of preceding transcript line (proxy for "request started")
+  model?: string;
+  usage: UsageSummary;          // per-call usage
+  reasoningTokens?: number;     // reasoning/thinking tokens, if any
+  contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
+  responseId?: string;          // provider message id
+  finishReason?: string;        // stop_reason / finish_reason if present
+}
+
 export interface Turn {
   totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
   textBlocks(): string[];
+  assistantCalls(): AssistantCallDetail[];
 }
 
 export interface ParsedSession {
@@ -79,78 +96,103 @@ function readUtf8FromFd(fd: number): string {
   return buffer.toString('utf8', 0, bytesRead);
 }
 
+interface AssistantLine {
+  line: Record<string, unknown>;
+  prevTimestamp?: string;
+}
+
 function buildSession(lines: unknown[]): ParsedSession {
   const turns: Turn[] = [];
-  let currentAssistantMsgs: unknown[] = [];
+  let currentAssistantLines: AssistantLine[] = [];
+  let prevTimestamp: string | undefined;
 
   for (const line of lines) {
     const l = line as Record<string, unknown>;
     const msg = l['message'] as Record<string, unknown> | undefined;
     const type = l['type'] as string | undefined;
     const role = (msg?.['role'] as string | undefined) ?? type;
+    const timestamp = typeof l['timestamp'] === 'string' ? (l['timestamp'] as string) : undefined;
 
     if (role === 'assistant') {
-      currentAssistantMsgs.push(line);
+      currentAssistantLines.push({ line: l, prevTimestamp });
     } else if (role === 'user') {
       const rawContent = msg?.['content'];
       const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
       // A user message with text content marks the end of the previous turn.
       const hasText = typeof rawContent === 'string' || content.some(b => b['type'] === 'text');
-      if (hasText && currentAssistantMsgs.length > 0) {
-        turns.push(buildTurn(currentAssistantMsgs));
-        currentAssistantMsgs = [];
+      if (hasText && currentAssistantLines.length > 0) {
+        turns.push(buildTurn(currentAssistantLines));
+        currentAssistantLines = [];
       }
     }
+
+    if (timestamp) prevTimestamp = timestamp;
   }
 
-  if (currentAssistantMsgs.length > 0) {
-    turns.push(buildTurn(currentAssistantMsgs));
+  if (currentAssistantLines.length > 0) {
+    turns.push(buildTurn(currentAssistantLines));
   }
 
   return { turns };
 }
 
-function buildTurn(assistantMsgs: unknown[]): Turn {
-  const usage = assistantMsgs.reduce<UsageSummary>(
-    (acc, msg) => {
-      const m = msg as Record<string, unknown>;
-      const message = m['message'] as Record<string, unknown> | undefined;
-      const u = (message?.['usage'] ?? m['usage'] ?? {}) as Record<string, number>;
-      return addUsage(acc, rawToUsageSummary(u));
-    },
-    { input_tokens: 0, output_tokens: 0 }
+function buildTurn(assistantLines: AssistantLine[]): Turn {
+  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
+    const m = line;
+    const message = m['message'] as Record<string, unknown> | undefined;
+    const u = (message?.['usage'] ?? m['usage'] ?? {}) as Record<string, number>;
+    const usage = rawToUsageSummary(u);
+    const reasoningTokens = typeof u['reasoning_tokens'] === 'number' ? u['reasoning_tokens'] : undefined;
+    const model = (message?.['model'] ?? m['model']) as string | undefined;
+    const rawContent = message?.['content'];
+    const contentBlocks: unknown[] = Array.isArray(rawContent)
+      ? (rawContent as unknown[])
+      : typeof rawContent === 'string'
+        ? [{ type: 'text', text: rawContent }]
+        : [];
+    const responseId = (message?.['id'] ?? m['id']) as string | undefined;
+    const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
+    const timestamp = typeof m['timestamp'] === 'string' ? (m['timestamp'] as string) : '';
+
+    return {
+      timestamp,
+      prevTimestamp,
+      model,
+      usage,
+      reasoningTokens,
+      contentBlocks,
+      responseId,
+      finishReason: stopReason,
+    };
+  });
+
+  const totalUsageValue = calls.reduce<UsageSummary>(
+    (acc, c) => addUsage(acc, c.usage),
+    { input_tokens: 0, output_tokens: 0 },
   );
 
-  const model = assistantMsgs
-    .map(m => {
-      const msg = m as Record<string, unknown>;
-      const message = msg['message'] as Record<string, unknown> | undefined;
-      return (message?.['model'] ?? msg['model']) as string | undefined;
-    })
-    .filter(Boolean)
-    .pop();
+  const model = calls.map(c => c.model).filter(Boolean).pop();
 
   const texts: string[] = [];
-  for (const msg of assistantMsgs) {
-    const m = msg as Record<string, unknown>;
-    const message = m['message'] as Record<string, unknown> | undefined;
-    const content = message?.['content'];
-
-    if (typeof content === 'string' && content.trim()) {
-      texts.push(content);
-    } else if (Array.isArray(content)) {
-      for (const block of content as Array<Record<string, unknown>>) {
-        if (block['type'] === 'text' && typeof block['text'] === 'string' && block['text'].trim()) {
-          texts.push(block['text']);
-        }
+  for (const c of calls) {
+    for (const block of c.contentBlocks) {
+      if (typeof block === 'string' && block.trim()) {
+        texts.push(block);
+        continue;
+      }
+      if (!block || typeof block !== 'object') continue;
+      const b = block as Record<string, unknown>;
+      if (b['type'] === 'text' && typeof b['text'] === 'string' && (b['text'] as string).trim()) {
+        texts.push(b['text'] as string);
       }
     }
   }
 
   return {
-    totalUsage: () => usage,
+    totalUsage: () => totalUsageValue,
     primaryModel: () => model,
     textBlocks: () => texts,
+    assistantCalls: () => calls,
   };
 }

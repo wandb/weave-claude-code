@@ -199,19 +199,31 @@ Read or update plugin configuration without leaving Claude Code.
 
 ## What Gets Traced
 
-Each Claude Code session produces a trace in Weave with the following hierarchy:
+The plugin emits OTel spans that follow the [GenAI semantic
+conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) and ships
+them to the Weave Agents observability backend (`/agents/otel/v1/traces`).
+Each Claude Code session produces one OTel trace with the following hierarchy:
 
 ```
-claude_code.session
-  └─ claude_code.turn          (one per user message)
-       ├─ claude_code.tool.*   (each tool call: Read, Bash, Grep, etc.)
-       │    └─ claude_code.permission_request  (if user approval was needed)
-       └─ claude_code.subagent (if Claude spawned a subagent)
-            └─ claude_code.tool.*
+invoke_agent claude-code               (session root)
+└─ invoke_agent claude-code            (one per user prompt — a "turn")
+   ├─ chat <model>                     (each LLM API call within the turn)
+   ├─ execute_tool <tool_name>         (each tool call: Read, Bash, Grep, ...)
+   └─ invoke_agent <subagent_type>     (each subagent spawned by the turn)
+      ├─ chat <model>
+      └─ execute_tool <tool_name>
 ```
 
-Each trace includes token usage, model name, tool inputs/outputs, timing, and
-the textual content associated with prompts and responses.
+Permission requests appear as `weave.permission_request` span events on the
+parent `execute_tool` span; context-window compaction appears as a
+`weave.compaction` event on the session span.
+
+Each span includes per-call token usage (`gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens`, cache and reasoning token counts), model name
+(`gen_ai.request.model`), tool inputs and outputs
+(`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`), timing, and the
+textual content of prompts and assistant messages
+(`gen_ai.input.messages`, `gen_ai.output.messages`).
 
 Important: tool inputs and outputs may contain sensitive information. In
 practice this can include file contents, command output, URLs, fetched content,
