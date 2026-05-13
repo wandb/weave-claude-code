@@ -243,7 +243,7 @@ export interface SubagentSpanArgs {
   sessionId: string;
   subagentType: string;
   agentId: string;
-  spawningToolCallId: string;
+  spawningToolCallId?: string;
   pluginVersion: string;
 }
 
@@ -252,19 +252,19 @@ export function startSubagentSpan(
   parentSpan: Span,
   args: SubagentSpanArgs,
 ): Span {
+  const attrs: Record<string, string> = {
+    [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
+    [ATTR.AGENT_NAME]: args.subagentType,
+    [ATTR.AGENT_ID]: args.agentId,
+    [ATTR.AGENT_VERSION]: args.pluginVersion,
+    [ATTR.CONVERSATION_ID]: `${args.sessionId}:${args.agentId}`,
+  };
+  if (args.spawningToolCallId) {
+    attrs[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID] = args.spawningToolCallId;
+  }
   return tracer.startSpan(
     `${OP.INVOKE_AGENT} ${args.subagentType}`,
-    {
-      kind: SpanKind.INTERNAL,
-      attributes: {
-        [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-        [ATTR.AGENT_NAME]: args.subagentType,
-        [ATTR.AGENT_ID]: args.agentId,
-        [ATTR.AGENT_VERSION]: args.pluginVersion,
-        [ATTR.CONVERSATION_ID]: `${args.sessionId}:${args.agentId}`,
-        [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: args.spawningToolCallId,
-      },
-    },
+    { kind: SpanKind.INTERNAL, attributes: attrs },
     ctxWithParent(parentSpan),
   );
 }

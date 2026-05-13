@@ -74,14 +74,19 @@ interface PendingToolCall {
 }
 
 /**
- * Created when a Task tool with subagent_type is detected in PreToolUse.
- * `agentId` and `span` are filled in when the matching SubagentStart event arrives.
+ * Tracks a subagent across hook events. Two shapes:
+ *   (a) Matched — created at PreToolUse when an Agent tool with subagent_type
+ *       is detected; carries `toolUseId` and `spawningToolCallId`. `agentId`
+ *       and `span` are filled in when SubagentStart arrives.
+ *   (b) Orphan — created at SubagentStart when no pending tracker is in the
+ *       proximity window. Has no spawning tool, so `toolUseId` and
+ *       `spawningToolCallId` are absent.
  */
 interface SubagentTracker {
-  toolUseId: string;
   subagentType: string;
   detectedAt: Date;
-  spawningToolCallId: string;  // tool_use_id of the spawning Agent tool span (for back-pointer attr)
+  toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
+  spawningToolCallId?: string; // back-pointer attr value (matched path only)
   agentId?: string;
   span?: Span;
 }
@@ -637,10 +642,8 @@ export class GlobalDaemon {
     if (!bestTracker) {
       this.log('ERROR', `SubagentStart: no unmatched tracker for agentId=${agentId}, creating orphan`);
       bestTracker = {
-        toolUseId: agentId,
         subagentType: agentType,
         detectedAt: new Date(),
-        spawningToolCallId: '',
       };
       session.subagents.add(bestTracker);
     }
