@@ -5,6 +5,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 import {
   Span,
   SpanStatusCode,
@@ -26,19 +27,21 @@ import { TranscriptFile } from './transcriptFile.js';
 import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
-  PROVIDER_ANTHROPIC,
   OP,
   startSessionSpan,
   startTurnSpan,
   startToolSpan,
   startSubagentSpan,
   emitChatSpansFromAssistantCalls,
-  addPermissionEvent,
+  addPermissionRequestEvent,
+  addPermissionResolvedEvent,
   addCompactionEvent,
   toolDisplayName,
   promptSnippet,
   jsonStr,
   ctxFromSpanContext,
+  isValidTraceId,
+  isValidSpanId,
 } from './genaiSpans.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,8 +101,7 @@ interface SessionState {
   totalUsage: Record<string, UsageSummary>;
 
   pendingToolCalls: Map<string, PendingToolCall>;
-  subagentTrackers: Map<string, SubagentTracker>;
-  subagentByAgentId: Map<string, SubagentTracker>;
+  subagents: SubagentTracking;
 }
 
 interface TraceResolution {
@@ -119,8 +121,56 @@ const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
-const HEX_TRACE_ID = /^[0-9a-f]{32}$/i;
-const HEX_SPAN_ID = /^[0-9a-f]{16}$/i;
+/**
+ * Per-session container that tracks subagents from PreToolUse (when an Agent
+ * tool with subagent_type is detected) through SubagentStop. Replaces a pair
+ * of maps keyed by toolUseId and agentId — single source of truth for the
+ * tracker list, with intent-revealing lookup methods.
+ */
+class SubagentTracking {
+  private trackers: SubagentTracker[] = [];
+
+  /** Add a pending tracker at PreToolUse, before SubagentStart correlates an agent_id. */
+  add(tracker: SubagentTracker): void {
+    this.trackers.push(tracker);
+  }
+
+  /**
+   * Find the unmatched tracker (no agent_id yet) whose detectedAt is closest
+   * to `now`, within `windowMs`. Returns undefined if no candidate qualifies.
+   */
+  findUnmatchedByProximity(now: number, windowMs: number): SubagentTracker | undefined {
+    let best: SubagentTracker | undefined;
+    let bestDelta = Infinity;
+    for (const t of this.trackers) {
+      if (t.agentId) continue;
+      const delta = now - t.detectedAt.getTime();
+      if (delta >= 0 && delta < windowMs && delta < bestDelta) {
+        bestDelta = delta;
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  byAgentId(agentId: string): SubagentTracker | undefined {
+    for (const t of this.trackers) if (t.agentId === agentId) return t;
+    return undefined;
+  }
+
+  remove(tracker: SubagentTracker): void {
+    const idx = this.trackers.indexOf(tracker);
+    if (idx >= 0) this.trackers.splice(idx, 1);
+  }
+
+  size(): number {
+    return this.trackers.length;
+  }
+
+  all(): SubagentTracker[] {
+    return [...this.trackers];
+  }
+}
 
 export class GlobalDaemon {
   private server?: net.Server;
@@ -374,7 +424,7 @@ export class GlobalDaemon {
       // If we have a prior traceId (resume or env), force it via a synthetic remote parent.
       let parentCtx: Context | undefined;
       if (resolution.reuseTraceId) {
-        const synthSpanId = resolution.reuseSessionSpanId ?? this.randomHexSpanId();
+        const synthSpanId = resolution.reuseSessionSpanId ?? randomBytes(8).toString('hex');
         parentCtx = ctxFromSpanContext(resolution.reuseTraceId, synthSpanId, true);
       }
       sessionSpan = startSessionSpan(this.tracer, parentCtx, {
@@ -398,8 +448,7 @@ export class GlobalDaemon {
       turnToolCalls: 0,
       toolCounts: {},
       pendingToolCalls: new Map(),
-      subagentTrackers: new Map(),
-      subagentByAgentId: new Map(),
+      subagents: new SubagentTracking(),
       totalUsage: {},
     });
 
@@ -454,7 +503,7 @@ export class GlobalDaemon {
 
     // Parent: subagent span if agent_id is set, else current turn span
     const parentSpan = agentId
-      ? session.subagentByAgentId.get(agentId)?.span ?? session.currentTurnSpan
+      ? session.subagents.byAgentId(agentId)?.span ?? session.currentTurnSpan
       : session.currentTurnSpan;
     if (!parentSpan) {
       this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
@@ -473,13 +522,12 @@ export class GlobalDaemon {
     // tool_use_id so handleSubagentStart can correlate and produce a subagent span as a
     // flat sibling under the turn (NOT a child of this tool span).
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
-      const tracker: SubagentTracker = {
+      session.subagents.add({
         toolUseId,
         subagentType: toolInput['subagent_type'] as string,
         detectedAt: new Date(),
         spawningToolCallId: toolUseId,
-      };
-      session.subagentTrackers.set(toolUseId, tracker);
+      });
     }
   }
 
@@ -505,8 +553,14 @@ export class GlobalDaemon {
       return;
     }
 
-    pending.permissionStartedAt = new Date();
+    const now = new Date();
+    pending.permissionStartedAt = now;
     pending.permissionSuggestions = payload['permission_suggestions'];
+
+    addPermissionRequestEvent(pending.span, {
+      suggestions: pending.permissionSuggestions,
+      timestamp: now,
+    });
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
@@ -522,10 +576,9 @@ export class GlobalDaemon {
     if (!pending) return;
 
     if (pending.permissionStartedAt) {
-      addPermissionEvent(pending.span, {
+      addPermissionResolvedEvent(pending.span, {
         approved: true,
-        suggestions: pending.permissionSuggestions,
-        timestamp: pending.permissionStartedAt,
+        timestamp: new Date(),
       });
     }
 
@@ -549,10 +602,9 @@ export class GlobalDaemon {
     if (!pending) return;
 
     if (pending.permissionStartedAt) {
-      addPermissionEvent(pending.span, {
+      addPermissionResolvedEvent(pending.span, {
         approved: false,
-        suggestions: pending.permissionSuggestions,
-        timestamp: pending.permissionStartedAt,
+        timestamp: new Date(),
       });
     }
 
@@ -578,32 +630,19 @@ export class GlobalDaemon {
     // Temporal proximity matching: find the closest unmatched SubagentTracker within 5 s.
     // SubagentStart has no explicit parent pointer, so we correlate by timing.
     const PROXIMITY_MS = 5_000;
-    const now = Date.now();
-    let bestTracker: SubagentTracker | undefined;
-    let bestDelta = Infinity;
-
-    for (const tracker of session.subagentTrackers.values()) {
-      if (tracker.agentId) continue; // already matched
-      const delta = now - tracker.detectedAt.getTime();
-      if (delta >= 0 && delta < PROXIMITY_MS && delta < bestDelta) {
-        bestDelta = delta;
-        bestTracker = tracker;
-      }
-    }
-
     const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
 
+    let bestTracker = session.subagents.findUnmatchedByProximity(Date.now(), PROXIMITY_MS);
+    const matched = !!bestTracker;
     if (!bestTracker) {
-      // No matching Agent tool call — create an orphan tracker
       this.log('ERROR', `SubagentStart: no unmatched tracker for agentId=${agentId}, creating orphan`);
       bestTracker = {
         toolUseId: agentId,
         subagentType: agentType,
         detectedAt: new Date(),
         spawningToolCallId: '',
-        agentId,
       };
-      session.subagentTrackers.set(agentId, bestTracker);
+      session.subagents.add(bestTracker);
     }
 
     bestTracker.agentId = agentId;
@@ -614,9 +653,8 @@ export class GlobalDaemon {
       spawningToolCallId: bestTracker.spawningToolCallId,
       pluginVersion: VERSION,
     });
-    session.subagentByAgentId.set(agentId, bestTracker);
 
-    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${bestTracker.toolUseId !== agentId}`);
+    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
   }
 
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
@@ -626,7 +664,7 @@ export class GlobalDaemon {
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
 
-    const tracker = session.subagentByAgentId.get(agentId);
+    const tracker = session.subagents.byAgentId(agentId);
     if (!tracker?.span) {
       this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId}`);
       return;
@@ -675,8 +713,7 @@ export class GlobalDaemon {
 
     this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`);
 
-    session.subagentTrackers.delete(tracker.toolUseId);
-    session.subagentByAgentId.delete(agentId);
+    session.subagents.remove(tracker);
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
@@ -758,7 +795,7 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagentByAgentId.size}`,
+      `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
     if (session.sessionSpan) {
@@ -774,10 +811,9 @@ export class GlobalDaemon {
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       if (pending.permissionStartedAt) {
-        addPermissionEvent(pending.span, {
+        addPermissionResolvedEvent(pending.span, {
           approved: false,
-          suggestions: pending.permissionSuggestions,
-          timestamp: pending.permissionStartedAt,
+          timestamp: new Date(),
         });
       }
       pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
@@ -787,12 +823,12 @@ export class GlobalDaemon {
     }
 
     // Close any open subagent spans
-    for (const [agentId, tracker] of session.subagentByAgentId) {
+    for (const tracker of session.subagents.all()) {
       if (tracker.span) {
         tracker.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
         tracker.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
         tracker.span.end();
-        this.log('DEBUG', `Closed orphaned subagent span: ${agentId}`);
+        this.log('DEBUG', `Closed orphaned subagent span: ${tracker.agentId ?? '(unmatched)'}`);
       }
     }
 
@@ -903,10 +939,10 @@ export class GlobalDaemon {
     envParentSpanId: string | undefined,
   ): TraceResolution {
     // Env-supplied parent trace context wins (parent Claude Code is injecting it).
-    if (envParentTraceId && HEX_TRACE_ID.test(envParentTraceId)) {
+    if (envParentTraceId && isValidTraceId(envParentTraceId)) {
       return {
         reuseTraceId: envParentTraceId.toLowerCase(),
-        reuseSessionSpanId: envParentSpanId && HEX_SPAN_ID.test(envParentSpanId) ? envParentSpanId.toLowerCase() : undefined,
+        reuseSessionSpanId: envParentSpanId && isValidSpanId(envParentSpanId) ? envParentSpanId.toLowerCase() : undefined,
         source: 'env-parent',
       };
     }
@@ -948,13 +984,6 @@ export class GlobalDaemon {
       if (typeof t === 'string' && t) return t;
     }
     return 'tool_error';
-  }
-
-  /** Generate a random 16-hex span ID (8 bytes) for synthetic parent contexts. */
-  private randomHexSpanId(): string {
-    const bytes = new Uint8Array(8);
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {

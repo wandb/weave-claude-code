@@ -79,6 +79,7 @@ export const ATTR = {
 
   // Event names
   EVT_PERMISSION_REQUEST: 'weave.permission_request',
+  EVT_PERMISSION_RESOLVED: 'weave.permission_resolved',
   EVT_COMPACTION: 'weave.compaction',
 
   // Event attributes
@@ -89,7 +90,6 @@ export const ATTR = {
   EVT_COMPACTION_ITEMS_AFTER: 'weave.compaction.items_after',
 } as const;
 
-export const PROVIDER_ANTHROPIC = 'anthropic';
 export const AGENT_NAME_CLAUDE_CODE = 'claude-code';
 
 export const OP = {
@@ -101,6 +101,27 @@ export const OP = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** True if `s` is a 32-character hex OTel trace ID. */
+export function isValidTraceId(s: string): boolean {
+  return /^[0-9a-f]{32}$/i.test(s);
+}
+
+/** True if `s` is a 16-character hex OTel span ID. */
+export function isValidSpanId(s: string): boolean {
+  return /^[0-9a-f]{16}$/i.test(s);
+}
+
+/**
+ * Derive `gen_ai.provider.name` from a model id. Returns undefined when the
+ * routing layer is ambiguous — better to omit than guess.
+ */
+export function providerFromModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  if (/^(us\.)?anthropic\./i.test(model)) return 'aws.bedrock';
+  if (/^claude-/i.test(model)) return 'anthropic';
+  return undefined;
+}
 
 /** Stringify a value for an OTel attribute. Returns '' for null/undefined. */
 export function jsonStr(v: unknown): string {
@@ -155,7 +176,6 @@ export function startSessionSpan(
       kind: SpanKind.INTERNAL,
       attributes: {
         [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-        [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
         [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
         [ATTR.AGENT_VERSION]: args.pluginVersion,
         [ATTR.CONVERSATION_ID]: args.sessionId,
@@ -180,7 +200,6 @@ export interface TurnSpanArgs {
 export function startTurnSpan(tracer: Tracer, parentSpan: Span, args: TurnSpanArgs): Span {
   const attrs: Record<string, string | number> = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-    [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
     [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
     [ATTR.CONVERSATION_ID]: args.sessionId,
@@ -206,7 +225,6 @@ export interface ToolSpanArgs {
 export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanArgs): Span {
   const attrs: Record<string, string> = {
     [ATTR.OPERATION_NAME]: OP.EXECUTE_TOOL,
-    [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
     [ATTR.TOOL_NAME]: args.toolName,
     [ATTR.TOOL_CALL_ID]: args.toolUseId,
     [ATTR.WEAVE_TOOL_USE_ID]: args.toolUseId,
@@ -240,7 +258,6 @@ export function startSubagentSpan(
       kind: SpanKind.INTERNAL,
       attributes: {
         [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-        [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
         [ATTR.AGENT_NAME]: args.subagentType,
         [ATTR.AGENT_ID]: args.agentId,
         [ATTR.AGENT_VERSION]: args.pluginVersion,
@@ -277,13 +294,14 @@ export function emitChatSpan(
 ): void {
   const attrs: Record<string, string | number | boolean | string[]> = {
     [ATTR.OPERATION_NAME]: OP.CHAT,
-    [ATTR.PROVIDER_NAME]: PROVIDER_ANTHROPIC,
     [ATTR.REQUEST_MODEL]: args.model,
     [ATTR.CONVERSATION_ID]: args.sessionId,
     [ATTR.USAGE_INPUT_TOKENS]: args.usage.input_tokens,
     [ATTR.USAGE_OUTPUT_TOKENS]: args.usage.output_tokens,
     [ATTR.OUTPUT_TYPE]: 'text',
   };
+  const provider = providerFromModel(args.model);
+  if (provider) attrs[ATTR.PROVIDER_NAME] = provider;
   if (args.usage.cache_read_input_tokens !== undefined) {
     attrs[ATTR.USAGE_CACHE_READ_INPUT_TOKENS] = args.usage.cache_read_input_tokens;
   }
@@ -374,20 +392,32 @@ function assistantBlocksToText(blocks: unknown[]): string {
 // Span events
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface PermissionEventArgs {
-  approved: boolean;
+export interface PermissionRequestEventArgs {
   suggestions?: unknown;
   timestamp: Date;
 }
 
-export function addPermissionEvent(toolSpan: Span, args: PermissionEventArgs): void {
-  const attrs: Record<string, string | boolean> = {
-    [ATTR.EVT_PERMISSION_APPROVED]: args.approved,
-  };
+/** Added at PermissionRequest time. Records that the request happened. */
+export function addPermissionRequestEvent(toolSpan: Span, args: PermissionRequestEventArgs): void {
+  const attrs: Record<string, string> = {};
   if (args.suggestions !== undefined) {
     attrs[ATTR.EVT_PERMISSION_SUGGESTIONS] = jsonStr(args.suggestions);
   }
   toolSpan.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
+}
+
+export interface PermissionResolvedEventArgs {
+  approved: boolean;
+  timestamp: Date;
+}
+
+/** Added at PostToolUse[Failure]. Records the request outcome. */
+export function addPermissionResolvedEvent(toolSpan: Span, args: PermissionResolvedEventArgs): void {
+  toolSpan.addEvent(
+    ATTR.EVT_PERMISSION_RESOLVED,
+    { [ATTR.EVT_PERMISSION_APPROVED]: args.approved },
+    args.timestamp,
+  );
 }
 
 export interface CompactionEventArgs {

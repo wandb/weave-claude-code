@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { isValidTraceId, isValidSpanId } from './genaiSpans.js';
 
 export interface TraceRegistryEntry {
   sessionId: string;
@@ -26,9 +27,6 @@ const TRACE_REGISTRY_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1_000; // 180 days
 // stored UUIDv7s under sessionCallId; those are not valid OTel span IDs, so
 // any v1 file is ignored on load.
 const TRACE_REGISTRY_VERSION = 2;
-
-const HEX_TRACE_ID = /^[0-9a-f]{32}$/i;
-const HEX_SPAN_ID = /^[0-9a-f]{16}$/i;
 
 /**
  * Small local cache of Claude session -> OTel trace mappings.
@@ -58,9 +56,9 @@ export class TraceRegistry {
         if (
           entry.sessionId &&
           entry.traceId &&
-          HEX_TRACE_ID.test(entry.traceId) &&
+          isValidTraceId(entry.traceId) &&
           entry.transcriptPath &&
-          (!entry.sessionSpanId || HEX_SPAN_ID.test(entry.sessionSpanId))
+          (!entry.sessionSpanId || isValidSpanId(entry.sessionSpanId))
         ) {
           this.entries.set(entry.sessionId, entry);
         }
