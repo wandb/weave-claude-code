@@ -73,7 +73,6 @@ export const ATTR = {
   WEAVE_SESSION_TOOL_COUNT: 'weave.claude_code.tool.count',
   WEAVE_SESSION_TOOL_COUNTS: 'weave.claude_code.tool.counts',
   WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID: 'weave.claude_code.subagent.spawning_tool_call_id',
-  WEAVE_TOOL_USE_ID: 'weave.claude_code.tool.use_id',
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
@@ -171,7 +170,7 @@ export function startSessionSpan(
   args: SessionSpanArgs,
 ): Span {
   return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}`,
+    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}:session`,
     {
       kind: SpanKind.INTERNAL,
       attributes: {
@@ -209,7 +208,7 @@ export function startTurnSpan(tracer: Tracer, parentSpan: Span, args: TurnSpanAr
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
   return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}`,
+    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}:turn`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
     ctxWithParent(parentSpan),
   );
@@ -227,7 +226,6 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
     [ATTR.OPERATION_NAME]: OP.EXECUTE_TOOL,
     [ATTR.TOOL_NAME]: args.toolName,
     [ATTR.TOOL_CALL_ID]: args.toolUseId,
-    [ATTR.WEAVE_TOOL_USE_ID]: args.toolUseId,
     [ATTR.TOOL_CALL_ARGUMENTS]: jsonStr(args.toolInput),
   };
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;

@@ -69,8 +69,17 @@ interface PendingToolCall {
   span: Span;
   toolName: string;
   toolInput: Record<string, unknown>;
-  permissionStartedAt?: Date;
-  permissionSuggestions?: unknown;
+  /** True once a PermissionRequest event has been emitted for this tool. */
+  permissionRequested?: boolean;
+}
+
+/** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
+function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
+  if (!pending.permissionRequested) return;
+  addPermissionResolvedEvent(pending.span, {
+    approved,
+    timestamp: new Date(),
+  });
 }
 
 /**
@@ -548,7 +557,7 @@ export class GlobalDaemon {
     // once we know whether it was approved.
     let pending: PendingToolCall | undefined;
     for (const call of session.pendingToolCalls.values()) {
-      if (call.toolName === toolName && call.permissionStartedAt === undefined && deepEqual(call.toolInput, payload['tool_input'])) {
+      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, payload['tool_input'])) {
         pending = call;
         break;
       }
@@ -558,13 +567,10 @@ export class GlobalDaemon {
       return;
     }
 
-    const now = new Date();
-    pending.permissionStartedAt = now;
-    pending.permissionSuggestions = payload['permission_suggestions'];
-
+    pending.permissionRequested = true;
     addPermissionRequestEvent(pending.span, {
-      suggestions: pending.permissionSuggestions,
-      timestamp: now,
+      suggestions: payload['permission_suggestions'],
+      timestamp: new Date(),
     });
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
@@ -580,12 +586,7 @@ export class GlobalDaemon {
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
-    if (pending.permissionStartedAt) {
-      addPermissionResolvedEvent(pending.span, {
-        approved: true,
-        timestamp: new Date(),
-      });
-    }
+    resolvePermissionIfPending(pending, true);
 
     pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
     pending.span.end();
@@ -606,12 +607,7 @@ export class GlobalDaemon {
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
-    if (pending.permissionStartedAt) {
-      addPermissionResolvedEvent(pending.span, {
-        approved: false,
-        timestamp: new Date(),
-      });
-    }
+    resolvePermissionIfPending(pending, false);
 
     const error = payload['error'] ?? payload['tool_response'];
     pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
@@ -813,12 +809,7 @@ export class GlobalDaemon {
 
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
-      if (pending.permissionStartedAt) {
-        addPermissionResolvedEvent(pending.span, {
-          approved: false,
-          timestamp: new Date(),
-        });
-      }
+      resolvePermissionIfPending(pending, false);
       pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
       pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
       pending.span.end();
