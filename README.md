@@ -202,21 +202,27 @@ Read or update plugin configuration without leaving Claude Code.
 The plugin emits OTel spans that follow the [GenAI semantic
 conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) and ships
 them to the Weave Agents observability backend (`/agents/otel/v1/traces`).
-Each Claude Code session produces one OTel trace with the following hierarchy:
+Each user prompt produces one OTel trace (the "turn"); multi-turn
+conversations are stitched together server-side via
+`gen_ai.conversation.id`, which is set to the Claude Code session id on
+every span in the turn.
 
 ```
-invoke_agent claude-code               (session root)
-└─ invoke_agent claude-code            (one per user prompt — a "turn")
-   ├─ chat <model>                     (each LLM API call within the turn)
-   ├─ execute_tool <tool_name>         (each tool call: Read, Bash, Grep, ...)
-   └─ invoke_agent <subagent_type>     (each subagent spawned by the turn)
-      ├─ chat <model>
-      └─ execute_tool <tool_name>
+invoke_agent claude-code               (root — one trace per user prompt)
+├─ chat <model>                        (each LLM API call within the turn)
+└─ execute_tool <tool_name>            (each tool call: Read, Bash, Grep, ...)
+   └─ chat <model>                     (subagent LLM calls, when tool is Agent)
 ```
+
+Subagents do not get their own `invoke_agent` wrapper — the spawning
+`execute_tool Agent` span IS the agent invocation in the chat view. The
+subagent's LLM calls attach as children of that tool span.
 
 Permission requests appear as `weave.permission_request` span events on the
-parent `execute_tool` span; context-window compaction appears as a
-`weave.compaction` event on the session span.
+parent `execute_tool` span; context-window compaction is stamped as
+`weave.compaction.{summary,items_before,items_after}` attributes on the
+turn span open at compaction time (or the next turn if compaction fires
+between turns).
 
 Each span includes per-call token usage (`gen_ai.usage.input_tokens`,
 `gen_ai.usage.output_tokens`, cache and reasoning token counts), model name

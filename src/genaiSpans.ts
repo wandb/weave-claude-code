@@ -8,7 +8,6 @@ import {
   Tracer,
   Context,
   TimeInput,
-  ROOT_CONTEXT,
   context as otelContext,
   trace,
 } from '@opentelemetry/api';
@@ -20,7 +19,9 @@ import type { AssistantCallDetail, UsageSummary } from './parser.js';
 //
 // Canonical `gen_ai.*` keys come from the OTel GenAI semantic conventions
 // (https://opentelemetry.io/docs/specs/semconv/gen-ai/). `weave.*` keys are
-// Claude-Code-specific extensions with no semconv equivalent.
+// Claude-Code-specific extensions with no semconv equivalent. Compaction keys
+// (`weave.compaction.*`) match the Weave Agents backend's semconv exactly —
+// the backend extracts them into dedicated span columns.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const ATTR = {
@@ -63,32 +64,27 @@ export const ATTR = {
   // GenAI semconv — errors
   ERROR_TYPE: 'error.type',
 
-  // Weave extensions — session / claude_code
+  // Weave extensions — claude_code per-turn metadata
   WEAVE_SESSION_ID: 'weave.claude_code.session.id',
   WEAVE_CWD: 'weave.claude_code.cwd',
   WEAVE_SOURCE: 'weave.claude_code.source',
   WEAVE_PLUGIN_VERSION: 'weave.claude_code.plugin.version',
   WEAVE_TURN_NUMBER: 'weave.claude_code.turn.number',
   WEAVE_TURN_TOOL_COUNT: 'weave.claude_code.turn.tool_count',
-  WEAVE_SESSION_END_REASON: 'weave.claude_code.session.end_reason',
-  WEAVE_SESSION_TURN_COUNT: 'weave.claude_code.turn.count',
-  WEAVE_SESSION_TOOL_COUNT: 'weave.claude_code.tool.count',
-  WEAVE_SESSION_TOOL_COUNTS: 'weave.claude_code.tool.counts',
-  WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID: 'weave.claude_code.subagent.spawning_tool_call_id',
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
-  // Event names
+  // Weave Agents backend — compaction (set as span attributes on the turn span;
+  // the backend extracts these into dedicated columns)
+  COMPACTION_SUMMARY: 'weave.compaction.summary',
+  COMPACTION_ITEMS_BEFORE: 'weave.compaction.items_before',
+  COMPACTION_ITEMS_AFTER: 'weave.compaction.items_after',
+
+  // Permission span events
   EVT_PERMISSION_REQUEST: 'weave.permission_request',
   EVT_PERMISSION_RESOLVED: 'weave.permission_resolved',
-  EVT_COMPACTION: 'weave.compaction',
-
-  // Event attributes
   EVT_PERMISSION_APPROVED: 'weave.permission.approved',
   EVT_PERMISSION_SUGGESTIONS: 'weave.permission.suggestions',
-  EVT_COMPACTION_SUMMARY: 'weave.compaction.summary',
-  EVT_COMPACTION_ITEMS_BEFORE: 'weave.compaction.items_before',
-  EVT_COMPACTION_ITEMS_AFTER: 'weave.compaction.items_after',
 } as const;
 
 export const AGENT_NAME_CLAUDE_CODE = 'claude-code';
@@ -102,16 +98,6 @@ export const OP = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** True if `s` is a 32-character hex OTel trace ID. */
-export function isValidTraceId(s: string): boolean {
-  return /^[0-9a-f]{32}$/i.test(s);
-}
-
-/** True if `s` is a 16-character hex OTel span ID. */
-export function isValidSpanId(s: string): boolean {
-  return /^[0-9a-f]{16}$/i.test(s);
-}
 
 /**
  * Derive `gen_ai.provider.name` from a model id. Returns undefined when the
@@ -145,39 +131,30 @@ export function ctxWithParent(parent: Span): Context {
   return trace.setSpan(otelContext.active(), parent);
 }
 
-/**
- * Synthetic parent context — used when resuming a session to force the new
- * session span onto a previously-seen traceId. The synthetic spanId does not
- * resolve to a real span in the backend, but the traceId stitches the new
- * spans into the same trace as the prior process.
- */
-export function ctxFromSpanContext(traceId: string, spanId: string, isRemote = true): Context {
-  return trace.setSpanContext(ROOT_CONTEXT, {
-    traceId,
-    spanId,
-    traceFlags: 1, // sampled
-    isRemote,
-  });
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Span builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface SessionSpanArgs {
+export interface TurnSpanArgs {
   sessionId: string;
+  turnNumber: number;
+  prompt: string;
   cwd: string;
   source: string;
   pluginVersion: string;
   requestModel?: string;
+  displayName?: string;
 }
 
-export function startSessionSpan(
-  tracer: Tracer,
-  parentCtx: Context | undefined,
-  args: SessionSpanArgs,
-): Span {
-  const attrs: Record<string, string> = {
+/**
+ * Start a turn span. Each turn is the root of its own trace; the Weave Agents
+ * backend stitches turns into a conversation via `gen_ai.conversation.id` (set
+ * to the Claude Code session_id). Session-level metadata (cwd, source,
+ * plugin.version) is stamped on every turn span so it's queryable without a
+ * separate session-level span.
+ */
+export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
+  const attrs: Record<string, string | number> = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
     [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
@@ -186,39 +163,16 @@ export function startSessionSpan(
     [ATTR.WEAVE_CWD]: args.cwd,
     [ATTR.WEAVE_SOURCE]: args.source,
     [ATTR.WEAVE_PLUGIN_VERSION]: args.pluginVersion,
-  };
-  if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
-
-  return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}:session`,
-    { kind: SpanKind.INTERNAL, attributes: attrs },
-    parentCtx,
-  );
-}
-
-export interface TurnSpanArgs {
-  sessionId: string;
-  turnNumber: number;
-  prompt: string;
-  pluginVersion: string;
-  displayName?: string;
-}
-
-export function startTurnSpan(tracer: Tracer, parentSpan: Span, args: TurnSpanArgs): Span {
-  const attrs: Record<string, string | number> = {
-    [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-    [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
-    [ATTR.AGENT_VERSION]: args.pluginVersion,
-    [ATTR.CONVERSATION_ID]: args.sessionId,
     [ATTR.WEAVE_TURN_NUMBER]: args.turnNumber,
     [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: args.prompt }]),
   };
+  if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
+  // No parent context — turn spans are roots, one trace per turn.
   return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}:turn`,
+    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
-    ctxWithParent(parentSpan),
   );
 }
 
@@ -240,36 +194,6 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
 
   return tracer.startSpan(
     `${OP.EXECUTE_TOOL} ${args.toolName}`,
-    { kind: SpanKind.INTERNAL, attributes: attrs },
-    ctxWithParent(parentSpan),
-  );
-}
-
-export interface SubagentSpanArgs {
-  sessionId: string;
-  subagentType: string;
-  agentId: string;
-  spawningToolCallId?: string;
-  pluginVersion: string;
-}
-
-export function startSubagentSpan(
-  tracer: Tracer,
-  parentSpan: Span,
-  args: SubagentSpanArgs,
-): Span {
-  const attrs: Record<string, string> = {
-    [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-    [ATTR.AGENT_NAME]: args.subagentType,
-    [ATTR.AGENT_ID]: args.agentId,
-    [ATTR.AGENT_VERSION]: args.pluginVersion,
-    [ATTR.CONVERSATION_ID]: `${args.sessionId}:${args.agentId}`,
-  };
-  if (args.spawningToolCallId) {
-    attrs[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID] = args.spawningToolCallId;
-  }
-  return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${args.subagentType}`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
     ctxWithParent(parentSpan),
   );
@@ -340,7 +264,8 @@ export function emitChatSpan(
 
 /**
  * Walk a parsed list of per-message details and emit one chat span per
- * assistant message. `parent` is the turn-level (or subagent-level) span.
+ * assistant message. `parentSpan` is the turn-level span (for the main agent)
+ * or the spawning Agent tool span (for a subagent).
  */
 export function emitChatSpansFromAssistantCalls(
   tracer: Tracer,
@@ -410,19 +335,26 @@ export function addPermissionResolvedEvent(toolSpan: Span, args: PermissionResol
   );
 }
 
-export interface CompactionEventArgs {
+export interface CompactionAttrs {
   summary?: string;
   itemsBefore?: number;
   itemsAfter?: number;
-  timestamp?: Date;
 }
 
-export function addCompactionEvent(sessionSpan: Span, args: CompactionEventArgs): void {
-  const attrs: Record<string, string | number> = {};
-  if (args.summary !== undefined) attrs[ATTR.EVT_COMPACTION_SUMMARY] = args.summary;
-  if (args.itemsBefore !== undefined) attrs[ATTR.EVT_COMPACTION_ITEMS_BEFORE] = args.itemsBefore;
-  if (args.itemsAfter !== undefined) attrs[ATTR.EVT_COMPACTION_ITEMS_AFTER] = args.itemsAfter;
-  sessionSpan.addEvent(ATTR.EVT_COMPACTION, attrs, args.timestamp ?? new Date());
+/**
+ * Stamp `weave.compaction.*` attributes onto a turn span. The Weave Agents
+ * backend extracts these into dedicated columns (`compaction_summary`,
+ * `compaction_items_before`, `compaction_items_after`) and renders a
+ * "context_compacted" card in the chat view.
+ *
+ * Compaction is a session-level event, but with no session span it attaches
+ * to the turn span that's open when the compaction fires — or to the next
+ * turn span, if compaction fires between turns.
+ */
+export function setCompactionAttrs(turnSpan: Span, attrs: CompactionAttrs): void {
+  if (attrs.summary !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_SUMMARY, attrs.summary);
+  if (attrs.itemsBefore !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, attrs.itemsBefore);
+  if (attrs.itemsAfter !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, attrs.itemsAfter);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
