@@ -9,8 +9,10 @@ import {
   Context,
   TimeInput,
   ROOT_CONTEXT,
+  context as otelContext,
   trace,
 } from '@opentelemetry/api';
+import { extractAssistantTextBlocks } from './parser.js';
 import type { AssistantCallDetail, UsageSummary } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,9 +135,14 @@ export function jsonStr(v: unknown): string {
   }
 }
 
-/** Context carrying `parent` as the active span for child-span creation. */
+/**
+ * Context carrying `parent` as the active span for child-span creation.
+ * Builds on `context.active()` (not `ROOT_CONTEXT`) so baggage on the active
+ * context propagates to children — relevant if we ever wire baggage for
+ * cross-process trace continuity.
+ */
 export function ctxWithParent(parent: Span): Context {
-  return trace.setSpan(ROOT_CONTEXT, parent);
+  return trace.setSpan(otelContext.active(), parent);
 }
 
 /**
@@ -368,23 +375,7 @@ function parseTimestamp(ts: string | undefined): Date | undefined {
 }
 
 function assistantBlocksToText(blocks: unknown[]): string {
-  const parts: string[] = [];
-  for (const block of blocks) {
-    if (typeof block === 'string') {
-      parts.push(block);
-      continue;
-    }
-    if (!block || typeof block !== 'object') continue;
-    const b = block as Record<string, unknown>;
-    const type = b['type'];
-    if (type === 'text' && typeof b['text'] === 'string') {
-      parts.push(b['text'] as string);
-    } else if (type === 'thinking' && typeof b['thinking'] === 'string') {
-      // Don't fold thinking into visible text — left for future reasoning_content
-      continue;
-    }
-  }
-  return parts.join('\n');
+  return extractAssistantTextBlocks(blocks).join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

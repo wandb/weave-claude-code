@@ -168,8 +168,7 @@ class SubagentTracking {
   }
 
   byAgentId(agentId: string): SubagentTracker | undefined {
-    for (const t of this.trackers) if (t.agentId === agentId) return t;
-    return undefined;
+    return this.trackers.find(t => t.agentId === agentId);
   }
 
   remove(tracker: SubagentTracker): void {
