@@ -648,18 +648,22 @@ export class GlobalDaemon {
       try {
         agentTranscript = new TranscriptFile(agentTranscriptPath);
         const parsed = parseSessionFd(agentTranscript.getFd());
+        // Use the last turn only. Subagent transcripts are almost always
+        // single-turn; the rare 2-turn case occurs when the parent agent's
+        // prior assistant message is carried in as pre-context on line 0
+        // and the user prompt that fires the subagent appears on line 1.
+        // Emitting chat spans from earlier turns would mis-attribute the
+        // parent's LLM call to this subagent invocation.
         const lastTurn = parsed?.turns[parsed.turns.length - 1];
         model = lastTurn?.primaryModel();
 
-        if (parsed) {
-          for (const turn of parsed.turns) {
-            emitChatSpansFromAssistantCalls(
-              this.tracer,
-              chatParent,
-              `${session.sessionId}:${agentId}`,
-              turn.assistantCalls(),
-            );
-          }
+        if (lastTurn) {
+          emitChatSpansFromAssistantCalls(
+            this.tracer,
+            chatParent,
+            `${session.sessionId}:${agentId}`,
+            lastTurn.assistantCalls(),
+          );
         }
       } catch (err) {
         this.log('DEBUG', `SubagentStop: could not parse transcript: ${err}`);
