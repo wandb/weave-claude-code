@@ -22,11 +22,14 @@ This will:
 - Prompt for your Weave project (`entity/project`) and W&B API key if not already set
 
 Marketplace installs are pinned to a specific release tag rather than the
-repository default branch. When cutting a new release, create the matching
-protected tag (for example `v0.1.1`) and update the pinned ref and sha in
-[`src/setup.ts`](src/setup.ts) and in
-[`./.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)
-before publishing.
+repository default branch. New releases are cut via two GitHub Actions:
+
+1. **Version Bump** — dispatched with a version like `0.1.2`. Bumps the
+   pinned version across the repo, pins the marketplace to the resulting
+   commit SHA, and creates and pushes the matching `v0.1.2` tag.
+2. **Publish Package** — dispatched with the tag (e.g. `v0.1.2`). Verifies
+   the tag is consistent and not already published, then builds and
+   publishes to npm.
 
 Your W&B API key is available at https://wandb.ai/authorize.
 
