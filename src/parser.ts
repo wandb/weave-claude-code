@@ -138,21 +138,25 @@ function buildSession(lines: unknown[]): ParsedSession {
 }
 
 function buildTurn(assistantLines: AssistantLine[]): Turn {
-  const calls: AssistantCallDetail[] = assistantLines.map(({ line: m, prevTimestamp }) => {
-    const message = m['message'] as Record<string, unknown> | undefined;
-    const rawUsage = (message?.['usage'] ?? m['usage'] ?? {}) as Record<string, number>;
+  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
+    const message = line['message'] as Record<string, unknown> | undefined;
+    const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
     const usage = rawToUsageSummary(rawUsage);
     const reasoningTokens = typeof rawUsage['reasoning_tokens'] === 'number' ? rawUsage['reasoning_tokens'] : undefined;
-    const model = (message?.['model'] ?? m['model']) as string | undefined;
+    const model = (message?.['model'] ?? line['model']) as string | undefined;
     const rawContent = message?.['content'];
+    // `content` is either an array of blocks (the common assistant shape), a
+    // bare string (legacy single-text format), or missing. Fall back to [] for
+    // the missing / unknown case so downstream code sees a well-typed empty
+    // list instead of `undefined`.
     const contentBlocks: unknown[] = Array.isArray(rawContent)
       ? (rawContent as unknown[])
       : typeof rawContent === 'string'
         ? [{ type: 'text', text: rawContent }]
         : [];
-    const responseId = (message?.['id'] ?? m['id']) as string | undefined;
+    const responseId = (message?.['id'] ?? line['id']) as string | undefined;
     const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
-    const timestamp = (m['timestamp'] as string | undefined) ?? '';
+    const timestamp = (line['timestamp'] as string | undefined) ?? '';
 
     return {
       timestamp,
