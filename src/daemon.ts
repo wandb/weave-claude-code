@@ -19,6 +19,7 @@ import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { loadSettings, VERSION } from './setup.js';
+import { recordTurn } from './traceRegistry.js';
 import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
@@ -1036,8 +1037,28 @@ export class GlobalDaemon {
     }
 
     session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
+    const turnSpanCtx = session.currentTurnSpan.spanContext();
+    const turnStartedAt = (() => {
+      const raw = (session.currentTurnSpan as unknown as { startTime?: [number, number] }).startTime;
+      if (!Array.isArray(raw)) return new Date().toISOString();
+      return new Date(raw[0] * 1000 + Math.floor(raw[1] / 1e6)).toISOString();
+    })();
     session.currentTurnSpan.end();
     session.currentTurnSpan = undefined;
+
+    // Record a local breadcrumb so `weave-claude-plugin trace recent` can
+    // surface the trace_id for this turn without needing DEBUG-level logs.
+    recordTurn({
+      sessionId,
+      turnNumber: session.turnNumber,
+      traceId: turnSpanCtx.traceId,
+      conversationId: session.conversationId,
+      startedAt: turnStartedAt,
+      endedAt: new Date().toISOString(),
+      toolCount: session.turnToolCalls,
+      subagentCount: session.subagents.size(),
+      cwd: session.cwd,
+    });
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
