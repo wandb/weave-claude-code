@@ -83,6 +83,40 @@ function hashPrompt(prompt: string): string {
 }
 
 /**
+ * Pull the subagent's reply text out of a Claude-Code `tool_response` value.
+ * Anthropic-style responses arrive as
+ *   `{ content: [{ type: 'text', text: '...' }, ...], ... }`
+ * with optional `prompt`, `agentId`, `agentType`, etc. sibling fields. The
+ * chat view should render just the assistant's reply, not the whole
+ * envelope, so we extract the concatenated `text` blocks. Returns:
+ *   - the input verbatim if it's already a plain string,
+ *   - joined text content if `content` is a list of blocks with `type:'text'`,
+ *   - JSON-stringified fallback only if the shape is unrecognized (preserves
+ *     pre-fix behavior so we never silently lose data).
+ */
+function extractSubagentReplyText(toolResponse: unknown): string {
+  if (typeof toolResponse === 'string') return toolResponse;
+  if (toolResponse === null || typeof toolResponse !== 'object') {
+    return JSON.stringify(toolResponse);
+  }
+  const obj = toolResponse as Record<string, unknown>;
+  const content = obj['content'];
+  if (Array.isArray(content)) {
+    const texts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === 'object') {
+        const b = block as Record<string, unknown>;
+        if (b['type'] === 'text' && typeof b['text'] === 'string') {
+          texts.push(b['text']);
+        }
+      }
+    }
+    if (texts.length > 0) return texts.join('\n');
+  }
+  return JSON.stringify(toolResponse);
+}
+
+/**
  * Map a parent transcript path + subagent agent_id to the subagent's transcript
  * file. Claude Code writes subagent transcripts as siblings of the parent in a
  * `<session_id>/subagents/` subdirectory:
@@ -810,10 +844,16 @@ export class GlobalDaemon {
     if (!span || tracker.ended) return;
 
     if (output !== undefined && output !== null && output !== '') {
-      const outputText = typeof output === 'string' ? output : jsonStr(output);
+      // For matched (PostToolUse) closes, `output` is the `tool_response`
+      // value Claude Code passes — an Anthropic-shape envelope with
+      // `content[]` blocks plus sibling metadata. Extract just the reply
+      // text so the chat view shows the subagent's message, not the raw
+      // JSON wrapper. Failure path passes a plain error string, which
+      // extractSubagentReplyText returns verbatim.
+      const replyText = extractSubagentReplyText(output);
       span.setAttribute(
         ATTR.OUTPUT_MESSAGES,
-        jsonStr([{ role: 'assistant', content: outputText }]),
+        jsonStr([{ role: 'assistant', content: replyText }]),
       );
     }
     if (failure) {
