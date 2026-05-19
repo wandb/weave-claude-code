@@ -136,7 +136,15 @@ export function ctxWithParent(parent: Span): Context {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface TurnSpanArgs {
+  /** Current process's Claude Code session id — stamped on the span as a
+   *  debug breadcrumb (`weave.claude_code.session.id`). Per resume, this
+   *  changes; the conversation id does not. */
   sessionId: string;
+  /** Stitching key for the multi-turn conversation. For resumed sessions,
+   *  this is the root ancestor's session id (so turns from before and after
+   *  resume share `gen_ai.conversation.id`). For fresh sessions, equals
+   *  `sessionId`. */
+  conversationId: string;
   turnNumber: number;
   prompt: string;
   cwd: string;
@@ -148,17 +156,16 @@ export interface TurnSpanArgs {
 
 /**
  * Start a turn span. Each turn is the root of its own trace; the Weave Agents
- * backend stitches turns into a conversation via `gen_ai.conversation.id` (set
- * to the Claude Code session_id). Session-level metadata (cwd, source,
- * plugin.version) is stamped on every turn span so it's queryable without a
- * separate session-level span.
+ * backend stitches turns into a conversation via `gen_ai.conversation.id`.
+ * Session-level metadata (cwd, source, plugin.version) is stamped on every
+ * turn span so it's queryable without a separate session-level span.
  */
 export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   const attrs: Record<string, string | number> = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
     [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
-    [ATTR.CONVERSATION_ID]: args.sessionId,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
     [ATTR.WEAVE_SESSION_ID]: args.sessionId,
     [ATTR.WEAVE_CWD]: args.cwd,
     [ATTR.WEAVE_SOURCE]: args.source,
@@ -200,7 +207,11 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
 }
 
 export interface ChatSpanArgs {
-  sessionId: string;
+  /** Stitching key — same value as the parent turn span's
+   *  `gen_ai.conversation.id`. For subagent chats this is suffixed with
+   *  `:${agent_id}` upstream so the subagent's calls form their own
+   *  conversation under the spawning tool span. */
+  conversationId: string;
   model: string;
   startedAt: TimeInput;
   endedAt: TimeInput;
@@ -225,7 +236,7 @@ export function emitChatSpan(
   const attrs: Record<string, string | number | boolean | string[]> = {
     [ATTR.OPERATION_NAME]: OP.CHAT,
     [ATTR.REQUEST_MODEL]: args.model,
-    [ATTR.CONVERSATION_ID]: args.sessionId,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
     [ATTR.USAGE_INPUT_TOKENS]: args.usage.input_tokens,
     [ATTR.USAGE_OUTPUT_TOKENS]: args.usage.output_tokens,
     [ATTR.OUTPUT_TYPE]: 'text',
@@ -270,7 +281,7 @@ export function emitChatSpan(
 export function emitChatSpansFromAssistantCalls(
   tracer: Tracer,
   parentSpan: Span,
-  sessionId: string,
+  conversationId: string,
   calls: AssistantCallDetail[],
 ): void {
   for (const c of calls) {
@@ -278,7 +289,7 @@ export function emitChatSpansFromAssistantCalls(
     const startedAt = parseTimestamp(c.prevTimestamp) ?? parseTimestamp(c.timestamp) ?? new Date();
     const endedAt = parseTimestamp(c.timestamp) ?? new Date();
     emitChatSpan(tracer, parentSpan, {
-      sessionId,
+      conversationId,
       model: c.model,
       startedAt,
       endedAt,

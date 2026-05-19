@@ -20,7 +20,7 @@ import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd } from './parser.js';
-import { TranscriptFile } from './transcriptFile.js';
+import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
@@ -96,6 +96,11 @@ interface SubagentTracker {
 
 interface SessionState {
   sessionId: string;
+  /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
+   *  turns stitch with their pre-resume turns server-side. Equals `sessionId`
+   *  for fresh (non-forked) sessions. Resolved once at SessionStart by
+   *  walking `forkedFrom.sessionId` pointers across transcript files. */
+  conversationId: string;
   transcript: TranscriptFile;
   cwd: string;
   source: string;
@@ -407,8 +412,11 @@ export class GlobalDaemon {
     const initialRequestModel = payload['model'] as string | undefined;
     const cwd = (payload['cwd'] as string | undefined) ?? '';
 
+    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
+
     this.sessions.set(sessionId, {
       sessionId,
+      conversationId,
       transcript,
       cwd,
       source,
@@ -421,11 +429,87 @@ export class GlobalDaemon {
       subagents: new SubagentTracking(),
     });
 
-    this.log('INFO', `Session created: ${sessionId}`);
+    const resumed = conversationId !== sessionId;
+    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} conversation=${conversationId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
     );
+  }
+
+  /**
+   * Resolve the canonical `gen_ai.conversation.id` for a session by walking
+   * the `forkedFrom.sessionId` chain to the root. Returns `sessionId` itself
+   * for fresh (non-forked) sessions, or when the chain can't be resolved.
+   *
+   * `claude --continue` / `claude --resume <id>` produce a new process-level
+   * session_id but stamp every transcript line with `forkedFrom.sessionId`
+   * pointing at the immediate parent. Each transcript file is named after
+   * its session id and lives in the same project directory, so walking the
+   * chain is just sibling-file reads.
+   *
+   * SessionStart fires roughly when Claude Code flushes the first transcript
+   * line, so we retry briefly if the file isn't readable yet. The hard cap
+   * on chain depth is a sanity guard against pathological forking, not a
+   * real limit.
+   */
+  private async resolveConversationId(
+    sessionId: string,
+    transcriptPath: string,
+    source: string,
+  ): Promise<string> {
+    const MAX_CHAIN_DEPTH = 32;
+    const MAX_HEAD_READ_ATTEMPTS = 4;
+    const HEAD_READ_RETRY_MS = 100;
+
+    const transcriptDir = path.dirname(transcriptPath);
+    const seen = new Set<string>([sessionId]);
+    let current = sessionId;
+    let currentPath = transcriptPath;
+
+    for (let depth = 0; depth < MAX_CHAIN_DEPTH; depth++) {
+      let parent: string | undefined;
+      // Only the FIRST hop needs retry — ancestor transcripts are static.
+      const attempts = depth === 0 ? MAX_HEAD_READ_ATTEMPTS : 1;
+      for (let i = 0; i < attempts; i++) {
+        const head = readFirstTranscriptLine(currentPath);
+        const ff = head?.['forkedFrom'] as Record<string, unknown> | undefined;
+        const ffId = ff?.['sessionId'];
+        if (typeof ffId === 'string' && ffId) {
+          parent = ffId;
+          break;
+        }
+        if (head !== undefined) break; // head parseable but no fork — root
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, HEAD_READ_RETRY_MS));
+      }
+      if (!parent || seen.has(parent)) break;
+      seen.add(parent);
+
+      const parentPath = path.join(transcriptDir, `${parent}.jsonl`);
+      current = parent;
+      if (!fs.existsSync(parentPath)) {
+        // Parent transcript not on disk (e.g., resumed across machines).
+        // Stop here — the recorded parent id is still the best stitching
+        // key we have, even though we can't verify if IT was a fork too.
+        this.log(
+          'DEBUG',
+          `resolveConversationId: parent transcript not on disk: ${parentPath} — stopping chain walk at ${parent}`,
+        );
+        break;
+      }
+      currentPath = parentPath;
+    }
+
+    if (current !== sessionId && source !== 'resume') {
+      // Fork detected but `source` doesn't say resume — log so the mismatch
+      // is visible. We still stitch by the chain root because that's the
+      // correct behavior; this just surfaces an unexpected hook payload.
+      this.log(
+        'DEBUG',
+        `resolveConversationId: forkedFrom chain found but source='${source}' (expected 'resume') session=${sessionId} root=${current}`,
+      );
+    }
+    return current;
   }
 
   private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
@@ -446,6 +530,7 @@ export class GlobalDaemon {
     session.turnToolCalls = 0;
     const turnSpan = startTurnSpan(this.tracer, {
       sessionId: session.sessionId,
+      conversationId: session.conversationId,
       turnNumber: session.turnNumber,
       prompt,
       cwd: session.cwd,
@@ -661,7 +746,7 @@ export class GlobalDaemon {
           emitChatSpansFromAssistantCalls(
             this.tracer,
             chatParent,
-            `${session.sessionId}:${agentId}`,
+            `${session.conversationId}:${agentId}`,
             lastTurn.assistantCalls(),
           );
         }
@@ -729,7 +814,7 @@ export class GlobalDaemon {
       emitChatSpansFromAssistantCalls(
         this.tracer,
         session.currentTurnSpan,
-        session.sessionId,
+        session.conversationId,
         currentTurn.assistantCalls(),
       );
     }
