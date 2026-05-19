@@ -5,6 +5,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import {
   Span,
   SpanStatusCode,
@@ -27,6 +28,7 @@ import {
   CompactionAttrs,
   startTurnSpan,
   startToolSpan,
+  startInvokeAgentSpan,
   emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
@@ -74,24 +76,95 @@ function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean)
   });
 }
 
+/** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
+ *  the subagent's SubagentStart by matching transcript content. */
+function hashPrompt(prompt: string): string {
+  return createHash('sha256').update(prompt, 'utf8').digest('hex');
+}
+
+/**
+ * Map a parent transcript path + subagent agent_id to the subagent's transcript
+ * file. Claude Code writes subagent transcripts as siblings of the parent in a
+ * `<session_id>/subagents/` subdirectory:
+ *   parent:   <project_dir>/<session_id>.jsonl
+ *   subagent: <project_dir>/<session_id>/subagents/agent-<agent_id>.jsonl
+ */
+function computeSubagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
+  const projectDir = path.dirname(parentTranscriptPath);
+  const sessionDirName = path.basename(parentTranscriptPath, '.jsonl');
+  return path.join(projectDir, sessionDirName, 'subagents', `agent-${agentId}.jsonl`);
+}
+
+/** Pull the user-message content out of a transcript line. Returns the prompt
+ *  string for `{type: 'user', message: {content: string|Array}}` lines, else
+ *  undefined. Array-form content is joined across text blocks. */
+function extractUserMessageContent(line: Record<string, unknown> | undefined): string | undefined {
+  if (!line || line['type'] !== 'user') return undefined;
+  const msg = line['message'];
+  if (!msg || typeof msg !== 'object') return undefined;
+  const content = (msg as Record<string, unknown>)['content'];
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as Record<string, unknown>)['type'] === 'text') {
+        const t = (block as Record<string, unknown>)['text'];
+        if (typeof t === 'string') parts.push(t);
+      }
+    }
+    return parts.length > 0 ? parts.join('') : undefined;
+  }
+  return undefined;
+}
+
+/** Read the subagent transcript's first line, retrying briefly because Claude
+ *  Code may not have flushed it yet when SubagentStart fires. Total wait
+ *  bounded by the sum of `RETRY_DELAYS_MS`. */
+const SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS = [0, 50, 100, 150];
+async function readSubagentFirstLineWithRetry(
+  transcriptPath: string,
+): Promise<Record<string, unknown> | undefined> {
+  for (const delay of SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS) {
+    if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    const line = readFirstTranscriptLine(transcriptPath);
+    if (line && line['type'] === 'user') return line;
+  }
+  return undefined;
+}
+
 /**
  * Tracks a subagent across hook events. Two shapes:
  *   (a) Matched — created at PreToolUse when an Agent tool with subagent_type
- *       is detected; carries `toolUseId` and a reference to the spawning Agent
- *       tool span. `agentId` is filled in when SubagentStart arrives.
- *   (b) Orphan — created at SubagentStart when no pending tracker is in the
- *       proximity window. Has no spawning tool span.
+ *       is detected; carries `toolUseId`, `promptHash`, and a reference to
+ *       the subagent's `invoke_agent` span. `agentId` is filled in at
+ *       SubagentStart via content-based correlation: sha256(firing prompt) +
+ *       subagent_type.
+ *   (b) Orphan — created at SubagentStart when no tracker matches the firing
+ *       prompt (the parent's Agent PreToolUse never fired, or its prompt
+ *       differs from the subagent transcript's line 1). The `invoke_agent`
+ *       span is created at SubagentStart with the current turn span as
+ *       parent and no input messages (the firing prompt is unavailable).
  *
- * Subagents don't get their own `invoke_agent` wrapper span — the spawning
- * `execute_tool Agent` span IS the agent invocation in the chat view. The
- * subagent's LLM calls (`chat` spans) attach as children of that tool span.
+ * The subagent is its own `invoke_agent <subagent_type>` span, child of the
+ * parent turn's `invoke_agent claude-code` span. Per the Weave Agents chat
+ * view (`weave/trace_server/agents/chat_view.py`), nested `invoke_agent`
+ * spans render as an `agent_start` lifecycle marker with the inner agent's
+ * own assistant text — distinct from an `execute_tool` tool-call event.
+ * The Agent tool call does NOT emit an `execute_tool` span; it emits this
+ * `invoke_agent` span directly.
  */
 interface SubagentTracker {
   subagentType: string;
   detectedAt: Date;
   toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
-  spawningToolSpan?: Span;     // Agent tool span; chat spans parent under this (matched path only)
+  invokeAgentSpan?: Span;      // subagent's `invoke_agent` span; subagent chat/tool spans parent here
   agentId?: string;
+  /** sha256 of the prompt passed to the Agent tool; matched against the
+   *  subagent's transcript line-1 user message at SubagentStart. */
+  promptHash?: string;
+  /** True once the invoke_agent span has been ended. Guards against
+   *  double-end when PostToolUse and SubagentStop both try to close it. */
+  ended?: boolean;
 }
 
 interface SessionState {
@@ -131,9 +204,8 @@ const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
 /**
  * Per-session container that tracks subagents from PreToolUse (when an Agent
- * tool with subagent_type is detected) through SubagentStop. Replaces a pair
- * of maps keyed by toolUseId and agentId — single source of truth for the
- * tracker list, with intent-revealing lookup methods.
+ * tool with subagent_type is detected) through SubagentStop. Single source of
+ * truth for the tracker list, with intent-revealing lookup methods.
  */
 class SubagentTracking {
   private trackers: SubagentTracker[] = [];
@@ -144,25 +216,32 @@ class SubagentTracking {
   }
 
   /**
-   * Find the unmatched tracker (no agent_id yet) whose detectedAt is closest
-   * to `now`, within `windowMs`. Returns undefined if no candidate qualifies.
+   * Find the unmatched tracker (no agent_id yet) matching `(promptHash,
+   * subagentType)`. FIFO across ties: the oldest pending tracker wins, so two
+   * back-to-back identical Agent calls still correlate in dispatch order.
+   * Returns undefined if no candidate qualifies.
    */
-  findUnmatchedByProximity(now: number, windowMs: number): SubagentTracker | undefined {
+  findUnmatchedByContent(promptHash: string, subagentType: string): SubagentTracker | undefined {
     let best: SubagentTracker | undefined;
-    let bestDelta = Infinity;
     for (const t of this.trackers) {
       if (t.agentId) continue;
-      const delta = now - t.detectedAt.getTime();
-      if (delta >= 0 && delta < windowMs && delta < bestDelta) {
-        bestDelta = delta;
-        best = t;
-      }
+      if (t.promptHash !== promptHash) continue;
+      if (t.subagentType !== subagentType) continue;
+      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
     }
     return best;
   }
 
   byAgentId(agentId: string): SubagentTracker | undefined {
     return this.trackers.find(t => t.agentId === agentId);
+  }
+
+  /** Lookup by spawning Agent tool's tool_use_id. Used at PostToolUse to find
+   *  the subagent's `invoke_agent` span when the matching toolUseId is not
+   *  in `pendingToolCalls` (because the Agent tool emits an invoke_agent
+   *  span instead of an execute_tool span). */
+  byToolUseId(toolUseId: string): SubagentTracker | undefined {
+    return this.trackers.find(t => t.toolUseId === toolUseId);
   }
 
   remove(tracker: SubagentTracker): void {
@@ -563,13 +642,44 @@ export class GlobalDaemon {
 
     const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
 
-    // Parent: spawning Agent tool span if this PreToolUse comes from inside a subagent,
-    // else the current turn span.
+    // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
+    // a subagent, else the current turn span.
     const parentSpan = agentId
-      ? session.subagents.byAgentId(agentId)?.spawningToolSpan ?? session.currentTurnSpan
+      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? session.currentTurnSpan
       : session.currentTurnSpan;
     if (!parentSpan) {
       this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
+      return;
+    }
+
+    // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
+    // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
+    // nested invoke_agent spans as their own `agent_start` lifecycle marker; an
+    // execute_tool wrapper here would mis-render the subagent dispatch as a
+    // generic tool call. The Agent tool's PostToolUse closes this span with the
+    // subagent's final return as `gen_ai.output.messages`.
+    //
+    // `promptHash` lets SubagentStart correlate this tracker to the right
+    // subagent deterministically by reading the subagent transcript's line 1
+    // (the firing prompt) and matching by sha256 + subagent_type.
+    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
+      const subagentType = toolInput['subagent_type'] as string;
+      const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
+      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
+        agentType: subagentType,
+        conversationId: session.conversationId,
+        pluginVersion: VERSION,
+        inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
+        spawningToolCallId: toolUseId,
+        displayName: toolDisplayName(toolName, toolInput),
+      });
+      session.subagents.add({
+        toolUseId,
+        subagentType,
+        detectedAt: new Date(),
+        invokeAgentSpan,
+        promptHash: hashPrompt(prompt),
+      });
       return;
     }
 
@@ -580,19 +690,6 @@ export class GlobalDaemon {
       displayName: toolDisplayName(toolName, toolInput),
     });
     session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
-
-    // Agent tool with subagent_type spawns a subagent. Stash the tool span so the
-    // subagent's chat spans (emitted at SubagentStop from the parsed transcript)
-    // can parent under it. The Agent tool span IS the subagent invocation — no
-    // separate `invoke_agent <subagent_type>` wrapper is created.
-    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
-      session.subagents.add({
-        toolUseId,
-        subagentType: toolInput['subagent_type'] as string,
-        detectedAt: new Date(),
-        spawningToolSpan: toolSpan,
-      });
-    }
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -633,6 +730,19 @@ export class GlobalDaemon {
     const toolUseId = payload['tool_use_id'] as string | undefined;
     if (!toolUseId) return;
 
+    // Subagent dispatch: the matching span is the subagent's invoke_agent
+    // span (not a pendingToolCall), so we close it here with the subagent's
+    // final assistant text as `gen_ai.output.messages`.
+    const subagentTracker = session.subagents.byToolUseId(toolUseId);
+    if (subagentTracker?.invokeAgentSpan) {
+      this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+      session.subagents.remove(subagentTracker);
+      session.totalToolCalls += 1;
+      session.turnToolCalls += 1;
+      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      return;
+    }
+
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
@@ -654,12 +764,26 @@ export class GlobalDaemon {
     const toolUseId = payload['tool_use_id'] as string | undefined;
     if (!toolUseId) return;
 
+    const error = payload['error'] ?? payload['tool_response'];
+
+    // Subagent dispatch failed (rare). Close the invoke_agent span with ERROR
+    // status; subagent chat spans, if any reached SubagentStop, are already
+    // attached as children.
+    const subagentTracker = session.subagents.byToolUseId(toolUseId);
+    if (subagentTracker?.invokeAgentSpan) {
+      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+      session.subagents.remove(subagentTracker);
+      session.totalToolCalls += 1;
+      session.turnToolCalls += 1;
+      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      return;
+    }
+
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
     resolvePermissionIfPending(pending, false);
 
-    const error = payload['error'] ?? payload['tool_response'];
     pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
     pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
     pending.span.setStatus({ code: SpanStatusCode.ERROR, message: typeof error === 'string' ? error : 'tool failed' });
@@ -671,37 +795,96 @@ export class GlobalDaemon {
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
+  /**
+   * Close a subagent's `invoke_agent` span. Idempotent — guarded by
+   * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
+   * regardless of order. Sets `gen_ai.output.messages` from the canonical
+   * tool return string when available; marks the span ERROR on failure.
+   */
+  private closeSubagentInvokeAgentSpan(
+    tracker: SubagentTracker,
+    output: unknown,
+    failure: boolean,
+  ): void {
+    const span = tracker.invokeAgentSpan;
+    if (!span || tracker.ended) return;
+
+    if (output !== undefined && output !== null && output !== '') {
+      const outputText = typeof output === 'string' ? output : jsonStr(output);
+      span.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        jsonStr([{ role: 'assistant', content: outputText }]),
+      );
+    }
+    if (failure) {
+      span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: typeof output === 'string' ? output : 'subagent failed',
+      });
+    }
+    span.end();
+    tracker.ended = true;
+  }
+
   private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session || !this.tracer) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
 
-    // Temporal proximity matching: find the closest unmatched SubagentTracker within 5 s.
-    // SubagentStart has no explicit parent pointer, so we correlate by timing.
-    const PROXIMITY_MS = 5_000;
     const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
 
-    let bestTracker = session.subagents.findUnmatchedByProximity(Date.now(), PROXIMITY_MS);
+    // Content-based deterministic correlation: SubagentStart carries no
+    // pointer back to the parent's `tool_use_id`, so we read the subagent's
+    // transcript line 1 (the firing user prompt — byte-identical to the
+    // parent Agent tool's `tool_input.prompt`) and match by sha256 of that
+    // string plus the subagent_type. No temporal window.
+    const subagentPath = computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
+    const firstLine = await readSubagentFirstLineWithRetry(subagentPath);
+    const firingPrompt = extractUserMessageContent(firstLine);
+
+    let bestTracker: SubagentTracker | undefined;
+    if (firingPrompt !== undefined) {
+      bestTracker = session.subagents.findUnmatchedByContent(hashPrompt(firingPrompt), agentType);
+    }
+
     const matched = !!bestTracker;
     if (!bestTracker) {
-      // No matching Agent tool call — record an orphan tracker so SubagentStop
-      // can still log the disconnect. Chat spans for orphans fall back to the
-      // current turn span at SubagentStop.
-      this.log('ERROR', `SubagentStart: no unmatched tracker for agentId=${agentId}, creating orphan`);
+      // No matching Agent tool call — either the parent's PreToolUse never
+      // fired, or the firing prompt couldn't be read from the subagent
+      // transcript. Create an orphan tracker AND an orphan `invoke_agent`
+      // span so the subagent still produces a valid nested agent invocation
+      // in the chat view. The span parents under the current turn (no
+      // spawning tool_use_id) and has no input_messages (firing prompt
+      // unavailable). Closed at SubagentStop since there will be no
+      // PostToolUse for it.
+      const reason = firingPrompt === undefined
+        ? 'transcript line 1 missing or non-user'
+        : `no tracker matches (promptHash, type=${agentType})`;
+      this.log('ERROR', `SubagentStart: ${reason}; creating orphan for agentId=${agentId} path=${subagentPath}`);
       bestTracker = {
         subagentType: agentType,
         detectedAt: new Date(),
       };
+      if (session.currentTurnSpan) {
+        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
+          agentType,
+          conversationId: session.conversationId,
+          pluginVersion: VERSION,
+          displayName: `Agent: ${agentType}`,
+        });
+        bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
+      }
       session.subagents.add(bestTracker);
     }
 
     bestTracker.agentId = agentId;
-    if (bestTracker.spawningToolSpan) {
-      // Surface the runtime agent_id on the spawning Agent tool span — useful for
-      // correlating the tool call with the subagent's chat spans in queries.
-      bestTracker.spawningToolSpan.setAttribute(ATTR.AGENT_ID, agentId);
+    if (bestTracker.invokeAgentSpan) {
+      // Stamp the runtime agent_id on the subagent's invoke_agent span — the
+      // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
+      bestTracker.invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
@@ -720,14 +903,14 @@ export class GlobalDaemon {
       return;
     }
 
-    // Chat spans for the subagent's LLM calls parent under the spawning Agent
-    // tool span (the chat-view treats that tool call as the subagent invocation).
-    // For orphan trackers without a spawning tool, fall back to the current turn
-    // span — better than dropping the calls outright.
-    const chatParent = tracker.spawningToolSpan ?? session.currentTurnSpan;
+    // Chat spans for the subagent's LLM calls parent under the subagent's
+    // own invoke_agent span. For orphan trackers without an invoke_agent
+    // span (no current turn at SubagentStart), fall back to the turn span.
+    const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
 
     const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
     let model: string | undefined;
+    let lastAssistantText: string | undefined;
     if (agentTranscriptPath && chatParent) {
       let agentTranscript: TranscriptFile | undefined;
       try {
@@ -741,12 +924,13 @@ export class GlobalDaemon {
         // parent's LLM call to this subagent invocation.
         const lastTurn = parsed?.turns[parsed.turns.length - 1];
         model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
           emitChatSpansFromAssistantCalls(
             this.tracer,
             chatParent,
-            `${session.conversationId}:${agentId}`,
+            session.conversationId,
             lastTurn.assistantCalls(),
           );
         }
@@ -757,13 +941,20 @@ export class GlobalDaemon {
       }
     }
 
-    // The Agent tool's `tool_call_result` is set by PostToolUse; the subagent's
-    // final assistant message is the same string Claude Code passes back to the
-    // parent agent, so we don't need to mirror it here. We only stamp the model
-    // observed in the subagent transcript so the tool span records which model
-    // actually ran the subagent.
-    if (model && tracker.spawningToolSpan) {
-      tracker.spawningToolSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+    if (tracker.invokeAgentSpan) {
+      // Stamp the model the subagent actually ran on (Claude Code's
+      // SubagentStart payload doesn't carry the model; the transcript does).
+      if (model) {
+        tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+      }
+      // Orphan path: no PostToolUse will fire, so close the invoke_agent
+      // span here using the subagent's final assistant text as the output.
+      // Matched path: leave the span open for PostToolUse to close with the
+      // canonical tool_response and remove the tracker; if we removed the
+      // tracker here, byToolUseId at PostToolUse would miss it.
+      if (!tracker.ended && !tracker.toolUseId) {
+        this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+      }
     }
 
     this.log(
@@ -771,7 +962,11 @@ export class GlobalDaemon {
       `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`,
     );
 
-    session.subagents.remove(tracker);
+    // Only remove orphan trackers here. Matched trackers stay until
+    // PostToolUse(Agent) closes the invoke_agent span and removes them.
+    if (!tracker.toolUseId) {
+      session.subagents.remove(tracker);
+    }
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
@@ -872,10 +1067,15 @@ export class GlobalDaemon {
       this.log('DEBUG', `Closed orphaned turn span`);
     }
 
-    // Subagent trackers without a SubagentStop event are logged but produce no
-    // span of their own; their chat spans (if any) would have been emitted at
-    // SubagentStop under the spawning Agent tool span, which is already closed.
+    // Close any subagent invoke_agent spans that didn't receive PostToolUse
+    // or SubagentStop. Without this they'd leak open and never export.
     for (const tracker of session.subagents.all()) {
+      if (tracker.invokeAgentSpan && !tracker.ended) {
+        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
+        tracker.invokeAgentSpan.end();
+        tracker.ended = true;
+      }
       this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
     }
 

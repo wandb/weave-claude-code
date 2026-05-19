@@ -74,6 +74,12 @@ export const ATTR = {
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
+  // Back-pointer from a subagent `invoke_agent` span to the parent agent's
+  // `Agent` tool call that spawned it. Set on the inner `invoke_agent` span
+  // so queries can correlate the subagent invocation with the spawning
+  // tool_use_id without walking the span tree.
+  WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID: 'weave.claude_code.subagent.spawning_tool_call_id',
+
   // Weave Agents backend — compaction (set as span attributes on the turn span;
   // the backend extracts these into dedicated columns)
   COMPACTION_SUMMARY: 'weave.compaction.summary',
@@ -180,6 +186,62 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   return tracer.startSpan(
     `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
+  );
+}
+
+export interface InvokeAgentSpanArgs {
+  /** Agent type label — becomes the second word of the span name and is
+   *  stamped as `gen_ai.agent.name`. For Claude Code subagents this is the
+   *  `subagent_type` from the spawning `Agent` tool call (e.g. "Explore",
+   *  "general-purpose"). */
+  agentType: string;
+  /** Stitching key inherited from the parent turn span. */
+  conversationId: string;
+  /** Plugin version, stamped as `gen_ai.agent.version` for parity with the
+   *  outer turn span. */
+  pluginVersion: string;
+  /** Initial input passed to the agent — typically the firing prompt from
+   *  the parent agent's `Agent` tool call. Stamped as
+   *  `gen_ai.input.messages`. */
+  inputMessages?: unknown;
+  /** tool_use_id of the parent's `Agent` tool call. Stamped as a
+   *  back-pointer attribute so queries can correlate the subagent
+   *  invocation with the spawning tool call. */
+  spawningToolCallId?: string;
+  displayName?: string;
+}
+
+/**
+ * Start a nested `invoke_agent` span — used for subagents Claude Code
+ * dispatches via the `Agent` tool. Child of the parent turn (or, for nested
+ * subagent calls, of the spawning subagent's invoke_agent span). Subagent
+ * `chat` spans and any tool calls the subagent runs parent under this span,
+ * which the Weave Agents chat view renders as an `agent_start` lifecycle
+ * marker followed by the subagent's own assistant text.
+ */
+export function startInvokeAgentSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: InvokeAgentSpanArgs,
+): Span {
+  const attrs: Record<string, string | number> = {
+    [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
+    [ATTR.AGENT_NAME]: args.agentType,
+    [ATTR.AGENT_VERSION]: args.pluginVersion,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+  };
+  if (args.inputMessages !== undefined) {
+    attrs[ATTR.INPUT_MESSAGES] = jsonStr(args.inputMessages);
+  }
+  if (args.spawningToolCallId) {
+    attrs[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID] = args.spawningToolCallId;
+  }
+  if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
+
+  return tracer.startSpan(
+    `${OP.INVOKE_AGENT} ${args.agentType}`,
+    { kind: SpanKind.INTERNAL, attributes: attrs },
+    ctxWithParent(parentSpan),
   );
 }
 
