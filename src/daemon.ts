@@ -5,13 +5,38 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
-import { init, WeaveClient, op } from 'weave';
-import { uuidv7 } from 'uuidv7';
-import { loadSettings } from './setup.js';
+import { createHash } from 'crypto';
+import {
+  Span,
+  SpanStatusCode,
+  Tracer,
+  diag,
+  DiagConsoleLogger,
+  DiagLogLevel,
+} from '@opentelemetry/api';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { resourceFromAttributes } from '@opentelemetry/resources';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd, UsageSummary, rawToUsageSummary, addUsage } from './parser.js';
-import { TraceRegistry } from './traceRegistry.js';
-import { TranscriptFile } from './transcriptFile.js';
+import { parseSessionFd } from './parser.js';
+import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
+import {
+  ATTR,
+  AGENT_NAME_CLAUDE_CODE,
+  CompactionAttrs,
+  startTurnSpan,
+  startToolSpan,
+  startInvokeAgentSpan,
+  emitChatSpansFromAssistantCalls,
+  addPermissionRequestEvent,
+  addPermissionResolvedEvent,
+  setCompactionAttrs,
+  toolDisplayName,
+  promptSnippet,
+  jsonStr,
+} from './genaiSpans.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -33,68 +58,139 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   );
 }
 
-/** Stores the Weave call ID opened at PreToolUse so PostToolUse can close it. */
+/** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
 interface PendingToolCall {
-  weaveCallId: string;
+  span: Span;
   toolName: string;
   toolInput: Record<string, unknown>;
-  permissionWeaveCallId?: string;   // set when PermissionRequest fires; closed in Post/PostFailure
-  permissionStartedAt?: string;     // same value used as ended_at — zero-duration, tool execution time is not permission decision time
-  subagentModel?: string;           // set by SubagentStop for Agent tools; surfaced in PostToolUse summary
+  /** True once a PermissionRequest event has been emitted for this tool. */
+  permissionRequested?: boolean;
+}
+
+/** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
+function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
+  if (!pending.permissionRequested) return;
+  addPermissionResolvedEvent(pending.span, {
+    approved,
+    timestamp: new Date(),
+  });
+}
+
+/** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
+ *  the subagent's SubagentStart by matching transcript content. */
+function hashPrompt(prompt: string): string {
+  return createHash('sha256').update(prompt, 'utf8').digest('hex');
 }
 
 /**
- * Created when a Task tool with subagent_type is detected in PreToolUse.
- * agentId and subagentWeaveCallId are filled in when the matching SubagentStart event arrives.
+ * Map a parent transcript path + subagent agent_id to the subagent's transcript
+ * file. Claude Code writes subagent transcripts as siblings of the parent in a
+ * `<session_id>/subagents/` subdirectory:
+ *   parent:   <project_dir>/<session_id>.jsonl
+ *   subagent: <project_dir>/<session_id>/subagents/agent-<agent_id>.jsonl
+ */
+function computeSubagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
+  const projectDir = path.dirname(parentTranscriptPath);
+  const sessionDirName = path.basename(parentTranscriptPath, '.jsonl');
+  return path.join(projectDir, sessionDirName, 'subagents', `agent-${agentId}.jsonl`);
+}
+
+/** Pull the user-message content out of a transcript line. Returns the prompt
+ *  string for `{type: 'user', message: {content: string|Array}}` lines, else
+ *  undefined. Array-form content is joined across text blocks. */
+function extractUserMessageContent(line: Record<string, unknown> | undefined): string | undefined {
+  if (!line || line['type'] !== 'user') return undefined;
+  const msg = line['message'];
+  if (!msg || typeof msg !== 'object') return undefined;
+  const content = (msg as Record<string, unknown>)['content'];
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as Record<string, unknown>)['type'] === 'text') {
+        const t = (block as Record<string, unknown>)['text'];
+        if (typeof t === 'string') parts.push(t);
+      }
+    }
+    return parts.length > 0 ? parts.join('') : undefined;
+  }
+  return undefined;
+}
+
+/** Read the subagent transcript's first line, retrying briefly because Claude
+ *  Code may not have flushed it yet when SubagentStart fires. Total wait
+ *  bounded by the sum of `RETRY_DELAYS_MS`. */
+const SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS = [0, 50, 100, 150];
+async function readSubagentFirstLineWithRetry(
+  transcriptPath: string,
+): Promise<Record<string, unknown> | undefined> {
+  for (const delay of SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS) {
+    if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    const line = readFirstTranscriptLine(transcriptPath);
+    if (line && line['type'] === 'user') return line;
+  }
+  return undefined;
+}
+
+/**
+ * Tracks a subagent across hook events. Two shapes:
+ *   (a) Matched — created at PreToolUse when an Agent tool with subagent_type
+ *       is detected; carries `toolUseId`, `promptHash`, and a reference to
+ *       the subagent's `invoke_agent` span. `agentId` is filled in at
+ *       SubagentStart via content-based correlation: sha256(firing prompt) +
+ *       subagent_type.
+ *   (b) Orphan — created at SubagentStart when no tracker matches the firing
+ *       prompt (the parent's Agent PreToolUse never fired, or its prompt
+ *       differs from the subagent transcript's line 1). The `invoke_agent`
+ *       span is created at SubagentStart with the current turn span as
+ *       parent and no input messages (the firing prompt is unavailable).
+ *
+ * The subagent is its own `invoke_agent <subagent_type>` span, child of the
+ * parent turn's `invoke_agent claude-code` span. Per the Weave Agents chat
+ * view (`weave/trace_server/agents/chat_view.py`), nested `invoke_agent`
+ * spans render as an `agent_start` lifecycle marker with the inner agent's
+ * own assistant text — distinct from an `execute_tool` tool-call event.
+ * The Agent tool call does NOT emit an `execute_tool` span; it emits this
+ * `invoke_agent` span directly.
  */
 interface SubagentTracker {
-  toolUseId: string;
-  traceId: string;               // Shared trace ID for the whole session
   subagentType: string;
-  detectedAt: Date;              // Used for temporal proximity matching at SubagentStart
-  taskToolWeaveCallId: string;   // Weave call ID of the Agent tool itself (opened at PreToolUse)
-  agentId?: string;              // Set when SubagentStart fires
-  subagentWeaveCallId?: string;  // Weave call ID of the subagent call (opened at SubagentStart)
+  detectedAt: Date;
+  toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
+  invokeAgentSpan?: Span;      // subagent's `invoke_agent` span; subagent chat/tool spans parent here
+  agentId?: string;
+  /** sha256 of the prompt passed to the Agent tool; matched against the
+   *  subagent's transcript line-1 user message at SubagentStart. */
+  promptHash?: string;
+  /** True once the invoke_agent span has been ended. Guards against
+   *  double-end when PostToolUse and SubagentStop both try to close it. */
+  ended?: boolean;
 }
 
 interface SessionState {
   sessionId: string;
+  /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
+   *  turns stitch with their pre-resume turns server-side. Equals `sessionId`
+   *  for fresh (non-forked) sessions. Resolved once at SessionStart by
+   *  walking `forkedFrom.sessionId` pointers across transcript files. */
+  conversationId: string;
   transcript: TranscriptFile;
   cwd: string;
-  traceId: string;
+  source: string;
+  initialRequestModel?: string;
 
-  parentCallId?: string;  // set when WEAVE_PARENT_CALL_ID is injected by a parent op
+  currentTurnSpan?: Span;
 
-  // Weave call IDs
-  sessionCallId?: string;
-  currentTurnCallId?: string;
-
-  // Tracking
   turnNumber: number;
   totalToolCalls: number;
   turnToolCalls: number;
   toolCounts: Record<string, number>;
-  totalUsage: Record<string, UsageSummary>;
+
   pendingToolCalls: Map<string, PendingToolCall>;
+  subagents: SubagentTracking;
 
-  // Subagent tracking (keyed by toolUseId; secondary index by agentId)
-  subagentTrackers: Map<string, SubagentTracker>;
-  subagentByAgentId: Map<string, SubagentTracker>;
-}
-
-interface TraceResolution {
-  traceId: string;
-  sessionCallId?: string;
-  source: 'new' | 'registry-session' | 'registry-transcript';
-}
-
-/** Registered Weave op refs, keyed by call-site name. Each value has a .uri() method. */
-interface OpRegistry {
-  session: { uri(): string };
-  turn: { uri(): string };
-  tool: { uri(): string };
-  permissionRequest: { uri(): string };
-  subagent: { uri(): string };
+  /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
+  pendingCompaction?: CompactionAttrs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,45 +202,93 @@ const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
+/**
+ * Per-session container that tracks subagents from PreToolUse (when an Agent
+ * tool with subagent_type is detected) through SubagentStop. Single source of
+ * truth for the tracker list, with intent-revealing lookup methods.
+ */
+class SubagentTracking {
+  private trackers: SubagentTracker[] = [];
+
+  /** Add a pending tracker at PreToolUse, before SubagentStart correlates an agent_id. */
+  add(tracker: SubagentTracker): void {
+    this.trackers.push(tracker);
+  }
+
+  /**
+   * Find the unmatched tracker (no agent_id yet) matching `(promptHash,
+   * subagentType)`. FIFO across ties: the oldest pending tracker wins, so two
+   * back-to-back identical Agent calls still correlate in dispatch order.
+   * Returns undefined if no candidate qualifies.
+   */
+  findUnmatchedByContent(promptHash: string, subagentType: string): SubagentTracker | undefined {
+    let best: SubagentTracker | undefined;
+    for (const t of this.trackers) {
+      if (t.agentId) continue;
+      if (t.promptHash !== promptHash) continue;
+      if (t.subagentType !== subagentType) continue;
+      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
+    }
+    return best;
+  }
+
+  byAgentId(agentId: string): SubagentTracker | undefined {
+    return this.trackers.find(t => t.agentId === agentId);
+  }
+
+  /** Lookup by spawning Agent tool's tool_use_id. Used at PostToolUse to find
+   *  the subagent's `invoke_agent` span when the matching toolUseId is not
+   *  in `pendingToolCalls` (because the Agent tool emits an invoke_agent
+   *  span instead of an execute_tool span). */
+  byToolUseId(toolUseId: string): SubagentTracker | undefined {
+    return this.trackers.find(t => t.toolUseId === toolUseId);
+  }
+
+  remove(tracker: SubagentTracker): void {
+    const idx = this.trackers.indexOf(tracker);
+    if (idx >= 0) this.trackers.splice(idx, 1);
+  }
+
+  size(): number {
+    return this.trackers.length;
+  }
+
+  all(): SubagentTracker[] {
+    return [...this.trackers];
+  }
+}
+
 export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
   private lastActivity = Date.now();
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
-  private weaveClient: WeaveClient | null = null;
-  private opRegistry: OpRegistry | null = null;
-  private traceRegistry = new TraceRegistry();
+  private provider: NodeTracerProvider | null = null;
+  private tracer: Tracer | null = null;
 
   constructor(
     private readonly socketPath: string,
     private readonly logFile: string,
     private readonly weaveProject: string | null,
+    private readonly apiKey: string | null,
+    private readonly baseUrl: string,
     private readonly debugEnabled: boolean,
   ) {}
 
   async start(): Promise<void> {
-    const loadedRegistryEntries = this.traceRegistry.load();
-    this.log('DEBUG', `Loaded trace registry: ${loadedRegistryEntries} entries`);
-
-    // Initialize Weave client if a project is configured
-    if (this.weaveProject) {
+    // Initialize the OTel tracer if Weave is configured
+    if (this.weaveProject && this.apiKey) {
       try {
-        this.weaveClient = await init(this.weaveProject);
-        this.log('INFO', `Weave initialized for project: ${this.weaveProject}`);
-        try {
-          this.opRegistry = await this.registerOps(this.weaveClient);
-          this.log('INFO', `Registered ${Object.keys(this.opRegistry).length} Weave ops`);
-        } catch (err) {
-          this.log('ERROR', `Failed to register Weave ops: ${err} — using fallback op names`);
-          this.opRegistry = null;
-        }
+        this.initTracer();
+        this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
       } catch (err) {
-        this.log('ERROR', `Failed to initialize Weave: ${err} — continuing without Weave`);
-        this.weaveClient = null;
+        this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
+        this.provider = null;
+        this.tracer = null;
       }
     } else {
-      this.log('INFO', 'No weave_project configured — Weave tracking disabled');
+      this.log('INFO', 'No weave_project / API key configured — tracing disabled');
     }
 
     // Remove any stale socket left by a previous crash
@@ -170,25 +314,40 @@ export class GlobalDaemon {
     setInterval(() => this.checkInactivity(), 60_000).unref();
   }
 
-  // ── op registration ─────────────────────────────────────────────────────
+  // ── tracer initialization ───────────────────────────────────────────────
 
-  private async registerOps(client: WeaveClient): Promise<OpRegistry> {
-    const makeOp = (name: string, opKind: string) =>
-      op(() => {}, { name, opKind });
+  private initTracer(): void {
+    if (!this.weaveProject) throw new Error('weaveProject required to init tracer');
+    if (!this.apiKey) throw new Error('apiKey required to init tracer');
 
-    const [session, turn, tool, permissionRequest, subagent] = await Promise.all([
-      client.saveOp(makeOp('claude_code.session', 'agent')),
-      client.saveOp(makeOp('claude_code.turn', 'llm')),
-      client.saveOp(makeOp('claude_code.tool', 'tool')),
-      client.saveOp(makeOp('claude_code.permission_request', 'tool')),
-      client.saveOp(makeOp('claude_code.subagent', 'agent')),
-    ]);
+    const [entity, project] = this.weaveProject.split('/', 2);
+    if (!entity || !project) {
+      throw new Error(`Invalid weave_project format: '${this.weaveProject}' (expected entity/project)`);
+    }
 
-    return { session, turn, tool, permissionRequest, subagent };
-  }
+    // Route OTel diagnostics into the daemon log so exporter errors surface.
+    if (this.debugEnabled) {
+      diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN);
+    }
 
-  private opName(key: keyof OpRegistry, fallback: string): string {
-    return this.opRegistry?.[key]?.uri() ?? fallback;
+    const resource = resourceFromAttributes({
+      'service.name': AGENT_NAME_CLAUDE_CODE,
+      'service.version': VERSION,
+      'wandb.entity': entity,
+      'wandb.project': project,
+    });
+
+    const exporter = new OTLPTraceExporter({
+      url: `${this.baseUrl}/agents/otel/v1/traces`,
+      headers: { 'wandb-api-key': this.apiKey },
+    });
+
+    this.provider = new NodeTracerProvider({
+      resource,
+      spanProcessors: [new BatchSpanProcessor(exporter)],
+    });
+    this.provider.register();
+    this.tracer = this.provider.getTracer('weave-claude-plugin', VERSION);
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -292,6 +451,9 @@ export class GlobalDaemon {
         case 'SubagentStop':
           await this.handleSubagentStop(sessionId, payload);
           break;
+        case 'PreCompact':
+          await this.handlePreCompact(sessionId, payload);
+          break;
         case 'Stop':
           await this.handleStop(sessionId, payload);
           break;
@@ -317,8 +479,6 @@ export class GlobalDaemon {
       return;
     }
 
-    // Validate path is within home dir — no file I/O required so this works even before
-    // Claude Code has written the transcript to disk.
     let transcript: TranscriptFile;
     try {
       transcript = new TranscriptFile(rawPath);
@@ -328,43 +488,107 @@ export class GlobalDaemon {
     }
 
     const source = (payload['source'] as string | undefined) ?? 'unknown';
-    const model = (payload['model'] as string | undefined) ?? 'unknown';
+    const initialRequestModel = payload['model'] as string | undefined;
     const cwd = (payload['cwd'] as string | undefined) ?? '';
-    const parentCallId = (payload['weave_parent_call_id'] as string | undefined) || undefined;
-    const parentTraceId = (payload['weave_trace_id'] as string | undefined) || undefined;
 
-    const traceResolution = await this.resolveTraceForSession(sessionId, transcript.resolvedPath, source);
-    const traceId = parentTraceId ?? traceResolution.traceId;
+    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
     this.sessions.set(sessionId, {
       sessionId,
+      conversationId,
       transcript,
       cwd,
-      traceId,
-      parentCallId,
-      sessionCallId: traceResolution.sessionCallId,
+      source,
+      initialRequestModel,
       turnNumber: 0,
       totalToolCalls: 0,
       turnToolCalls: 0,
       toolCounts: {},
       pendingToolCalls: new Map(),
-      subagentTrackers: new Map(),
-      subagentByAgentId: new Map(),
-      totalUsage: {},
+      subagents: new SubagentTracking(),
     });
-    this.upsertTraceRegistry(
-      sessionId,
-      traceId,
-      transcript.resolvedPath,
-      source,
-      traceResolution.sessionCallId,
-    );
 
-    this.log('INFO', `Session created: ${sessionId}`);
+    const resumed = conversationId !== sessionId;
+    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} source=${source} model=${model} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} trace_id=${this.sessions.get(sessionId)?.traceId} trace_resolution=${traceResolution.source} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} conversation=${conversationId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
     );
+  }
+
+  /**
+   * Resolve the canonical `gen_ai.conversation.id` for a session by walking
+   * the `forkedFrom.sessionId` chain to the root. Returns `sessionId` itself
+   * for fresh (non-forked) sessions, or when the chain can't be resolved.
+   *
+   * `claude --continue` / `claude --resume <id>` produce a new process-level
+   * session_id but stamp every transcript line with `forkedFrom.sessionId`
+   * pointing at the immediate parent. Each transcript file is named after
+   * its session id and lives in the same project directory, so walking the
+   * chain is just sibling-file reads.
+   *
+   * SessionStart fires roughly when Claude Code flushes the first transcript
+   * line, so we retry briefly if the file isn't readable yet. The hard cap
+   * on chain depth is a sanity guard against pathological forking, not a
+   * real limit.
+   */
+  private async resolveConversationId(
+    sessionId: string,
+    transcriptPath: string,
+    source: string,
+  ): Promise<string> {
+    const MAX_CHAIN_DEPTH = 32;
+    const MAX_HEAD_READ_ATTEMPTS = 4;
+    const HEAD_READ_RETRY_MS = 100;
+
+    const transcriptDir = path.dirname(transcriptPath);
+    const seen = new Set<string>([sessionId]);
+    let current = sessionId;
+    let currentPath = transcriptPath;
+
+    for (let depth = 0; depth < MAX_CHAIN_DEPTH; depth++) {
+      let parent: string | undefined;
+      // Only the FIRST hop needs retry — ancestor transcripts are static.
+      const attempts = depth === 0 ? MAX_HEAD_READ_ATTEMPTS : 1;
+      for (let i = 0; i < attempts; i++) {
+        const head = readFirstTranscriptLine(currentPath);
+        const ff = head?.['forkedFrom'] as Record<string, unknown> | undefined;
+        const ffId = ff?.['sessionId'];
+        if (typeof ffId === 'string' && ffId) {
+          parent = ffId;
+          break;
+        }
+        if (head !== undefined) break; // head parseable but no fork — root
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, HEAD_READ_RETRY_MS));
+      }
+      if (!parent || seen.has(parent)) break;
+      seen.add(parent);
+
+      const parentPath = path.join(transcriptDir, `${parent}.jsonl`);
+      current = parent;
+      if (!fs.existsSync(parentPath)) {
+        // Parent transcript not on disk (e.g., resumed across machines).
+        // Stop here — the recorded parent id is still the best stitching
+        // key we have, even though we can't verify if IT was a fork too.
+        this.log(
+          'DEBUG',
+          `resolveConversationId: parent transcript not on disk: ${parentPath} — stopping chain walk at ${parent}`,
+        );
+        break;
+      }
+      currentPath = parentPath;
+    }
+
+    if (current !== sessionId && source !== 'resume') {
+      // Fork detected but `source` doesn't say resume — log so the mismatch
+      // is visible. We still stitch by the chain root because that's the
+      // correct behavior; this just surfaces an unexpected hook payload.
+      this.log(
+        'DEBUG',
+        `resolveConversationId: forkedFrom chain found but source='${source}' (expected 'resume') session=${sessionId} root=${current}`,
+      );
+    }
+    return current;
   }
 
   private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
@@ -373,67 +597,44 @@ export class GlobalDaemon {
       this.log('ERROR', `Unknown session: ${sessionId}`);
       return;
     }
+    if (!this.tracer) return;
 
     const prompt = (payload['prompt'] as string | undefined) ?? '';
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} trace_id=${session.traceId} existing_session_call=${session.sessionCallId ?? 'none'} current_turn_call=${session.currentTurnCallId ?? 'none'} turn_number=${session.turnNumber} prompt=${GlobalDaemon.promptSnippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurnSpan ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
     );
 
-    // Create the top-level session call on the first turn
-    if (!session.sessionCallId && this.weaveClient) {
-      const callId = uuidv7();
-      session.sessionCallId = callId;
-      this.weaveClient.saveCallStart({
-        project_id: this.weaveClient.projectId,
-        id: callId,
-        op_name: this.opName('session', 'claude_code.session'),
-        trace_id: session.traceId,
-        parent_id: session.parentCallId ?? null,
-        started_at: new Date().toISOString(),
-        display_name: `Claude Code: ${GlobalDaemon.promptSnippet(prompt)}`,
-        inputs: { prompt },
-        attributes: {
-          kind: 'agent',
-          session_id: session.sessionId,
-          cwd: session.cwd,
-        },
-      });
-      this.log('INFO', `Created session call: ${callId}`);
-      this.upsertTraceRegistry(
-        session.sessionId,
-        session.traceId,
-        session.transcript.resolvedPath,
-        'session_call_created',
-        session.sessionCallId,
-      );
-    }
-
-    // Create a turn call for every prompt
     session.turnNumber += 1;
     session.turnToolCalls = 0;
-    const turnCallId = uuidv7();
-    session.currentTurnCallId = turnCallId;
+    const turnSpan = startTurnSpan(this.tracer, {
+      sessionId: session.sessionId,
+      conversationId: session.conversationId,
+      turnNumber: session.turnNumber,
+      prompt,
+      cwd: session.cwd,
+      source: session.source,
+      pluginVersion: VERSION,
+      requestModel: session.initialRequestModel,
+      displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+    });
+    session.currentTurnSpan = turnSpan;
 
-    if (this.weaveClient) {
-      this.weaveClient.saveCallStart({
-        project_id: this.weaveClient.projectId,
-        id: turnCallId,
-        op_name: this.opName('turn', 'claude_code.turn'),
-        trace_id: session.traceId,
-        parent_id: session.sessionCallId ?? null,
-        started_at: new Date().toISOString(),
-        display_name: `Turn ${session.turnNumber}: ${GlobalDaemon.promptSnippet(prompt)}`,
-        inputs: { prompt },
-        attributes: { kind: 'llm' },
-      });
-      this.log('INFO', `Created turn call: ${turnCallId} (turn ${session.turnNumber})`);
+    // Drain compaction attrs buffered while no turn was open.
+    if (session.pendingCompaction) {
+      setCompactionAttrs(turnSpan, session.pendingCompaction);
+      session.pendingCompaction = undefined;
     }
+
+    this.log(
+      'INFO',
+      `Created turn span (turn ${session.turnNumber}) trace_id=${turnSpan.spanContext().traceId}`,
+    );
   }
 
   private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session || !this.tracer) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     const toolName = payload['tool_name'] as string | undefined;
@@ -441,52 +642,69 @@ export class GlobalDaemon {
 
     const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
 
-    // For subagent tool calls, parent is the subagent's Weave call; otherwise the current turn.
-    const parentId = agentId
-      ? (session.subagentByAgentId.get(agentId)?.subagentWeaveCallId ?? null)
-      : (session.currentTurnCallId ?? null);
-
-    const weaveCallId = uuidv7();
-    session.pendingToolCalls.set(toolUseId, { weaveCallId, toolName, toolInput });
-
-    this.weaveClient.saveCallStart({
-      project_id: this.weaveClient.projectId,
-      id: weaveCallId,
-      op_name: this.opName('tool', `claude_code.tool.${toolName}`),
-      trace_id: session.traceId,
-      parent_id: parentId,
-      started_at: new Date().toISOString(),
-      display_name: GlobalDaemon.toolDisplayName(toolName, toolInput),
-      inputs: toolInput,
-      attributes: { kind: 'tool', tool_use_id: toolUseId },
-    });
-
-    // Agent tools with subagent_type spawn subagents (parent session only). Record the Weave
-    // call ID so handleSubagentStart can nest the subagent call underneath it.
-    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
-      const tracker: SubagentTracker = {
-        toolUseId,
-        traceId: session.traceId,
-        subagentType: toolInput['subagent_type'] as string,
-        detectedAt: new Date(),
-        taskToolWeaveCallId: weaveCallId,
-      };
-      session.subagentTrackers.set(toolUseId, tracker);
+    // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
+    // a subagent, else the current turn span.
+    const parentSpan = agentId
+      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? session.currentTurnSpan
+      : session.currentTurnSpan;
+    if (!parentSpan) {
+      this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
+      return;
     }
+
+    // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
+    // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
+    // nested invoke_agent spans as their own `agent_start` lifecycle marker; an
+    // execute_tool wrapper here would mis-render the subagent dispatch as a
+    // generic tool call. The Agent tool's PostToolUse closes this span with the
+    // subagent's final return as `gen_ai.output.messages`.
+    //
+    // `promptHash` lets SubagentStart correlate this tracker to the right
+    // subagent deterministically by reading the subagent transcript's line 1
+    // (the firing prompt) and matching by sha256 + subagent_type.
+    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
+      const subagentType = toolInput['subagent_type'] as string;
+      const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
+      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
+        agentType: subagentType,
+        conversationId: session.conversationId,
+        pluginVersion: VERSION,
+        inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
+        spawningToolCallId: toolUseId,
+        displayName: toolDisplayName(toolName, toolInput),
+      });
+      session.subagents.add({
+        toolUseId,
+        subagentType,
+        detectedAt: new Date(),
+        invokeAgentSpan,
+        promptHash: hashPrompt(prompt),
+      });
+      return;
+    }
+
+    const toolSpan = startToolSpan(this.tracer, parentSpan, {
+      toolName,
+      toolUseId,
+      toolInput,
+      displayName: toolDisplayName(toolName, toolInput),
+    });
+    session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session) return;
 
     const toolName = payload['tool_name'] as string | undefined;
     if (!toolName) return;
 
-    // Correlate to a pending tool call by tool_name + tool_input so we can close the
-    // permission call with the approval outcome in PostToolUse / PostToolUseFailure.
+    // Correlate to a pending tool call by tool_name + tool_input. Record the
+    // permission state; the actual span event is added at PostToolUse[Failure]
+    // once we know whether it was approved.
     let pending: PendingToolCall | undefined;
     for (const call of session.pendingToolCalls.values()) {
-      if (call.toolName === toolName && !call.permissionWeaveCallId && deepEqual(call.toolInput, payload['tool_input'])) {
+      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, payload['tool_input'])) {
         pending = call;
         break;
       }
@@ -496,72 +714,42 @@ export class GlobalDaemon {
       return;
     }
 
-    const permCallId = uuidv7();
-    const permStartedAt = new Date().toISOString();
-    pending.permissionWeaveCallId = permCallId;
-    pending.permissionStartedAt = permStartedAt;
-
-    this.weaveClient.saveCallStart({
-      project_id: this.weaveClient.projectId,
-      id: permCallId,
-      op_name: this.opName('permissionRequest', 'claude_code.permission_request'),
-      trace_id: session.traceId,
-      parent_id: pending.weaveCallId,
-      started_at: permStartedAt,
-      display_name: `Permission: ${toolName}`,
-      inputs: {
-        tool_name: toolName,
-        tool_input: payload['tool_input'],
-        permission_suggestions: payload['permission_suggestions'],
-      },
-      attributes: { kind: 'tool' },
+    pending.permissionRequested = true;
+    addPermissionRequestEvent(pending.span, {
+      suggestions: payload['permission_suggestions'],
+      timestamp: new Date(),
     });
 
-    this.log('DEBUG', `Permission request for ${toolName}`);
+    this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
 
   private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     if (!toolUseId) return;
 
+    // Subagent dispatch: the matching span is the subagent's invoke_agent
+    // span (not a pendingToolCall), so we close it here with the subagent's
+    // final assistant text as `gen_ai.output.messages`.
+    const subagentTracker = session.subagents.byToolUseId(toolUseId);
+    if (subagentTracker?.invokeAgentSpan) {
+      this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+      session.subagents.remove(subagentTracker);
+      session.totalToolCalls += 1;
+      session.turnToolCalls += 1;
+      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      return;
+    }
+
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
-    const now = new Date().toISOString();
+    resolvePermissionIfPending(pending, true);
 
-    if (pending.permissionWeaveCallId) {
-      this.weaveClient.saveCallEnd({
-        project_id: this.weaveClient.projectId,
-        id: pending.permissionWeaveCallId,
-        ended_at: pending.permissionStartedAt!,
-        output: { approved: true },
-        summary: {},
-      });
-    }
-
-    // For Agent tool calls, normalize the usage from tool_response into a UsageSummary
-    // keyed by model name, consistent with the turn-level summary from handleStop.
-    let toolSummary: Record<string, unknown> = {};
-    if (pending.toolName === 'Agent' && pending.subagentModel) {
-      const rawUsage = (payload['tool_response'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
-      if (rawUsage) {
-        const usage = rawToUsageSummary(rawUsage);
-        toolSummary = { model: pending.subagentModel, usage: { [pending.subagentModel]: usage } };
-      } else {
-        toolSummary = { model: pending.subagentModel };
-      }
-    }
-
-    this.weaveClient.saveCallEnd({
-      project_id: this.weaveClient.projectId,
-      id: pending.weaveCallId,
-      ended_at: now,
-      output: payload['tool_response'],
-      summary: toolSummary,
-    });
+    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
+    pending.span.end();
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -571,33 +759,35 @@ export class GlobalDaemon {
 
   private async handlePostToolUseFailure(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     if (!toolUseId) return;
 
+    const error = payload['error'] ?? payload['tool_response'];
+
+    // Subagent dispatch failed (rare). Close the invoke_agent span with ERROR
+    // status; subagent chat spans, if any reached SubagentStop, are already
+    // attached as children.
+    const subagentTracker = session.subagents.byToolUseId(toolUseId);
+    if (subagentTracker?.invokeAgentSpan) {
+      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+      session.subagents.remove(subagentTracker);
+      session.totalToolCalls += 1;
+      session.turnToolCalls += 1;
+      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      return;
+    }
+
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
-    const now = new Date().toISOString();
+    resolvePermissionIfPending(pending, false);
 
-    if (pending.permissionWeaveCallId) {
-      this.weaveClient.saveCallEnd({
-        project_id: this.weaveClient.projectId,
-        id: pending.permissionWeaveCallId,
-        ended_at: pending.permissionStartedAt!,
-        output: { approved: false },
-        summary: {},
-      });
-    }
-
-    this.weaveClient.saveCallEnd({
-      project_id: this.weaveClient.projectId,
-      id: pending.weaveCallId,
-      ended_at: now,
-      output: { error: payload['error'] ?? payload['tool_response'] },
-      summary: { is_error: true },
-    });
+    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
+    pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
+    pending.span.setStatus({ code: SpanStatusCode.ERROR, message: typeof error === 'string' ? error : 'tool failed' });
+    pending.span.end();
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -605,156 +795,249 @@ export class GlobalDaemon {
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
+  /**
+   * Close a subagent's `invoke_agent` span. Idempotent — guarded by
+   * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
+   * regardless of order. Sets `gen_ai.output.messages` from the canonical
+   * tool return string when available; marks the span ERROR on failure.
+   */
+  private closeSubagentInvokeAgentSpan(
+    tracker: SubagentTracker,
+    output: unknown,
+    failure: boolean,
+  ): void {
+    const span = tracker.invokeAgentSpan;
+    if (!span || tracker.ended) return;
+
+    if (output !== undefined && output !== null && output !== '') {
+      const outputText = typeof output === 'string' ? output : jsonStr(output);
+      span.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        jsonStr([{ role: 'assistant', content: outputText }]),
+      );
+    }
+    if (failure) {
+      span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: typeof output === 'string' ? output : 'subagent failed',
+      });
+    }
+    span.end();
+    tracker.ended = true;
+  }
+
   private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session || !this.tracer) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
 
-    // Temporal proximity matching: find the closest unmatched SubagentTracker within 5 s.
-    // SubagentStart has no explicit parent pointer, so we correlate by timing.
-    const PROXIMITY_MS = 5_000;
-    const now = Date.now();
-    let bestTracker: SubagentTracker | undefined;
-    let bestDelta = Infinity;
-
-    for (const tracker of session.subagentTrackers.values()) {
-      if (tracker.agentId) continue; // already matched
-      const delta = now - tracker.detectedAt.getTime();
-      if (delta >= 0 && delta < PROXIMITY_MS && delta < bestDelta) {
-        bestDelta = delta;
-        bestTracker = tracker;
-      }
-    }
-
     const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
 
-    if (!bestTracker) {
-      // No matching Agent tool call — create an orphan tracker parented to the turn.
-      this.log('ERROR', `SubagentStart: no unmatched tracker for agentId=${agentId}, parenting to turn`);
-      bestTracker = {
-        toolUseId: agentId,
-        traceId: session.traceId,
-        subagentType: agentType,
-        detectedAt: new Date(),
-        taskToolWeaveCallId: session.currentTurnCallId ?? '',
-        agentId,
-      };
-      session.subagentTrackers.set(agentId, bestTracker);
+    // Content-based deterministic correlation: SubagentStart carries no
+    // pointer back to the parent's `tool_use_id`, so we read the subagent's
+    // transcript line 1 (the firing user prompt — byte-identical to the
+    // parent Agent tool's `tool_input.prompt`) and match by sha256 of that
+    // string plus the subagent_type. No temporal window.
+    const subagentPath = computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
+    const firstLine = await readSubagentFirstLineWithRetry(subagentPath);
+    const firingPrompt = extractUserMessageContent(firstLine);
+
+    let bestTracker: SubagentTracker | undefined;
+    if (firingPrompt !== undefined) {
+      bestTracker = session.subagents.findUnmatchedByContent(hashPrompt(firingPrompt), agentType);
     }
 
-    const subagentWeaveCallId = uuidv7();
+    const matched = !!bestTracker;
+    if (!bestTracker) {
+      // No matching Agent tool call — either the parent's PreToolUse never
+      // fired, or the firing prompt couldn't be read from the subagent
+      // transcript. Create an orphan tracker AND an orphan `invoke_agent`
+      // span so the subagent still produces a valid nested agent invocation
+      // in the chat view. The span parents under the current turn (no
+      // spawning tool_use_id) and has no input_messages (firing prompt
+      // unavailable). Closed at SubagentStop since there will be no
+      // PostToolUse for it.
+      const reason = firingPrompt === undefined
+        ? 'transcript line 1 missing or non-user'
+        : `no tracker matches (promptHash, type=${agentType})`;
+      this.log('ERROR', `SubagentStart: ${reason}; creating orphan for agentId=${agentId} path=${subagentPath}`);
+      bestTracker = {
+        subagentType: agentType,
+        detectedAt: new Date(),
+      };
+      if (session.currentTurnSpan) {
+        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
+          agentType,
+          conversationId: session.conversationId,
+          pluginVersion: VERSION,
+          displayName: `Agent: ${agentType}`,
+        });
+        bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
+      }
+      session.subagents.add(bestTracker);
+    }
+
     bestTracker.agentId = agentId;
-    bestTracker.subagentWeaveCallId = subagentWeaveCallId;
-    session.subagentByAgentId.set(agentId, bestTracker);
+    if (bestTracker.invokeAgentSpan) {
+      // Stamp the runtime agent_id on the subagent's invoke_agent span — the
+      // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
+      bestTracker.invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
+    }
 
-    this.weaveClient.saveCallStart({
-      project_id: this.weaveClient.projectId,
-      id: subagentWeaveCallId,
-      op_name: this.opName('subagent', `claude_code.subagent.${bestTracker.subagentType}`),
-      trace_id: bestTracker.traceId,
-      parent_id: bestTracker.taskToolWeaveCallId,
-      started_at: new Date().toISOString(),
-      display_name: bestTracker.subagentType,
-      inputs: { subagent_type: bestTracker.subagentType },
-      attributes: { kind: 'agent', agent_id: agentId },
-    });
-
-    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${bestTracker.toolUseId !== agentId}`);
+    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
   }
 
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.weaveClient) return;
+    if (!session || !this.tracer) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
 
-    const tracker = session.subagentByAgentId.get(agentId);
-    if (!tracker?.subagentWeaveCallId) {
+    const tracker = session.subagents.byAgentId(agentId);
+    if (!tracker) {
       this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId}`);
       return;
     }
 
-    // Parse subagent transcript for model info.
+    // Chat spans for the subagent's LLM calls parent under the subagent's
+    // own invoke_agent span. For orphan trackers without an invoke_agent
+    // span (no current turn at SubagentStart), fall back to the turn span.
+    const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
+
     const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
     let model: string | undefined;
-    if (agentTranscriptPath) {
+    let lastAssistantText: string | undefined;
+    if (agentTranscriptPath && chatParent) {
       let agentTranscript: TranscriptFile | undefined;
       try {
         agentTranscript = new TranscriptFile(agentTranscriptPath);
         const parsed = parseSessionFd(agentTranscript.getFd());
-        model = parsed?.turns[parsed.turns.length - 1]?.primaryModel();
+        // Use the last turn only. Subagent transcripts are almost always
+        // single-turn; the rare 2-turn case occurs when the parent agent's
+        // prior assistant message is carried in as pre-context on line 0
+        // and the user prompt that fires the subagent appears on line 1.
+        // Emitting chat spans from earlier turns would mis-attribute the
+        // parent's LLM call to this subagent invocation.
+        const lastTurn = parsed?.turns[parsed.turns.length - 1];
+        model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
+
+        if (lastTurn) {
+          emitChatSpansFromAssistantCalls(
+            this.tracer,
+            chatParent,
+            session.conversationId,
+            lastTurn.assistantCalls(),
+          );
+        }
       } catch (err) {
-        this.log('DEBUG', `SubagentStop: could not parse transcript for model: ${err}`);
+        this.log('DEBUG', `SubagentStop: could not parse transcript: ${err}`);
       } finally {
         agentTranscript?.close();
       }
     }
 
-    // Propagate model to the parent Agent tool call so PostToolUse can surface it.
-    if (model) {
-      const pendingTool = session.pendingToolCalls.get(tracker.toolUseId);
-      if (pendingTool) pendingTool.subagentModel = model;
+    if (tracker.invokeAgentSpan) {
+      // Stamp the model the subagent actually ran on (Claude Code's
+      // SubagentStart payload doesn't carry the model; the transcript does).
+      if (model) {
+        tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+      }
+      // Orphan path: no PostToolUse will fire, so close the invoke_agent
+      // span here using the subagent's final assistant text as the output.
+      // Matched path: leave the span open for PostToolUse to close with the
+      // canonical tool_response and remove the tracker; if we removed the
+      // tracker here, byToolUseId at PostToolUse would miss it.
+      if (!tracker.ended && !tracker.toolUseId) {
+        this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+      }
     }
 
-    this.weaveClient.saveCallEnd({
-      project_id: this.weaveClient.projectId,
-      id: tracker.subagentWeaveCallId,
-      ended_at: new Date().toISOString(),
-      output: { last_assistant_message: (payload['last_assistant_message'] as string | undefined) ?? '' },
-      summary: model ? { model } : {},
-    });
+    this.log(
+      'DEBUG',
+      `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`,
+    );
 
-    this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`);
+    // Only remove orphan trackers here. Matched trackers stay until
+    // PostToolUse(Agent) closes the invoke_agent span and removes them.
+    if (!tracker.toolUseId) {
+      session.subagents.remove(tracker);
+    }
+  }
 
-    session.subagentTrackers.delete(tracker.toolUseId);
-    session.subagentByAgentId.delete(agentId);
+  private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const attrs: CompactionAttrs = {
+      summary: (payload['summary'] as string | undefined) ?? (payload['compaction_summary'] as string | undefined),
+      itemsBefore: typeof payload['items_before'] === 'number' ? (payload['items_before'] as number) : undefined,
+      itemsAfter: typeof payload['items_after'] === 'number' ? (payload['items_after'] as number) : undefined,
+    };
+
+    if (session.currentTurnSpan) {
+      setCompactionAttrs(session.currentTurnSpan, attrs);
+      this.log('INFO', `PreCompact attached to active turn ${session.turnNumber} (session ${sessionId})`);
+    } else {
+      // Buffer until the next UserPromptSubmit opens a turn span.
+      session.pendingCompaction = attrs;
+      this.log('INFO', `PreCompact buffered; will attach to next turn (session ${sessionId})`);
+    }
   }
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurnCallId || !this.weaveClient) return;
+    if (!session?.currentTurnSpan || !this.tracer) return;
 
-    // Parse transcript for usage + model (not available in hook payloads).
-    // Retry up to 3 times — the file may still be flushing when Stop fires.
+    // Parse transcript for usage + per-call detail. Retry up to 3 times — the
+    // file may still be flushing when Stop fires.
     const parsedSession = await this.parseSessionFileWithRetry(session.transcript);
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
-    const usage = currentTurn?.totalUsage();
     const model = currentTurn?.primaryModel();
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.traceId} turn_call=${session.currentTurnCallId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Weave expects summary.usage keyed by model name: { "model-name": { input_tokens, output_tokens } }
-    const usageSummary = usage && model ? { [model]: usage } : {};
-
-    // Accumulate into session totals for roll-up at SessionEnd
-    if (usage && model) {
-      const existing = session.totalUsage[model];
-      session.totalUsage[model] = existing ? addUsage(existing, usage) : { ...usage };
+    // Emit one chat span per LLM call within this turn
+    if (currentTurn) {
+      emitChatSpansFromAssistantCalls(
+        this.tracer,
+        session.currentTurnSpan,
+        session.conversationId,
+        currentTurn.assistantCalls(),
+      );
     }
 
     const parsedTexts = currentTurn?.textBlocks() ?? [];
     const lastMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
-
-    // Use parsed transcript texts if available; fall back to hook payload
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
-    this.weaveClient.saveCallEnd({
-      project_id: this.weaveClient.projectId,
-      id: session.currentTurnCallId,
-      ended_at: new Date().toISOString(),
-      output: {
-        assistant_message: lastMessage,                // backwards compat: final response
-        assistant_messages: assistantMessages,          // all text blocks in order
-      },
-      summary: { usage: usageSummary, tool_count: session.turnToolCalls },
-    });
-    session.currentTurnCallId = undefined;
+    if (assistantMessages.length) {
+      session.currentTurnSpan.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m }))),
+      );
+    }
+
+    // Aggregate finish reasons from per-call detail
+    const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
+    if (finishReasons?.length) {
+      session.currentTurnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
+    }
+
+    if (model) {
+      session.currentTurnSpan.setAttribute(ATTR.REQUEST_MODEL, model);
+    }
+
+    session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
+    session.currentTurnSpan.end();
+    session.currentTurnSpan = undefined;
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
@@ -765,84 +1048,38 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} trace_id=${session.traceId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagentByAgentId.size}`,
-    );
-    this.upsertTraceRegistry(
-      session.sessionId,
-      session.traceId,
-      session.transcript.resolvedPath,
-      (payload['reason'] as string | undefined) ?? 'session_end',
-      session.sessionCallId,
+      `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
-    if (this.weaveClient) {
-      const now = new Date().toISOString();
-
-      // Close any pending tool calls that were never completed
-      for (const [toolUseId, pending] of session.pendingToolCalls) {
-        if (pending.permissionWeaveCallId) {
-          this.weaveClient.saveCallEnd({
-            project_id: this.weaveClient.projectId,
-            id: pending.permissionWeaveCallId,
-            ended_at: now,
-            output: { approved: null, reason: 'session_ended' },
-            summary: {},
-          });
-        }
-        this.weaveClient.saveCallEnd({
-          project_id: this.weaveClient.projectId,
-          id: pending.weaveCallId,
-          ended_at: now,
-          output: { error: 'session ended before tool completed' },
-          summary: { is_error: true },
-        });
-        this.log('DEBUG', `Closed orphaned tool call: ${toolUseId} (${pending.toolName})`);
-      }
-
-      // Close any open subagent calls
-      for (const [agentId, tracker] of session.subagentByAgentId) {
-        if (tracker.subagentWeaveCallId) {
-          this.weaveClient.saveCallEnd({
-            project_id: this.weaveClient.projectId,
-            id: tracker.subagentWeaveCallId,
-            ended_at: now,
-            output: { reason: 'session_ended' },
-            summary: {},
-          });
-          this.log('DEBUG', `Closed orphaned subagent: ${agentId}`);
-        }
-      }
-
-      // Close the current turn if still open
-      if (session.currentTurnCallId) {
-        this.weaveClient.saveCallEnd({
-          project_id: this.weaveClient.projectId,
-          id: session.currentTurnCallId,
-          ended_at: now,
-          output: { reason: 'session_ended' },
-          summary: {},
-        });
-        this.log('DEBUG', `Closed orphaned turn call: ${session.currentTurnCallId}`);
-      }
-
-      // Close the session call
-      if (session.sessionCallId) {
-        this.weaveClient.saveCallEnd({
-          project_id: this.weaveClient.projectId,
-          id: session.sessionCallId,
-          ended_at: now,
-          output: { reason: (payload['reason'] as string | undefined) ?? '' },
-          summary: {
-            usage: session.totalUsage,
-            turn_count: session.turnNumber,
-            tool_count: session.totalToolCalls,
-            tool_counts: session.toolCounts,
-          },
-        });
-      }
-
-      this.log('INFO', `Finished session ${sessionId}`);
+    // Close any pending tool calls that were never completed
+    for (const [toolUseId, pending] of session.pendingToolCalls) {
+      resolvePermissionIfPending(pending, false);
+      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
+      pending.span.end();
+      this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
+
+    // Close the current turn if still open
+    if (session.currentTurnSpan) {
+      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.currentTurnSpan.end();
+      this.log('DEBUG', `Closed orphaned turn span`);
+    }
+
+    // Close any subagent invoke_agent spans that didn't receive PostToolUse
+    // or SubagentStop. Without this they'd leak open and never export.
+    for (const tracker of session.subagents.all()) {
+      if (tracker.invokeAgentSpan && !tracker.ended) {
+        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
+        tracker.invokeAgentSpan.end();
+        tracker.ended = true;
+      }
+      this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
+    }
+
+    this.log('INFO', `Finished session ${sessionId}`);
 
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
@@ -863,11 +1100,11 @@ export class GlobalDaemon {
     this.running = false;
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
-    if (this.weaveClient) {
+    if (this.provider) {
       try {
-        await this.weaveClient.waitForBatchProcessing();
+        await this.provider.shutdown();
       } catch (err) {
-        this.log('ERROR', `Error flushing Weave batch: ${err}`);
+        this.log('ERROR', `Error shutting down OTel provider: ${err}`);
       }
     }
     for (const session of this.sessions.values()) {
@@ -880,32 +1117,6 @@ export class GlobalDaemon {
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
-
-  /** Truncate a prompt to a readable display name, collapsing whitespace. */
-  private static promptSnippet(prompt: string, maxLen = 60): string {
-    const oneLine = prompt.replace(/\s+/g, ' ').trim();
-    return oneLine.length <= maxLen ? oneLine : oneLine.slice(0, maxLen - 1) + '…';
-  }
-
-  /** Build a human-readable display name for a tool call, e.g. "Read: src/foo.ts". */
-  private static toolDisplayName(toolName: string, input: Record<string, unknown>): string {
-    const s = (v: unknown) => GlobalDaemon.promptSnippet(String(v ?? ''), 60);
-    switch (toolName) {
-      case 'Read':
-      case 'Edit':
-      case 'Write':        return `${toolName}: ${s(input['file_path'])}`;
-      case 'Glob':         return `Glob: ${s(input['pattern'])}`;
-      case 'Grep':         return `Grep: ${s(input['pattern'])}`;
-      case 'Bash':         return `Bash: ${s(input['command'])}`;
-      case 'Agent':        return `Agent: ${s(input['description'] ?? input['subagent_type'])}`;
-      case 'WebFetch':     return `WebFetch: ${s(input['url'])}`;
-      case 'WebSearch':    return `WebSearch: ${s(input['query'])}`;
-      default: {
-        const first = Object.values(input).find((v) => typeof v === 'string') as string | undefined;
-        return first ? `${toolName}: ${GlobalDaemon.promptSnippet(first, 60)}` : toolName;
-      }
-    }
-  }
 
   /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
    *  The transcript file may still be flushing when Stop fires. */
@@ -937,53 +1148,26 @@ export class GlobalDaemon {
     this.sessionQueues.set(sessionId, next);
   }
 
-  private upsertTraceRegistry(
-    sessionId: string,
-    traceId: string,
-    transcriptPath: string,
-    source: string,
-    sessionCallId?: string,
-  ): void {
-    try {
-      this.traceRegistry.upsert(sessionId, traceId, transcriptPath, source, sessionCallId);
-    } catch (err) {
-      this.log('ERROR', `Failed to update trace registry: ${err}`);
+  /** Categorize an error value into a short identifier for `error.type`. */
+  private errorTypeFor(error: unknown): string {
+    if (typeof error === 'string') {
+      const trimmed = error.trim();
+      if (!trimmed) return 'tool_error';
+      // Take the first word that looks like a category label
+      const match = trimmed.match(/^[A-Z][A-Za-z_]*Error/);
+      return match ? match[0] : 'tool_error';
     }
-  }
-
-  private async resolveTraceForSession(
-    sessionId: string,
-    transcriptPath: string,
-    sessionSource: string,
-  ): Promise<TraceResolution> {
-    if (sessionSource === 'resume') {
-      const bySession = this.traceRegistry.getBySessionId(sessionId);
-      if (bySession) {
-        return {
-          traceId: bySession.traceId,
-          sessionCallId: bySession.sessionCallId,
-          source: 'registry-session',
-        };
-      }
-
-      const byTranscript = this.traceRegistry.getByTranscriptPath(transcriptPath);
-      if (byTranscript) {
-        return {
-          traceId: byTranscript.traceId,
-          sessionCallId: byTranscript.sessionCallId,
-          source: 'registry-transcript',
-        };
-      }
+    if (error && typeof error === 'object' && 'type' in error) {
+      const t = (error as Record<string, unknown>)['type'];
+      if (typeof t === 'string' && t) return t;
     }
-
-    return { traceId: uuidv7(), source: 'new' };
+    return 'tool_error';
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
     if (level === 'DEBUG' && !this.debugEnabled) return;
     appendToLog(this.logFile, level, msg);
   }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -998,6 +1182,7 @@ export async function runDaemon(): Promise<void> {
 
   const weaveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   const apiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  const baseUrl = (process.env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
 
   if (!weaveProject || !apiKey) {
     const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
@@ -1005,12 +1190,11 @@ export async function runDaemon(): Promise<void> {
     process.exit(0);
   }
 
-  // Ensure the Weave SDK sees the API key regardless of whether it came from
-  // settings.json or was already in the environment.
+  // Ensure downstream tooling (e.g. wandb settings) still sees the API key.
   process.env['WANDB_API_KEY'] = apiKey;
 
   const debugEnabled = !!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true;
-  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, debugEnabled);
+  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debugEnabled);
 
   try {
     await daemon.start();

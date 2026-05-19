@@ -11,10 +11,27 @@ export interface UsageSummary {
   cache_creation_input_tokens?: number;
 }
 
+/**
+ * Per-API-call detail for a single assistant message in the transcript.
+ * Each entry corresponds to one LLM invocation within a turn, used to emit
+ * one `chat <model>` span per call at Stop time.
+ */
+export interface AssistantCallDetail {
+  timestamp: string;            // ISO timestamp of the assistant message
+  prevTimestamp?: string;       // ISO timestamp of preceding transcript line (proxy for "request started")
+  model?: string;
+  usage: UsageSummary;          // per-call usage
+  reasoningTokens?: number;     // reasoning/thinking tokens, if any
+  contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
+  responseId?: string;          // provider message id
+  finishReason?: string;        // stop_reason / finish_reason if present
+}
+
 export interface Turn {
   totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
   textBlocks(): string[];
+  assistantCalls(): AssistantCallDetail[];
 }
 
 export interface ParsedSession {
@@ -79,78 +96,114 @@ function readUtf8FromFd(fd: number): string {
   return buffer.toString('utf8', 0, bytesRead);
 }
 
+interface AssistantLine {
+  line: Record<string, unknown>;
+  prevTimestamp?: string;
+}
+
 function buildSession(lines: unknown[]): ParsedSession {
   const turns: Turn[] = [];
-  let currentAssistantMsgs: unknown[] = [];
+  let currentAssistantLines: AssistantLine[] = [];
+  let prevTimestamp: string | undefined;
 
   for (const line of lines) {
-    const l = line as Record<string, unknown>;
-    const msg = l['message'] as Record<string, unknown> | undefined;
-    const type = l['type'] as string | undefined;
-    const role = (msg?.['role'] as string | undefined) ?? type;
+    const entry = line as Record<string, unknown>;
+    const message = entry['message'] as Record<string, unknown> | undefined;
+    const type = entry['type'] as string | undefined;
+    const role = (message?.['role'] as string | undefined) ?? type;
+    const timestamp = entry['timestamp'] as string | undefined;
 
     if (role === 'assistant') {
-      currentAssistantMsgs.push(line);
+      currentAssistantLines.push({ line: entry, prevTimestamp });
     } else if (role === 'user') {
-      const rawContent = msg?.['content'];
+      const rawContent = message?.['content'];
       const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
       // A user message with text content marks the end of the previous turn.
-      const hasText = typeof rawContent === 'string' || content.some(b => b['type'] === 'text');
-      if (hasText && currentAssistantMsgs.length > 0) {
-        turns.push(buildTurn(currentAssistantMsgs));
-        currentAssistantMsgs = [];
+      const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
+      if (hasText && currentAssistantLines.length > 0) {
+        turns.push(buildTurn(currentAssistantLines));
+        currentAssistantLines = [];
       }
     }
+
+    if (timestamp) prevTimestamp = timestamp;
   }
 
-  if (currentAssistantMsgs.length > 0) {
-    turns.push(buildTurn(currentAssistantMsgs));
+  if (currentAssistantLines.length > 0) {
+    turns.push(buildTurn(currentAssistantLines));
   }
 
   return { turns };
 }
 
-function buildTurn(assistantMsgs: unknown[]): Turn {
-  const usage = assistantMsgs.reduce<UsageSummary>(
-    (acc, msg) => {
-      const m = msg as Record<string, unknown>;
-      const message = m['message'] as Record<string, unknown> | undefined;
-      const u = (message?.['usage'] ?? m['usage'] ?? {}) as Record<string, number>;
-      return addUsage(acc, rawToUsageSummary(u));
-    },
-    { input_tokens: 0, output_tokens: 0 }
+function buildTurn(assistantLines: AssistantLine[]): Turn {
+  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
+    const message = line['message'] as Record<string, unknown> | undefined;
+    const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
+    const usage = rawToUsageSummary(rawUsage);
+    const reasoningTokens = typeof rawUsage['reasoning_tokens'] === 'number' ? rawUsage['reasoning_tokens'] : undefined;
+    const model = (message?.['model'] ?? line['model']) as string | undefined;
+    const rawContent = message?.['content'];
+    // `content` is either an array of blocks (the common assistant shape), a
+    // bare string (legacy single-text format), or missing. Fall back to [] for
+    // the missing / unknown case so downstream code sees a well-typed empty
+    // list instead of `undefined`.
+    const contentBlocks: unknown[] = Array.isArray(rawContent)
+      ? (rawContent as unknown[])
+      : typeof rawContent === 'string'
+        ? [{ type: 'text', text: rawContent }]
+        : [];
+    const responseId = (message?.['id'] ?? line['id']) as string | undefined;
+    const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
+    const timestamp = (line['timestamp'] as string | undefined) ?? '';
+
+    return {
+      timestamp,
+      prevTimestamp,
+      model,
+      usage,
+      reasoningTokens,
+      contentBlocks,
+      responseId,
+      finishReason: stopReason,
+    };
+  });
+
+  const totalUsageValue = calls.reduce<UsageSummary>(
+    (acc, call) => addUsage(acc, call.usage),
+    { input_tokens: 0, output_tokens: 0 },
   );
 
-  const model = assistantMsgs
-    .map(m => {
-      const msg = m as Record<string, unknown>;
-      const message = msg['message'] as Record<string, unknown> | undefined;
-      return (message?.['model'] ?? msg['model']) as string | undefined;
-    })
-    .filter(Boolean)
-    .pop();
+  const model = calls.map(call => call.model).filter(Boolean).pop();
 
-  const texts: string[] = [];
-  for (const msg of assistantMsgs) {
-    const m = msg as Record<string, unknown>;
-    const message = m['message'] as Record<string, unknown> | undefined;
-    const content = message?.['content'];
-
-    if (typeof content === 'string' && content.trim()) {
-      texts.push(content);
-    } else if (Array.isArray(content)) {
-      for (const block of content as Array<Record<string, unknown>>) {
-        if (block['type'] === 'text' && typeof block['text'] === 'string' && block['text'].trim()) {
-          texts.push(block['text']);
-        }
-      }
-    }
-  }
+  const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
 
   return {
-    totalUsage: () => usage,
+    totalUsage: () => totalUsageValue,
     primaryModel: () => model,
     textBlocks: () => texts,
+    assistantCalls: () => calls,
   };
+}
+
+/**
+ * Pull human-readable text out of assistant `content` blocks. Accepts the raw
+ * union (string entries, `{type: 'text', text}` objects, etc.) and returns
+ * only non-empty text. `thinking` and other block types are skipped.
+ */
+export function extractAssistantTextBlocks(blocks: unknown[]): string[] {
+  const out: string[] = [];
+  for (const block of blocks) {
+    if (typeof block === 'string') {
+      if (block.trim()) out.push(block);
+      continue;
+    }
+    if (!block || typeof block !== 'object') continue;
+    const obj = block as Record<string, unknown>;
+    if (obj['type'] === 'text' && typeof obj['text'] === 'string' && (obj['text'] as string).trim()) {
+      out.push(obj['text'] as string);
+    }
+  }
+  return out;
 }

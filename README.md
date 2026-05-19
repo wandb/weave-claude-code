@@ -199,19 +199,43 @@ Read or update plugin configuration without leaving Claude Code.
 
 ## What Gets Traced
 
-Each Claude Code session produces a trace in Weave with the following hierarchy:
+The plugin emits OTel spans that follow the [GenAI semantic
+conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) and ships
+them to the Weave Agents observability backend (`/agents/otel/v1/traces`).
+Each user prompt produces one OTel trace (the "turn"); multi-turn
+conversations are stitched together server-side via
+`gen_ai.conversation.id`, which is set to the Claude Code session id on
+every span in the turn.
 
 ```
-claude_code.session
-  └─ claude_code.turn          (one per user message)
-       ├─ claude_code.tool.*   (each tool call: Read, Bash, Grep, etc.)
-       │    └─ claude_code.permission_request  (if user approval was needed)
-       └─ claude_code.subagent (if Claude spawned a subagent)
-            └─ claude_code.tool.*
+invoke_agent claude-code                  (root — one trace per user prompt)
+├─ chat <model>                           (each LLM API call within the turn)
+├─ execute_tool <tool_name>               (each tool call: Read, Bash, Grep, ...)
+└─ invoke_agent <subagent_type>           (subagent dispatched via the `Agent` tool)
+   ├─ chat <model>                        (subagent LLM calls)
+   └─ execute_tool <tool_name>            (tools the subagent ran)
 ```
 
-Each trace includes token usage, model name, tool inputs/outputs, timing, and
-the textual content associated with prompts and responses.
+Subagents (dispatched via Claude Code's `Agent` tool) are emitted as their
+own nested `invoke_agent` span — a direct child of the turn span, sibling
+of any regular tool calls — not as an `execute_tool Agent` span. This
+matches the Weave Agents chat view's reference structure, where nested
+`invoke_agent` spans render as an `agent_start` lifecycle marker for the
+subagent. The spawning tool_use_id is preserved on the inner
+`invoke_agent` span as `weave.claude_code.subagent.spawning_tool_call_id`.
+
+Permission requests appear as `weave.permission_request` span events on the
+parent `execute_tool` span; context-window compaction is stamped as
+`weave.compaction.{summary,items_before,items_after}` attributes on the
+turn span open at compaction time (or the next turn if compaction fires
+between turns).
+
+Each span includes per-call token usage (`gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens`, cache and reasoning token counts), model name
+(`gen_ai.request.model`), tool inputs and outputs
+(`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`), timing, and the
+textual content of prompts and assistant messages
+(`gen_ai.input.messages`, `gen_ai.output.messages`).
 
 Important: tool inputs and outputs may contain sensitive information. In
 practice this can include file contents, command output, URLs, fetched content,

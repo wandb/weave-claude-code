@@ -62,3 +62,45 @@ export class TranscriptFile {
     try { fs.closeSync(this._fd); } finally { this._fd = null; }
   }
 }
+
+/**
+ * Open `transcriptPath` read-only (no symlink following, regular file only)
+ * and read the first line as JSON. Returns the parsed object or undefined on
+ * any failure (missing file, unparseable line, empty file). Caller-safe for
+ * ancestor transcripts in the fork chain: opens its own fd and closes it
+ * before returning.
+ */
+export function readFirstTranscriptLine(transcriptPath: string): Record<string, unknown> | undefined {
+  const resolved = path.resolve(transcriptPath);
+  if (!isPathWithinBase(resolved, os.homedir())) return undefined;
+
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(resolved, O_RDONLY_NOFOLLOW);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size === 0) return undefined;
+
+    const want = Math.min(stat.size, 64 * 1024);
+    const buf = Buffer.allocUnsafe(want);
+    let read = 0;
+    while (read < want) {
+      const n = fs.readSync(fd, buf, read, want - read, read);
+      if (n === 0) break;
+      read += n;
+    }
+    if (read === 0) return undefined;
+
+    const text = buf.toString('utf8', 0, read);
+    const nl = text.indexOf('\n');
+    const line = nl === -1 ? text : text.slice(0, nl);
+    if (!line.trim()) return undefined;
+
+    return JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
