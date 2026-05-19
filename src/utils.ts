@@ -83,3 +83,39 @@ export function appendToLog(logFile: string, level: 'DEBUG' | 'INFO' | 'WARN' | 
 export function isPathWithinBase(targetPath: string, basePath: string): boolean {
   return targetPath === basePath || targetPath.startsWith(basePath + path.sep);
 }
+
+/**
+ * Probe a Unix-domain socket and distinguish the three states a daemon socket
+ * file can be in:
+ *   - 'absent' — no inode at the path
+ *   - 'alive'  — connect() succeeded; something is listening
+ *   - 'stale'  — inode exists but connect() failed (ECONNREFUSED, ENOTSOCK,
+ *                hang, etc.); a daemon died without cleaning up its socket
+ *
+ * The `[ -S path ]` / fs.existsSync(path) test alone cannot tell 'alive' from
+ * 'stale': the socket inode persists across an ungraceful exit. Only an actual
+ * connect attempt distinguishes them.
+ */
+export function probeUnixSocket(
+  socketPath: string,
+  timeoutMs = 250,
+): Promise<'alive' | 'stale' | 'absent'> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(socketPath)) {
+      resolve('absent');
+      return;
+    }
+    const client = net.createConnection(socketPath);
+    let settled = false;
+    const settle = (v: 'alive' | 'stale'): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      resolve(v);
+    };
+    const timer = setTimeout(() => settle('stale'), timeoutMs);
+    client.once('connect', () => settle('alive'));
+    client.once('error', () => settle('stale'));
+  });
+}

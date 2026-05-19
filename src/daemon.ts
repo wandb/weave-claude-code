@@ -311,6 +311,16 @@ export class GlobalDaemon {
 
     process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
     process.on('SIGINT',  () => void this.shutdown('SIGINT'));
+    // Without SIGHUP, Node terminates the process on terminal close with no JS
+    // handler — leaving the socket inode behind for the next hook event to
+    // mistake for a live daemon. Routing SIGHUP through shutdown() unlinks it.
+    process.on('SIGHUP',  () => void this.shutdown('SIGHUP'));
+    // Belt-and-suspenders: catch any non-signal exit (uncaught exception,
+    // process.exit from elsewhere) and remove the inode. Does NOT cover SIGKILL
+    // or OOM — the hook handler's probe handles those at next event.
+    process.on('exit', () => {
+      try { if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath); } catch { /* nothing more we can do */ }
+    });
 
     setInterval(() => this.checkInactivity(), 60_000).unref();
   }
