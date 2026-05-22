@@ -372,6 +372,7 @@ async function cmdStatus(): Promise<void> {
   console.log('');
   if (effectiveProject && effectiveApiKey) {
     console.log('Status: Ready to trace');
+    console.log(`View traces: https://wandb.ai/${effectiveProject}/weave/agents`);
   } else {
     const missing = [
       !effectiveProject && 'weave_project',
