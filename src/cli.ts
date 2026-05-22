@@ -380,7 +380,7 @@ async function cmdStatus(): Promise<void> {
     console.log('Status: Ready to trace');
     console.log(`View traces: https://wandb.ai/${effectiveProject}/weave/agents`);
   } else if (socketState === 'stale') {
-    console.log('Status: Daemon socket is stale — will auto-recover on next session');
+    console.log('Status: Daemon socket is stale — will auto-recover on next Claude Code hook');
   } else {
     const missing = [
       !effectiveProject && 'weave_project',
