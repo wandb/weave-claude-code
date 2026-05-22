@@ -282,6 +282,7 @@ export class GlobalDaemon {
       try {
         this.initTracer();
         this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
+        this.log('INFO', `View traces: https://wandb.ai/${this.weaveProject}/weave/agents`);
       } catch (err) {
         this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
         this.provider = null;
