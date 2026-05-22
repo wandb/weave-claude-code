@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+// SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+// SPDX-License-Identifier: MIT
+// SPDX-PackageName: weave-claude-plugin
+
 /**
  * Keep the runtime version module available after TypeScript compilation.
  *
