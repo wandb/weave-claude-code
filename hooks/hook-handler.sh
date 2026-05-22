@@ -64,17 +64,36 @@ if [ -z "${WANDB_API_KEY_VALUE}" ] && [ -z "${WANDB_API_KEY:-}" ]; then
 fi
 
 # ── start daemon if needed ────────────────────────────────────────────────────
+#
+# The socket file alone is NOT proof that the daemon is alive. When the daemon
+# dies ungracefully (terminal SIGHUP, OOM, kill -9), its UNIX socket inode
+# remains on disk with no listener. `[ -S "$SOCKET_PATH" ]` returns true in
+# that state, but nc -U / connect() will then fail and silently drop every
+# event. Probe the socket instead.
 
-if [ ! -S "${SOCKET_PATH}" ]; then
+is_daemon_alive() {
+  # `</dev/null nc -U -w1 sock` opens a UNIX-domain connection, writes nothing,
+  # and exits 0 iff connect() succeeded. The daemon's empty-payload short-
+  # circuit (src/daemon.ts handleConnection: `if (!raw) return`) means an empty
+  # connection is dropped silently — no log spam.
+  #
+  # We do NOT use `nc -z -U`: on macOS BSD nc (Darwin 25.x), `-z` for UNIX
+  # sockets returns 1 even against a live listener.
+  </dev/null nc -U -w1 "${SOCKET_PATH}" >/dev/null 2>&1
+}
+
+if ! is_daemon_alive; then
   weave-claude-plugin daemon >> "${ERROR_LOG}" 2>&1 &
 
-  # Wait up to 5 s (50 × 100 ms) for the socket to appear
+  # Wait up to 5 s (50 × 100 ms) for the daemon to accept connections.
+  # The daemon unlinks any stale socket file before binding — see
+  # GlobalDaemon.start in src/daemon.ts — so we don't need to clean up here.
   for i in $(seq 1 50); do
-    [ -S "${SOCKET_PATH}" ] && break
+    is_daemon_alive && break
     sleep 0.1
   done
 
-  if [ ! -S "${SOCKET_PATH}" ]; then
+  if ! is_daemon_alive; then
     cat >> "${ERROR_LOG}" << EOF
 $(date -Iseconds) | ERROR | Daemon did not start within 5 s.
   Diagnose: weave-claude-plugin status

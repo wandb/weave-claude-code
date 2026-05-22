@@ -11,9 +11,10 @@
     "build": "tsc && node scripts/build/copy-version-module.mjs",
     "build:watch": "tsc --watch",
     "dev": "tsx src/cli.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
     "secrets:scan": "gitleaks dir . --no-banner --redact",
     "secrets:scan:staged": "gitleaks git --pre-commit --staged --redact --verbose",
-    "check": "npm run build && npm run secrets:scan",
+    "check": "npm run build && npm test && npm run secrets:scan",
     "setup-hooks": "node scripts/install-git-hooks.mjs"
   },
   "dependencies": {

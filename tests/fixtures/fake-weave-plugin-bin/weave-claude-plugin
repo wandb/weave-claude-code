@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+// SPDX-License-Identifier: MIT
+// SPDX-PackageName: weave-claude-plugin
+
+// Stand-in for the real weave-claude-plugin CLI, used by hook-handler integration
+// tests. Supports two subcommands:
+//   * `daemon` — bind WCP_SOCK_PATH, append every line received to WCP_REQUEST_LOG,
+//                stay alive until SIGTERM.
+//   * everything else — exit 0 silently. (Real CLI has install/config/etc.)
+
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+
+const sub = process.argv[2];
+
+if (sub === 'daemon') {
+  const sock = process.env.WCP_SOCK_PATH;
+  const reqLog = process.env.WCP_REQUEST_LOG;
+  if (!sock || !reqLog) {
+    console.error('fake daemon: WCP_SOCK_PATH and WCP_REQUEST_LOG must be set');
+    process.exit(2);
+  }
+  try { fs.unlinkSync(sock); } catch { /* fine, may be absent */ }
+
+  const server = net.createServer((c) => {
+    let buf = '';
+    c.on('data', (d) => { buf += d.toString(); });
+    c.on('end', () => {
+      fs.appendFileSync(reqLog, buf + '\n');
+    });
+  });
+  server.listen(sock, () => {
+    if (process.env.WCP_PID_FILE) {
+      fs.writeFileSync(process.env.WCP_PID_FILE, String(process.pid));
+    }
+  });
+
+  process.on('SIGTERM', () => { try { fs.unlinkSync(sock); } catch { /* fine */ } process.exit(0); });
+} else {
+  process.exit(0);
+}

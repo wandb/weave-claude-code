@@ -23,7 +23,7 @@ import {
   saveSettings,
   type Settings,
 } from './setup.js';
-import { prompt, sendToSocket } from './utils.js';
+import { prompt, sendToSocket, probeUnixSocket } from './utils.js';
 import { runDaemon } from './daemon.js';
 
 // ---------------------------------------------------------------------------
@@ -351,10 +351,16 @@ async function cmdStatus(): Promise<void> {
     console.log('  Run: weave-claude-plugin config set wandb_api_key <your-api-key>');
   }
 
-  // Check daemon socket
+  // Probe daemon socket — distinguishes alive (listening) from stale (file
+  // exists but no listener, eg. daemon crashed). Reporting "(exists)" purely
+  // from the inode hides crashes and makes "Ready to trace" lie.
   const socketPath = settings.daemon_socket;
-  if (fs.existsSync(socketPath)) {
-    console.log(`✓ Daemon socket: ${socketPath} (exists)`);
+  const socketState = await probeUnixSocket(socketPath);
+  if (socketState === 'alive') {
+    console.log(`✓ Daemon socket: ${socketPath} (alive)`);
+  } else if (socketState === 'stale') {
+    console.log(`✗ Daemon socket: ${socketPath} (stale — file exists but no listener)`);
+    console.log(`  Auto-recovers on next Claude Code session — no action needed.`);
   } else {
     console.log(`- Daemon socket: ${socketPath} (not running)`);
   }
@@ -370,15 +376,21 @@ async function cmdStatus(): Promise<void> {
   }
 
   console.log('');
-  if (effectiveProject && effectiveApiKey) {
+  if (effectiveProject && effectiveApiKey && socketState !== 'stale') {
     console.log('Status: Ready to trace');
     console.log(`View traces: https://wandb.ai/${effectiveProject}/weave/agents`);
+  } else if (socketState === 'stale') {
+    console.log('Status: Daemon socket is stale — will auto-recover on next Claude Code hook');
   } else {
     const missing = [
       !effectiveProject && 'weave_project',
       !effectiveApiKey && 'wandb_api_key',
     ].filter(Boolean).join(', ');
     console.log(`Status: Configuration incomplete — set ${missing} to start tracing`);
+  }
+
+  if (socketState === 'stale') {
+    process.exit(1);
   }
 }
 
