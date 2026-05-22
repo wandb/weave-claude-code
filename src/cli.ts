@@ -360,7 +360,7 @@ async function cmdStatus(): Promise<void> {
     console.log(`✓ Daemon socket: ${socketPath} (alive)`);
   } else if (socketState === 'stale') {
     console.log(`✗ Daemon socket: ${socketPath} (stale — file exists but no listener)`);
-    console.log(`  Recover: rm "${socketPath}" or restart Claude Code session`);
+    console.log(`  Auto-recovers on next Claude Code session — no action needed.`);
   } else {
     console.log(`- Daemon socket: ${socketPath} (not running)`);
   }
@@ -380,7 +380,7 @@ async function cmdStatus(): Promise<void> {
     console.log('Status: Ready to trace');
     console.log(`View traces: https://wandb.ai/${effectiveProject}/weave/agents`);
   } else if (socketState === 'stale') {
-    console.log('Status: Daemon socket is stale — see recovery instructions above');
+    console.log('Status: Daemon socket is stale — will auto-recover on next session');
   } else {
     const missing = [
       !effectiveProject && 'weave_project',
