@@ -1141,11 +1141,14 @@ export class GlobalDaemon {
    *  The transcript file may still be flushing when Stop fires.
    *
    *  `finalAssistantMessage`, when set, makes the retry predicate stricter:
-   *  the joined text blocks of the parsed last assistant call must be at
-   *  least as long as the expected text (the value Claude Code passes as
+   *  the joined text blocks of the parsed last assistant call must end
+   *  with the expected text (the value Claude Code passes as
    *  `payload['last_assistant_message']`), after normalizing newlines and
-   *  trailing whitespace. We compare against the whole call's text rather
-   *  than its trailing block alone — a single assistant message can hold
+   *  trailing whitespace. endsWith — rather than a length comparison —
+   *  handles the mixed text+tool_use prior call case, where the prior
+   *  call's text preamble could be longer than a short synthesis without
+   *  ending with it. We match against the whole call's text rather than
+   *  the trailing block alone — a single assistant message can hold
    *  multiple text blocks, and Claude Code's payload concatenates them.
    *  Otherwise the read raced the transcript writer and the final
    *  assistant message is missing from the file. Retrying lets the
@@ -1166,7 +1169,7 @@ export class GlobalDaemon {
       return null;
     }
     const normalize = (s: string) => s.replace(/\r\n/g, '\n').trimEnd();
-    const expectedLen = normalize(finalAssistantMessage ?? '').length;
+    const expectedFinal = normalize(finalAssistantMessage ?? '');
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
@@ -1177,7 +1180,7 @@ export class GlobalDaemon {
         : '';
       const turnsParsed = (result?.turns.length ?? 0) > 0;
       const writerCaughtUp =
-        !expectedLen || normalize(lastCallText).length >= expectedLen;
+        !expectedFinal || normalize(lastCallText).endsWith(expectedFinal);
       if (turnsParsed && writerCaughtUp) return result;
       if (i < attempts - 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
