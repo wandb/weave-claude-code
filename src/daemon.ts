@@ -1010,7 +1010,10 @@ export class GlobalDaemon {
     // as the synthesis text; otherwise the final chat span (the one
     // carrying the synthesis text) silently drops when the read races the
     // writer.
-    const finalAssistantMessage = payload['last_assistant_message'] as string | undefined;
+    // normalize() inside the retry helper calls .replace() on this value, so
+    // a non-string payload (contract violation) would throw and abort handleStop.
+    const rawFinalMessage = payload['last_assistant_message'];
+    const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
     const parsedSession = await this.parseSessionFileWithRetry(
       session.transcript,
       finalAssistantMessage,
