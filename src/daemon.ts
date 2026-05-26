@@ -1137,7 +1137,7 @@ export class GlobalDaemon {
   /** Retry parseSessionFile while the transcript writer catches up to Stop.
    *  If `finalAssistantMessage` is set, require the last assistant call's
    *  text to end with it (mod trailing whitespace) — guards against reading
-   *  before the synthesis line lands. */
+   *  before the synthesis line lands. Default budget: 5 × 200ms = 1s. */
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
     finalAssistantMessage?: string,
