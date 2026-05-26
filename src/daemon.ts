@@ -1161,7 +1161,7 @@ export class GlobalDaemon {
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
     finalAssistantMessage?: string,
-    // 5 × 200ms = 1s ceiling, well above the ~137ms observed race window.
+    // 5 × 200ms = 1s ceiling.
     attempts = 5,
     delayMs = 200,
   ): Promise<ReturnType<typeof parseSessionFd>> {
