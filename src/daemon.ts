@@ -1155,10 +1155,11 @@ export class GlobalDaemon {
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
-      const lastCall = result?.turns.at(-1)?.assistantCalls().at(-1);
-      const text = lastCall ? extractAssistantTextBlocks(lastCall.contentBlocks).join('\n') : '';
-      if (result?.turns.length && (!expected || text.trimEnd().endsWith(expected))) {
-        return result;
+      if (result?.turns.length) {
+        if (!expected) return result;
+        const lastCall = result.turns.at(-1)?.assistantCalls().at(-1);
+        const text = lastCall ? extractAssistantTextBlocks(lastCall.contentBlocks).join('\n') : '';
+        if (text.trimEnd().endsWith(expected)) return result;
       }
       if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
