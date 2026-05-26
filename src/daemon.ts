@@ -124,6 +124,7 @@ function lastAssistantTextEndsWith(
   suffix: string,
 ): boolean {
   const call = result.turns.at(-1)?.assistantCalls().at(-1);
+  // Turn exists but parser saw no assistant calls (writer mid-flush).
   if (!call) return false;
   return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
 }
@@ -1166,9 +1167,12 @@ export class GlobalDaemon {
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
+      // Writer caught up: parsed at least one turn AND (no synthesis to verify,
+      // OR the last assistant call ends with it).
       if (result?.turns.length && (!expected || lastAssistantTextEndsWith(result, expected))) {
         return result;
       }
+      // No next parse to wait for on the last iteration, so skip the sleep.
       if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
     return result;
