@@ -1004,14 +1004,8 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurnSpan || !this.tracer) return;
 
-    // Parse transcript for usage + per-call detail. Retry — the file may
-    // still be flushing when Stop fires. Pass `last_assistant_message` so
-    // the retry waits until the writer has flushed at least as many bytes
-    // as the synthesis text; otherwise the final chat span (the one
-    // carrying the synthesis text) silently drops when the read races the
-    // writer.
-    // The retry helper calls .trimEnd() on this value, so a non-string
-    // payload (contract violation) would throw and abort handleStop.
+    // Pass last_assistant_message so the retry waits for the synthesis to
+    // flush — otherwise the final chat span drops when the read races the writer.
     const rawFinalMessage = payload['last_assistant_message'];
     const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
     const parsedSession = await this.parseSessionFileWithRetry(
@@ -1140,28 +1134,13 @@ export class GlobalDaemon {
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
-  /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
-   *  The transcript file may still be flushing when Stop fires.
-   *
-   *  `finalAssistantMessage`, when set, makes the retry predicate stricter:
-   *  the joined text blocks of the parsed last assistant call must end
-   *  with the expected text (the value Claude Code passes as
-   *  `payload['last_assistant_message']`), after trimming trailing
-   *  whitespace on both sides. endsWith — rather than a length comparison —
-   *  handles the mixed text+tool_use prior call case, where the prior
-   *  call's text preamble could be longer than a short synthesis without
-   *  ending with it. We match against the whole call's text rather than
-   *  the trailing block alone — a single assistant message can hold
-   *  multiple text blocks, and Claude Code's payload concatenates them.
-   *  Otherwise the read raced the transcript writer and the final
-   *  assistant message is missing from the file. Retrying lets the
-   *  OS-level write catch up. Without this, a turns.length>0 reader passes
-   *  through with N-1 assistant calls and the synthesis chat span never
-   *  gets emitted. */
+  /** Retry parseSessionFile while the transcript writer catches up to Stop.
+   *  If `finalAssistantMessage` is set, require the last assistant call's
+   *  text to end with it (mod trailing whitespace) — guards against reading
+   *  before the synthesis line lands. */
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
     finalAssistantMessage?: string,
-    // 5 × 200ms = 1s ceiling.
     attempts = 5,
     delayMs = 200,
   ): Promise<ReturnType<typeof parseSessionFd>> {
@@ -1172,25 +1151,16 @@ export class GlobalDaemon {
       this.log('ERROR', `Cannot open transcript for parsing: ${err}`);
       return null;
     }
-    // Defensive trimEnd: Claude Code's Stop payload may drop a trailing '\n'
-    // that the transcript block keeps (unverified — ~2% of observed text
-    // blocks have a trailing newline). Cheap insurance for the endsWith below.
-    const expectedFinal = (finalAssistantMessage ?? '').trimEnd();
+    const expected = (finalAssistantMessage ?? '').trimEnd();
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
-      const lastTurn = result?.turns[result.turns.length - 1];
-      const lastCall = lastTurn?.assistantCalls().slice(-1)[0];
-      const lastCallText = lastCall
-        ? extractAssistantTextBlocks(lastCall.contentBlocks).join('\n')
-        : '';
-      const turnsParsed = (result?.turns.length ?? 0) > 0;
-      const writerCaughtUp =
-        !expectedFinal || lastCallText.trimEnd().endsWith(expectedFinal);
-      if (turnsParsed && writerCaughtUp) return result;
-      if (i < attempts - 1) {
-        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      const lastCall = result?.turns.at(-1)?.assistantCalls().at(-1);
+      const text = lastCall ? extractAssistantTextBlocks(lastCall.contentBlocks).join('\n') : '';
+      if (result?.turns.length && (!expected || text.trimEnd().endsWith(expected))) {
+        return result;
       }
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
     return result;
   }
