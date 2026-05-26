@@ -1010,8 +1010,8 @@ export class GlobalDaemon {
     // as the synthesis text; otherwise the final chat span (the one
     // carrying the synthesis text) silently drops when the read races the
     // writer.
-    // normalize() inside the retry helper calls .replace() on this value, so
-    // a non-string payload (contract violation) would throw and abort handleStop.
+    // The retry helper calls .trimEnd() on this value, so a non-string
+    // payload (contract violation) would throw and abort handleStop.
     const rawFinalMessage = payload['last_assistant_message'];
     const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
     const parsedSession = await this.parseSessionFileWithRetry(
@@ -1146,8 +1146,8 @@ export class GlobalDaemon {
    *  `finalAssistantMessage`, when set, makes the retry predicate stricter:
    *  the joined text blocks of the parsed last assistant call must end
    *  with the expected text (the value Claude Code passes as
-   *  `payload['last_assistant_message']`), after normalizing newlines and
-   *  trailing whitespace. endsWith — rather than a length comparison —
+   *  `payload['last_assistant_message']`), after trimming trailing
+   *  whitespace on both sides. endsWith — rather than a length comparison —
    *  handles the mixed text+tool_use prior call case, where the prior
    *  call's text preamble could be longer than a short synthesis without
    *  ending with it. We match against the whole call's text rather than
@@ -1172,10 +1172,10 @@ export class GlobalDaemon {
       this.log('ERROR', `Cannot open transcript for parsing: ${err}`);
       return null;
     }
-    // Reconcile line-ending and trailing-whitespace differences between the
-    // transcript file and the Stop payload's last_assistant_message.
-    const normalize = (s: string) => s.replace(/\r\n/g, '\n').trimEnd();
-    const expectedFinal = normalize(finalAssistantMessage ?? '');
+    // Defensive trimEnd: Claude Code's Stop payload may drop a trailing '\n'
+    // that the transcript block keeps (unverified — ~2% of observed text
+    // blocks have a trailing newline). Cheap insurance for the endsWith below.
+    const expectedFinal = (finalAssistantMessage ?? '').trimEnd();
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
@@ -1186,7 +1186,7 @@ export class GlobalDaemon {
         : '';
       const turnsParsed = (result?.turns.length ?? 0) > 0;
       const writerCaughtUp =
-        !expectedFinal || normalize(lastCallText).endsWith(expectedFinal);
+        !expectedFinal || lastCallText.trimEnd().endsWith(expectedFinal);
       if (turnsParsed && writerCaughtUp) return result;
       if (i < attempts - 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
