@@ -117,6 +117,17 @@ function extractUserMessageContent(line: Record<string, unknown> | undefined): s
   return undefined;
 }
 
+/** True if the last assistant call's joined text ends with `suffix`,
+ *  ignoring trailing whitespace on either side. */
+function lastAssistantTextEndsWith(
+  result: NonNullable<ReturnType<typeof parseSessionFd>>,
+  suffix: string,
+): boolean {
+  const call = result.turns.at(-1)?.assistantCalls().at(-1);
+  if (!call) return false;
+  return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
+}
+
 /** Read the subagent transcript's first line, retrying briefly because Claude
  *  Code may not have flushed it yet when SubagentStart fires. Total wait
  *  bounded by the sum of `RETRY_DELAYS_MS`. */
@@ -1155,11 +1166,8 @@ export class GlobalDaemon {
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
-      if (result?.turns.length) {
-        if (!expected) return result;
-        const lastCall = result.turns.at(-1)?.assistantCalls().at(-1);
-        const text = lastCall ? extractAssistantTextBlocks(lastCall.contentBlocks).join('\n') : '';
-        if (text.trimEnd().endsWith(expected)) return result;
+      if (result?.turns.length && (!expected || lastAssistantTextEndsWith(result, expected))) {
+        return result;
       }
       if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
