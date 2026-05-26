@@ -1161,6 +1161,7 @@ export class GlobalDaemon {
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
     finalAssistantMessage?: string,
+    // 5 × 200ms = 1s ceiling, well above the ~137ms observed race window.
     attempts = 5,
     delayMs = 200,
   ): Promise<ReturnType<typeof parseSessionFd>> {
@@ -1171,6 +1172,8 @@ export class GlobalDaemon {
       this.log('ERROR', `Cannot open transcript for parsing: ${err}`);
       return null;
     }
+    // Reconcile line-ending and trailing-whitespace differences between the
+    // transcript file and the Stop payload's last_assistant_message.
     const normalize = (s: string) => s.replace(/\r\n/g, '\n').trimEnd();
     const expectedFinal = normalize(finalAssistantMessage ?? '');
     let result: ReturnType<typeof parseSessionFd> = null;
