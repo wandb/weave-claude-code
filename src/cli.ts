@@ -325,7 +325,7 @@ async function cmdStatus(): Promise<void> {
   // Check weave-claude-plugin is on PATH
   const whichResult = spawnSync('which', ['weave-claude-plugin'], { encoding: 'utf8' });
   if (whichResult.status === 0 && whichResult.stdout.trim()) {
-    console.log(`✓ CLI: ${whichResult.stdout.trim()}`);
+    console.log(`✓ CLI: ${whichResult.stdout.trim()} (v${VERSION})`);
   } else {
     console.log('✗ CLI: weave-claude-plugin not found in PATH');
     console.log('  Run: npm install -g weave-claude-plugin');
