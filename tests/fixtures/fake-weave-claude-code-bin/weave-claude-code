@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 // SPDX-License-Identifier: MIT
-// SPDX-PackageName: weave-claude-plugin
+// SPDX-PackageName: @wandb/weave-claude-code
 
-// Stand-in for the real weave-claude-plugin CLI, used by hook-handler integration
+// Stand-in for the real weave-claude-code CLI, used by hook-handler integration
 // tests. Supports two subcommands:
 //   * `daemon` — bind WCP_SOCK_PATH, append every line received to WCP_REQUEST_LOG,
 //                stay alive until SIGTERM.

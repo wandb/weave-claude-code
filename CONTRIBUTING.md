@@ -1,4 +1,4 @@
-# Contributing to weave-claude-plugin
+# Contributing to weave-claude-code
 
 Until further notice, this project does not accept external contributions as of March 2026.
 
@@ -19,7 +19,7 @@ npm run check
 Source code should contain an SPDX-style license header, reflecting:
 - Year & Copyright owner
 - SPDX License identifier `SPDX-License-Identifier: MIT`
-- Package Name: `SPDX-PackageName: weave-claude-plugin`
+- Package Name: `SPDX-PackageName: weave-claude-code`
 
 This can be partially automated with [FSFe REUSE](https://reuse.software/dev/#tool)
 ```shell
@@ -30,7 +30,7 @@ Blindly adding the headers to every file without review risks assigning the
 wrong copyright owner! You should endeavor to understand who owns
 contributions!
 
-- The weave-claude-plugin source is licensed under the MIT license to protect the
+- The weave-claude-code source is licensed under the MIT license to protect the
   rights of all parties.
 
 Licensing state & SPDX bill-of-materials (BOM) can be valiated & generated with:

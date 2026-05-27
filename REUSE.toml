@@ -1,7 +1,7 @@
 version = 1
-SPDX-PackageName = "weave-claude-plugin"
+SPDX-PackageName = "weave-claude-code"
 SPDX-PackageSupplier = "CoreWeave, Inc."
-SPDX-PackageDownloadLocation = "https://github.com/wandb/claude_code_weave_plugin"
+SPDX-PackageDownloadLocation = "https://github.com/wandb/weave-claude-code"
 
 [[annotations]]
 path = "**"

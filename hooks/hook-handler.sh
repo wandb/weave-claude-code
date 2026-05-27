@@ -2,21 +2,21 @@
 
 # SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 # SPDX-License-Identifier: MIT
-# SPDX-PackageName: weave-claude-plugin
+# SPDX-PackageName: weave-claude-code
 
 # Receives a Claude Code lifecycle event on stdin (JSON) and forwards it to the
 # Weave daemon via Unix socket. Starts the daemon first if it is not running.
 #
 # Assumptions:
-#   - weave-claude-plugin is on PATH (installed globally via npm install -g)
+#   - weave-claude-code is on PATH (installed globally via npm install -g)
 #   - nc (netcat) is available (ships with macOS; brew install netcat on Linux)
 #
-# Errors are written to ~/.weave_claude_plugin/logs/hook-errors.log.
+# Errors are written to ~/.weave-claude-code/logs/hook-errors.log.
 # The script always exits 0 so it never disrupts Claude Code.
 
 set -uo pipefail
 
-CONFIG_DIR="${HOME}/.weave_claude_plugin"
+CONFIG_DIR="${HOME}/.weave-claude-code"
 SETTINGS_FILE="${CONFIG_DIR}/settings.json"
 ERROR_LOG="${CONFIG_DIR}/logs/hook-errors.log"
 SOCKET_PATH="${CONFIG_DIR}/daemon.sock"
@@ -26,8 +26,8 @@ mkdir -p "${CONFIG_DIR}/logs"
 
 # ── dependency checks ─────────────────────────────────────────────────────────
 
-if ! command -v weave-claude-plugin >/dev/null 2>&1; then
-  echo "$(date -Iseconds) | ERROR | weave-claude-plugin not found in PATH. Run: npm install -g weave-claude-plugin" >> "${ERROR_LOG}"
+if ! command -v weave-claude-code >/dev/null 2>&1; then
+  echo "$(date -Iseconds) | ERROR | weave-claude-code not found in PATH. Run: npm install -g weave-claude-code" >> "${ERROR_LOG}"
   exit 0
 fi
 
@@ -42,8 +42,8 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
   cat >> "${ERROR_LOG}" << 'EOF'
 ========================================
 ERROR | Plugin not configured.
-Run:  weave-claude-plugin install
-Then: weave-claude-plugin config set weave_project ENTITY/PROJECT
+Run:  weave-claude-code install
+Then: weave-claude-code config set weave_project ENTITY/PROJECT
 ========================================
 EOF
   exit 0
@@ -83,7 +83,7 @@ is_daemon_alive() {
 }
 
 if ! is_daemon_alive; then
-  weave-claude-plugin daemon >> "${ERROR_LOG}" 2>&1 &
+  weave-claude-code daemon >> "${ERROR_LOG}" 2>&1 &
 
   # Wait up to 5 s (50 × 100 ms) for the daemon to accept connections.
   # The daemon unlinks any stale socket file before binding — see
@@ -96,8 +96,8 @@ if ! is_daemon_alive; then
   if ! is_daemon_alive; then
     cat >> "${ERROR_LOG}" << EOF
 $(date -Iseconds) | ERROR | Daemon did not start within 5 s.
-  Diagnose: weave-claude-plugin status
-  Logs:     weave-claude-plugin logs --tail 50
+  Diagnose: weave-claude-code status
+  Logs:     weave-claude-code logs --tail 50
 EOF
     exit 0
   fi

@@ -22,6 +22,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: "cla/signatures/version1/cla.json"
-          path-to-document: "https://github.com/wandb/claude_code_weave_plugin/blob/main/cla.md"
+          path-to-document: "https://github.com/wandb/weave-claude-code/blob/main/cla.md"
           branch: "cla"
           allowlist: actions-user, dependabot[bot], wandbmachine

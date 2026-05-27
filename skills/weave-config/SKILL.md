@@ -15,7 +15,7 @@ If the user invoked this skill with arguments (e.g., `/weave:weave-config set we
 
 Run:
 ```bash
-weave-claude-plugin config show
+weave-claude-code config show
 ```
 
 This displays all settings and their sources (settings file vs environment variable).
@@ -24,7 +24,7 @@ This displays all settings and their sources (settings file vs environment varia
 
 To update a setting:
 ```bash
-weave-claude-plugin config set KEY VALUE
+weave-claude-code config set KEY VALUE
 ```
 
 Writable keys:
@@ -34,7 +34,7 @@ Writable keys:
 | `weave_project` | `entity/project` | `my-org/my-project` |
 | `wandb_api_key` | string | `abc123...` |
 | `debug` | `true` / `false` | `true` |
-| `daemon_socket` | file path | `~/.weave_claude_plugin/daemon.sock` |
+| `daemon_socket` | file path | `~/.weave-claude-code/daemon.sock` |
 
 **Validation notes:**
 - `weave_project` must contain a `/` (entity/project format). Find your entity name at https://wandb.ai.
@@ -45,9 +45,9 @@ Writable keys:
 
 To read one setting:
 ```bash
-weave-claude-plugin config get KEY
+weave-claude-code config get KEY
 ```
 
 ## After Changes
 
-After setting `weave_project` or `wandb_api_key`, confirm the update by running `weave-claude-plugin config show` and reporting the new value to the user. Note that changes take effect immediately for the next Claude Code session — no restart required.
+After setting `weave_project` or `wandb_api_key`, confirm the update by running `weave-claude-code config show` and reporting the new value to the user. Note that changes take effect immediately for the next Claude Code session — no restart required.

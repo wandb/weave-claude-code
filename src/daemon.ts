@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 // SPDX-License-Identifier: MIT
-// SPDX-PackageName: weave-claude-plugin
+// SPDX-PackageName: weave-claude-code
 
 import * as net from 'net';
 import * as fs from 'fs';
@@ -370,7 +370,7 @@ export class GlobalDaemon {
       spanProcessors: [new BatchSpanProcessor(exporter)],
     });
     this.provider.register();
-    this.tracer = this.provider.getTracer('weave-claude-plugin', VERSION);
+    this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -1207,7 +1207,7 @@ export class GlobalDaemon {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entry point (invoked by `weave-claude-plugin daemon`)
+// Entry point (invoked by `weave-claude-code daemon`)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function runDaemon(): Promise<void> {

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 // SPDX-License-Identifier: MIT
-// SPDX-PackageName: weave-claude-plugin
+// SPDX-PackageName: weave-claude-code
 
 import * as fs from 'fs';
 import * as os from 'os';
@@ -58,16 +58,16 @@ export interface UninstallResult {
   pluginError?: string;
 }
 
-export const CONFIG_DIR = path.join(os.homedir(), '.weave_claude_plugin');
+export const CONFIG_DIR = path.join(os.homedir(), '.weave-claude-code');
 export const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 
 // Claude Code plugin marketplace coordinates. Pin installs to a release tag so
 // new users never consume whatever happens to be on the default branch at
 // install time.
-export const MARKETPLACE_REPO = 'wandb/claude_code_weave_plugin';
+export const MARKETPLACE_REPO = 'wandb/weave-claude-code';
 export const MARKETPLACE_REF = `v${VERSION}`;
 export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#${MARKETPLACE_REF}`;
-export const MARKETPLACE_NAME = 'weave-claude-plugin';
+export const MARKETPLACE_NAME = 'weave-claude-code';
 export const PLUGIN_NAME = 'weave';
 
 /**
@@ -116,7 +116,7 @@ export function registerPlugin(logFile: string): PluginResult {
       "'claude' CLI not found in PATH.",
       'Install Claude Code before running this command:',
       '  https://claude.ai/download',
-      'Then re-run: weave-claude-plugin install',
+      'Then re-run: weave-claude-code install',
     ].join('\n');
     appendToLog(logFile, 'ERROR', msg);
     throw new Error(msg);
@@ -228,7 +228,7 @@ export function unregisterPlugin(): UninstallResult {
 
 export function loadSettings(): Settings {
   if (!fs.existsSync(SETTINGS_FILE)) {
-    throw new Error(`Settings not found at ${SETTINGS_FILE}\nRun: weave-claude-plugin install`);
+    throw new Error(`Settings not found at ${SETTINGS_FILE}\nRun: weave-claude-code install`);
   }
   return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) as Settings;
 }
