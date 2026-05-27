@@ -20,7 +20,7 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd } from './parser.js';
+import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
@@ -115,6 +115,18 @@ function extractUserMessageContent(line: Record<string, unknown> | undefined): s
     return parts.length > 0 ? parts.join('') : undefined;
   }
   return undefined;
+}
+
+/** True if the last assistant call's joined text ends with `suffix`,
+ *  ignoring trailing whitespace on either side. */
+function lastAssistantTextEndsWith(
+  result: NonNullable<ReturnType<typeof parseSessionFd>>,
+  suffix: string,
+): boolean {
+  const call = result.turns.at(-1)?.assistantCalls().at(-1);
+  // Turn exists but parser saw no assistant calls (writer mid-flush).
+  if (!call) return false;
+  return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
 }
 
 /** Read the subagent transcript's first line, retrying briefly because Claude
@@ -1004,9 +1016,14 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurnSpan || !this.tracer) return;
 
-    // Parse transcript for usage + per-call detail. Retry up to 3 times — the
-    // file may still be flushing when Stop fires.
-    const parsedSession = await this.parseSessionFileWithRetry(session.transcript);
+    // Pass last_assistant_message so the retry waits for the synthesis to
+    // flush — otherwise the final chat span drops when the read races the writer.
+    const rawFinalMessage = payload['last_assistant_message'];
+    const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
+    const parsedSession = await this.parseSessionFileWithRetry(
+      session.transcript,
+      finalAssistantMessage,
+    );
     const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
     const model = currentTurn?.primaryModel();
     const transcriptTurns = parsedSession?.turns.length ?? 0;
@@ -1129,12 +1146,15 @@ export class GlobalDaemon {
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
-  /** Retry parseSessionFile up to `attempts` times with `delayMs` between each.
-   *  The transcript file may still be flushing when Stop fires. */
+  /** Retry parseSessionFile while the transcript writer catches up to Stop.
+   *  If `finalAssistantMessage` is set, require the last assistant call's
+   *  text to end with it (mod trailing whitespace) — guards against reading
+   *  before the synthesis line lands. Default budget: 5 × 200ms = 1s. */
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
-    attempts = 3,
-    delayMs = 500,
+    finalAssistantMessage?: string,
+    attempts = 5,
+    delayMs = 200,
   ): Promise<ReturnType<typeof parseSessionFd>> {
     let fd: number;
     try {
@@ -1143,14 +1163,19 @@ export class GlobalDaemon {
       this.log('ERROR', `Cannot open transcript for parsing: ${err}`);
       return null;
     }
+    const expected = (finalAssistantMessage ?? '').trimEnd();
+    let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
-      const result = parseSessionFd(fd);
-      if (result?.turns.length) return result;
-      if (i < attempts - 1) {
-        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      result = parseSessionFd(fd);
+      // Writer caught up: parsed at least one turn AND (no synthesis to verify,
+      // OR the last assistant call ends with it).
+      if (result?.turns.length && (!expected || lastAssistantTextEndsWith(result, expected))) {
+        return result;
       }
+      // No next parse to wait for on the last iteration, so skip the sleep.
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
-    return parseSessionFd(fd);
+    return result;
   }
 
   private enqueueForSession(sessionId: string, fn: () => Promise<void>): void {
