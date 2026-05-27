@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "weave-claude-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Track Claude Code sessions in Weave for observability and debugging",
   "owner": {
     "name": "wandb"
@@ -12,12 +12,12 @@
   "plugins": [
     {
       "name": "weave",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "description": "Track Claude Code sessions in Weave for observability and debugging",
       "source": {
         "source": "github",
         "repo": "wandb/claude_code_weave_plugin",
-        "ref": "v0.2.1",
+        "ref": "v0.2.2",
         "sha": "711a701da3a57a3a529e2c016862d5ac8b8d649d"
       },
       "category": "observability"
