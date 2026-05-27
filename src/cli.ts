@@ -25,6 +25,7 @@ import {
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket } from './utils.js';
 import { runDaemon } from './daemon.js';
+import { findByTracePrefix, recentTurns, turnsForSession } from './traceRegistry.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -43,6 +44,7 @@ Commands:
   config <action>    Manage configuration (show | get <key> | set <key> <value>)
   status             Check installation status
   logs               Display daemon logs (--tail N, --follow)
+  trace <action>     Inspect recent turn trace ids (recent | lookup)
   daemon             Start the background daemon (used by hook handler)
   uninstall          Remove the plugin and all associated files
 
@@ -57,6 +59,9 @@ Examples:
   weave-claude-plugin config set weave_project my-entity/my-project
   weave-claude-plugin status
   weave-claude-plugin logs --tail 100
+  weave-claude-plugin trace recent --limit 10
+  weave-claude-plugin trace lookup --session <session-id>
+  weave-claude-plugin trace lookup --trace <prefix>
 `.trim();
 
 // ---------------------------------------------------------------------------
@@ -432,6 +437,92 @@ async function cmdLogs(tail: number, follow: boolean): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// trace
+// ---------------------------------------------------------------------------
+
+const TRACE_HELP = `
+weave-claude-plugin trace <action>
+
+Actions:
+  recent [--limit N]              Show the last N turn entries (default 20)
+  lookup --session <session-id>   List all turns for a session id
+  lookup --trace <prefix>         Resolve a (partial) trace id to its turn
+`.trim();
+
+function fmtTurn(t: { sessionId: string; turnNumber: number; traceId: string; conversationId: string; startedAt: string; endedAt: string; toolCount: number; subagentCount: number; cwd?: string }): string {
+  // Short-form one-line output. trace_id is the load-bearing column;
+  // the rest is contextual breadcrumbs.
+  return [
+    t.startedAt,
+    `trace=${t.traceId}`,
+    `session=${t.sessionId.slice(0, 8)}…`,
+    `turn=${t.turnNumber}`,
+    `conv=${t.conversationId.slice(0, 8)}…`,
+    `tools=${t.toolCount}`,
+    t.subagentCount > 0 ? `sub=${t.subagentCount}` : '',
+  ].filter(Boolean).join('  ');
+}
+
+async function cmdTrace(args: string[]): Promise<void> {
+  const action = args[0];
+  if (!action || action === '--help' || action === '-h') {
+    console.log(TRACE_HELP);
+    return;
+  }
+
+  if (action === 'recent') {
+    let limit = 20;
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--limit' && args[i + 1]) {
+        const n = parseInt(args[i + 1]!, 10);
+        if (Number.isFinite(n) && n > 0) limit = n;
+        i++;
+      }
+    }
+    const turns = recentTurns(limit);
+    if (turns.length === 0) {
+      console.log('(no turns recorded yet — trigger a turn through Claude Code first)');
+      return;
+    }
+    for (const t of turns) console.log(fmtTurn(t));
+    return;
+  }
+
+  if (action === 'lookup') {
+    // Flag parsing: --session <id>  OR  --trace <prefix>
+    let sessionId: string | undefined;
+    let tracePrefix: string | undefined;
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--session' && args[i + 1]) { sessionId = args[i + 1]; i++; }
+      else if (args[i] === '--trace' && args[i + 1]) { tracePrefix = args[i + 1]; i++; }
+    }
+    if (sessionId) {
+      const turns = turnsForSession(sessionId);
+      if (turns.length === 0) {
+        console.log(`(no turns recorded for session=${sessionId})`);
+        return;
+      }
+      for (const t of turns) console.log(fmtTurn(t));
+      return;
+    }
+    if (tracePrefix) {
+      const t = findByTracePrefix(tracePrefix);
+      if (!t) {
+        console.error(`No turn found with trace id prefix '${tracePrefix}'`);
+        process.exit(1);
+      }
+      console.log(fmtTurn(t));
+      return;
+    }
+    console.error('lookup requires --session <id> or --trace <prefix>');
+    process.exit(1);
+  }
+
+  console.error(`Unknown trace action: ${action}\nRun 'weave-claude-plugin trace --help' for usage.`);
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // uninstall
 // ---------------------------------------------------------------------------
 
@@ -560,6 +651,11 @@ async function main(): Promise<void> {
 
   if (cmd === 'uninstall') {
     await cmdUninstall(args.includes('--keep-logs'));
+    return;
+  }
+
+  if (cmd === 'trace') {
+    await cmdTrace(args.slice(1));
     return;
   }
 
