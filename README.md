@@ -255,25 +255,3 @@ weave-claude-code uninstall
 ```
 
 Pass `--keep-logs` to preserve the log directory.
-
----
-
-## Upgrading from v0.2.x
-
-In v0.3.0 the npm package, CLI binary, and settings directory were renamed for naming consistency. The plugin id (`weave`) and slash commands (`/weave:install`, `/weave:status`, `/weave:config`) are unchanged.
-
-| Before | After |
-|---|---|
-| `npm install -g weave-claude-plugin` | `npm install -g weave-claude-code` |
-| `weave-claude-plugin <command>` | `weave-claude-code <command>` |
-| `~/.weave_claude_plugin/` | `~/.weave-claude-code/` |
-
-This is a hard cutover — the new build does not read from the old settings directory or respond to the old binary name. To migrate:
-
-```bash
-npm uninstall -g weave-claude-plugin
-npm install -g weave-claude-code
-mv ~/.weave_claude_plugin ~/.weave-claude-code   # or re-run `weave-claude-code install`
-```
-
-Then relaunch Claude Code. The marketplace install (added via `/plugin marketplace add wandb/...`) continues to work via GitHub's repo-rename redirect, but you can re-add it under the new name if you prefer.
