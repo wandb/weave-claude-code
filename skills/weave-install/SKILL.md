@@ -74,3 +74,47 @@ weave-claude-code status
 Confirm all items show ✓. If anything shows ✗, diagnose and fix before finishing.
 
 Report the result to the user. On success, tell them that Claude Code sessions will now be automatically traced to their Weave project starting from the next session.
+
+## Updating an Existing Install
+
+Use this path when the user already has `weave-claude-plugin` installed and wants a newer version. The npm CLI binary and the Claude Code marketplace registration are two separate things — updating only one can leave Claude Code calling an old binary while its plugin UI reports "latest." Refresh both.
+
+### Step 1 — Compare installed vs. published
+
+```bash
+weave-claude-plugin --version
+npm view weave-claude-plugin version
+```
+
+If the versions match, no update is needed — stop here. Otherwise continue.
+
+### Step 2 — Upgrade the CLI
+
+```bash
+npm install -g weave-claude-plugin@latest
+```
+
+If this fails with a permission error, confirm with the user before retrying with `sudo`. Then verify:
+```bash
+weave-claude-plugin --version
+```
+
+### Step 3 — Refresh the marketplace registration
+
+```bash
+weave-claude-plugin install --force
+```
+
+`--force` is required: without it, `install` sees the existing config and skips re-registering the marketplace SHA, so Claude Code keeps pointing at the old plugin manifest.
+
+### Step 4 — Reload plugins in Claude Code
+
+Tell the user to run `/reload-plugins` in their active Claude Code session (or restart Claude Code). Until plugins reload, the running session keeps the previously-loaded version cached even though the on-disk binary has been upgraded.
+
+### Step 5 — Verify
+
+```bash
+weave-claude-plugin status
+```
+
+Confirm the `✓ CLI:` line shows the new version.
