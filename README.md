@@ -7,17 +7,17 @@ Track Claude Code sessions in [Weave](https://wandb.ai/) for observability and d
 **1. Install the CLI**
 
 ```bash
-npm install -g weave-claude-plugin
+npm install -g weave-claude-code
 ```
 
 **2. Run the installer**
 
 ```bash
-weave-claude-plugin install
+weave-claude-code install
 ```
 
 This will:
-- Create `~/.weave_claude_plugin/settings.json`
+- Create `~/.weave-claude-code/settings.json`
 - Register the plugin in Claude Code
 - Prompt for your Weave project (`entity/project`) and W&B API key if not already set
 
@@ -38,7 +38,7 @@ For CI, bootstrap scripts, or other automated systems, you can skip prompts:
 ```bash
 WEAVE_PROJECT=my-entity/my-project \
 WANDB_API_KEY=<your-api-key> \
-weave-claude-plugin install --non-interactive
+weave-claude-code install --non-interactive
 ```
 
 In non-interactive mode, the installer still creates config, registers the Claude marketplace, and installs the plugin. It does not prompt for missing values. Instead, it:
@@ -83,13 +83,13 @@ or compliance requirements, do not install or enable this plugin yet.
 
 ```bash
 # Show all current settings
-weave-claude-plugin config show
+weave-claude-code config show
 
 # Set your Weave project
-weave-claude-plugin config set weave_project my-entity/my-project
+weave-claude-code config set weave_project my-entity/my-project
 
 # Set your W&B API key
-weave-claude-plugin config set wandb_api_key <your-api-key>
+weave-claude-code config set wandb_api_key <your-api-key>
 ```
 
 You can also set these via environment variables — they take precedence over the settings file:
@@ -99,7 +99,7 @@ export WEAVE_PROJECT=my-entity/my-project
 export WANDB_API_KEY=<your-api-key>
 ```
 
-This is especially useful with `weave-claude-plugin install --non-interactive`, where the installer checks these variables instead of prompting.
+This is especially useful with `weave-claude-code install --non-interactive`, where the installer checks these variables instead of prompting.
 
 ---
 
@@ -117,7 +117,7 @@ export WANDB_BASE_URL=https://your-instance.wandb.io
 
 1. Shut down the daemon:
    ```bash
-   printf '{"command":"shutdown"}' | nc -U -w1 ~/.weave_claude_plugin/daemon.sock
+   printf '{"command":"shutdown"}' | nc -U -w1 ~/.weave-claude-code/daemon.sock
    ```
 2. Point the plugin at your instance using either approach:
 
@@ -142,7 +142,7 @@ export WANDB_BASE_URL=https://your-instance.wandb.io
 ## Check Status
 
 ```bash
-weave-claude-plugin status
+weave-claude-code status
 ```
 
 Each line shows `✓` (OK), `✗` (action needed), or `-` (not yet active but not an error).
@@ -150,16 +150,16 @@ Each line shows `✓` (OK), `✗` (action needed), or `-` (not yet active but no
 If sessions are not appearing in Weave, check the daemon log for errors:
 
 ```bash
-weave-claude-plugin logs
+weave-claude-code logs
 ```
 
 Or tail it in real time:
 
 ```bash
-weave-claude-plugin logs --follow
+weave-claude-code logs --follow
 ```
 
-The log file is also directly at `~/.weave_claude_plugin/logs/daemon.log`.
+The log file is also directly at `~/.weave-claude-code/logs/daemon.log`.
 
 ---
 
@@ -179,7 +179,7 @@ Walks through the full installation and configuration flow interactively. Use th
 
 ### `/weave:weave-status`
 
-Checks the current plugin status and explains any issues. Equivalent to running `weave-claude-plugin status` but Claude interprets the output and tells you exactly what to fix.
+Checks the current plugin status and explains any issues. Equivalent to running `weave-claude-code status` but Claude interprets the output and tells you exactly what to fix.
 
 ```
 /weave:weave-status
@@ -251,7 +251,7 @@ not available today.
 ## Uninstall
 
 ```bash
-weave-claude-plugin uninstall
+weave-claude-code uninstall
 ```
 
 Pass `--keep-logs` to preserve the log directory.

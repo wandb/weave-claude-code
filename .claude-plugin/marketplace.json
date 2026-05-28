@@ -1,13 +1,13 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "weave-claude-plugin",
+  "name": "weave-claude-code",
   "version": "0.2.2",
   "description": "Track Claude Code sessions in Weave for observability and debugging",
   "owner": {
     "name": "wandb"
   },
   "metadata": {
-    "description": "Official W&B Weave marketplace for the weave-claude plugin. Provides observability and debugging for Claude Code sessions by tracking turns, tool calls, and subagents in Weave."
+    "description": "Official W&B Weave marketplace for the weave-claude-code plugin. Provides observability and debugging for Claude Code sessions by tracking turns, tool calls, and subagents in Weave."
   },
   "plugins": [
     {
@@ -16,7 +16,7 @@
       "description": "Track Claude Code sessions in Weave for observability and debugging",
       "source": {
         "source": "github",
-        "repo": "wandb/claude_code_weave_plugin",
+        "repo": "wandb/weave-claude-code",
         "ref": "v0.2.2",
         "sha": "19389d3988ab5781fb39cc6c41e230a7649243c2"
       },

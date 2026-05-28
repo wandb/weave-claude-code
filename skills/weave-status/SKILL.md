@@ -11,7 +11,7 @@ Check the current installation and configuration status of the Weave Claude Code
 
 Run:
 ```bash
-weave-claude-plugin status
+weave-claude-code status
 ```
 
 ## Interpret Results
@@ -26,7 +26,7 @@ Each status line indicates one of three states:
 | Symptom | Fix |
 |---------|-----|
 | `✗ Configuration: not found` | Run `/weave:weave-install` to complete installation |
-| `✗ CLI: not found in PATH` | Run `npm install -g weave-claude-plugin` in a terminal |
+| `✗ CLI: not found in PATH` | Run `npm install -g weave-claude-code` in a terminal |
 | `✗ Weave project: not configured` | Run `/weave:weave-config set weave_project ENTITY/PROJECT` |
 | `- Daemon socket: not running` | Normal if no Claude Code session is active; daemon starts automatically on next hook event |
 | `- Log file: not created yet` | Normal before first session; no action needed |

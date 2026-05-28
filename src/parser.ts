@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 // SPDX-License-Identifier: MIT
-// SPDX-PackageName: weave-claude-plugin
+// SPDX-PackageName: weave-claude-code
 
 import * as fs from 'fs';
 

@@ -1,11 +1,11 @@
 {
-  "name": "weave-claude-plugin",
+  "name": "weave-claude-code",
   "version": "0.2.2",
   "description": "Track Claude Code sessions in Weave for observability and debugging",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "weave-claude-plugin": "dist/cli.js"
+    "weave-claude-code": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && node scripts/build/copy-version-module.mjs",
@@ -42,7 +42,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wandb/claude_code_weave_plugin.git"
+    "url": "git+https://github.com/wandb/weave-claude-code.git"
   },
   "license": "MIT"
 }
