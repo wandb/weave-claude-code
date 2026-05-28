@@ -43,6 +43,12 @@ export enum PluginStatus {
 export interface PluginResult {
   marketplaceStatus: MarketplaceStatus;
   pluginStatus: PluginStatus;
+  /** True when the marketplace ref drifted and `claude plugin update` was invoked to upgrade the installed plugin. */
+  pluginUpdated: boolean;
+  /** The marketplace ref Claude Code had registered before this run (null if not previously registered). */
+  refBefore: string | null;
+  /** The marketplace ref Claude Code has registered after this run. */
+  refAfter: string | null;
 }
 
 export enum RemovalStatus {
@@ -103,11 +109,35 @@ export function createConfig(configDir: string): ConfigResult {
 }
 
 /**
+ * Read the ref Claude Code has registered for the given marketplace, or null
+ * if the marketplace isn't registered. Used to detect drift when re-running
+ * `install` after a CLI upgrade: a new binary's MARKETPLACE_REF may differ from
+ * what Claude Code last cached, in which case the installed plugin is stale
+ * and needs a follow-up `claude plugin update`.
+ */
+export function readRegisteredMarketplaceRef(marketplaceName: string): string | null {
+  const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
+  if (!fs.existsSync(knownPath)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(knownPath, 'utf8')) as Record<string, { source?: { ref?: string } }>;
+    return data[marketplaceName]?.source?.ref ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Register the marketplace in Claude Code and install the plugin at user scope.
  *
  * Requires the `claude` CLI to be in PATH. Throws (and writes to logFile) on
  * any unrecoverable error. Idempotent — "already registered/installed" is not
  * treated as an error.
+ *
+ * When the marketplace ref drifts between runs (eg. the CLI was upgraded via
+ * `npm install -g weave-claude-plugin@latest`, bumping `MARKETPLACE_REF` from
+ * `v0.2.0` to `v0.2.2`), `claude plugin install` is a no-op for the already-
+ * installed plugin and the loaded version stays pinned. This function detects
+ * that drift and runs `claude plugin update` to actually upgrade the plugin.
  */
 export function registerPlugin(logFile: string): PluginResult {
   const claudePath = findClaudeCLI();
@@ -121,6 +151,8 @@ export function registerPlugin(logFile: string): PluginResult {
     appendToLog(logFile, 'ERROR', msg);
     throw new Error(msg);
   }
+
+  const refBefore = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
 
   // Register marketplace
   const mktResult = spawnSync(
@@ -136,6 +168,9 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
+  const refAfter = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
+  const refDrifted = refBefore !== null && refBefore !== refAfter;
+
   // Install plugin at user scope
   const pluginResult = spawnSync(
     claudePath,
@@ -150,9 +185,32 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
+  // Marketplace ref drifted and the plugin was already there at the old ref —
+  // `plugin install` is idempotent and would leave it pinned to the old version,
+  // so explicitly upgrade. Fresh installs (refBefore === null) take the normal
+  // `plugin install` path above and don't need this.
+  let pluginUpdated = false;
+  if (refDrifted && pluginAlready) {
+    const updateResult = spawnSync(
+      claudePath,
+      ['plugin', 'update', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    if (updateResult.status !== 0) {
+      const output = ((updateResult.stderr ?? '') + (updateResult.stdout ?? '')).trim();
+      const msg = `Failed to update plugin '${PLUGIN_NAME}': ${output}`;
+      appendToLog(logFile, 'ERROR', msg);
+      throw new Error(msg);
+    }
+    pluginUpdated = true;
+  }
+
   return {
     marketplaceStatus: mktAlready ? MarketplaceStatus.AlreadyRegistered : MarketplaceStatus.Registered,
     pluginStatus: pluginAlready ? PluginStatus.AlreadyInstalled : PluginStatus.Installed,
+    pluginUpdated,
+    refBefore,
+    refAfter,
   };
 }
 

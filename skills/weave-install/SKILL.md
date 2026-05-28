@@ -77,7 +77,7 @@ Report the result to the user. On success, tell them that Claude Code sessions w
 
 ## Updating an Existing Install
 
-Use this path when the user already has `weave-claude-plugin` installed and wants a newer version. The npm CLI binary and the Claude Code marketplace registration are two separate things — updating only one can leave Claude Code calling an old binary while its plugin UI reports "latest." Refresh both.
+Use this path when the user already has `weave-claude-plugin` installed and wants a newer version.
 
 ### Step 1 — Compare installed vs. published
 
@@ -88,30 +88,22 @@ npm view weave-claude-plugin version
 
 If the versions match, no update is needed — stop here. Otherwise continue.
 
-### Step 2 — Upgrade the CLI
+### Step 2 — Upgrade the CLI and refresh registration
 
 ```bash
 npm install -g weave-claude-plugin@latest
+weave-claude-plugin install
 ```
 
-If this fails with a permission error, confirm with the user before retrying with `sudo`. Then verify:
-```bash
-weave-claude-plugin --version
-```
+The second command does the heavy lifting: the upgraded binary has a new `MARKETPLACE_REF` baked in, so `install` re-registers Claude Code's marketplace pin at the new git tag and — when it detects the installed plugin is now behind — runs `claude plugin update` to actually upgrade it. Watch the output for a `Marketplace refreshed (vOLD → vNEW)` line followed by `Plugin updated`. If `install` fails with a permission error on the npm step, confirm with the user before retrying with `sudo`.
 
-### Step 3 — Refresh the marketplace registration
+No `--force` is needed. No manual `claude plugin marketplace remove` is needed.
 
-```bash
-weave-claude-plugin install --force
-```
+### Step 3 — Restart Claude Code
 
-`--force` is required: without it, `install` sees the existing config and skips re-registering the marketplace SHA, so Claude Code keeps pointing at the old plugin manifest.
+The new plugin code only loads on the next Claude Code start. Tell the user to either run `/reload-plugins` in their active session or fully restart Claude Code. Until then, the running session keeps the previously-loaded version cached even though everything on disk has been upgraded.
 
-### Step 4 — Reload plugins in Claude Code
-
-Tell the user to run `/reload-plugins` in their active Claude Code session (or restart Claude Code). Until plugins reload, the running session keeps the previously-loaded version cached even though the on-disk binary has been upgraded.
-
-### Step 5 — Verify
+### Step 4 — Verify
 
 ```bash
 weave-claude-plugin status

@@ -104,8 +104,21 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
     process.exit(1);
   }
 
-  console.log(`✓ Marketplace ${pluginResult.marketplaceStatus === MarketplaceStatus.AlreadyRegistered ? 'already registered' : 'registered'}`);
-  console.log(`✓ Plugin ${pluginResult.pluginStatus === PluginStatus.AlreadyInstalled ? 'already installed' : 'installed'}`);
+  if (pluginResult.marketplaceStatus === MarketplaceStatus.AlreadyRegistered) {
+    console.log(`✓ Marketplace already registered (${pluginResult.refAfter ?? 'unknown ref'})`);
+  } else if (pluginResult.refBefore && pluginResult.refBefore !== pluginResult.refAfter) {
+    console.log(`✓ Marketplace refreshed (${pluginResult.refBefore} → ${pluginResult.refAfter})`);
+  } else {
+    console.log(`✓ Marketplace registered (${pluginResult.refAfter ?? 'unknown ref'})`);
+  }
+
+  if (pluginResult.pluginUpdated) {
+    console.log(`✓ Plugin updated — restart Claude Code to apply`);
+  } else if (pluginResult.pluginStatus === PluginStatus.AlreadyInstalled) {
+    console.log(`✓ Plugin already installed`);
+  } else {
+    console.log(`✓ Plugin installed`);
+  }
 
   // Interactive prompts for missing config
   let settings: Settings;
