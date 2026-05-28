@@ -93,62 +93,56 @@ afterEach(() => {
   fs.rmSync(tmpHome, { recursive: true, force: true });
 });
 
-suite('registerPlugin — fresh install', () => {
-  test('registers marketplace and installs plugin; no follow-up update', async () => {
+suite('registerPlugin', () => {
+  test('fresh install: registers + installs, no follow-up update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
 
-    const logFile = path.join(tmpHome, 'log.txt');
-    const result = registerPlugin(logFile);
+    const result = registerPlugin(path.join(tmpHome, 'log.txt'));
 
-    assert.equal(result.refBefore, null, 'no prior registration');
-    assert.equal(result.refAfter, MARKETPLACE_REF, 'registered at current MARKETPLACE_REF');
-    assert.equal(result.pluginUpdated, false, 'fresh install never needs `plugin update`');
+    assert.equal(result.refBefore, null);
+    assert.equal(result.refAfter, MARKETPLACE_REF);
+    assert.equal(result.pluginUpdated, false);
 
     const calls = readFakeCalls(tmpHome);
-    assert.ok(calls.some((c) => c.startsWith('plugin marketplace add')), 'marketplace add was called');
-    assert.ok(calls.some((c) => c.startsWith('plugin install')), 'plugin install was called');
-    assert.ok(!calls.some((c) => c.startsWith('plugin update')), 'plugin update was NOT called');
+    assert.ok(calls.some((c) => c.startsWith('plugin marketplace add')), 'marketplace add called');
+    assert.ok(calls.some((c) => c.startsWith('plugin install')), 'plugin install called');
+    assert.ok(!calls.some((c) => c.startsWith('plugin update')), 'plugin update NOT called');
   });
-});
 
-suite('registerPlugin — idempotent re-run', () => {
-  test('same ref already registered: no plugin update', async () => {
+  test('idempotent re-run: same ref already registered → no plugin update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
 
     seedKnownMarketplace(tmpHome, MARKETPLACE_REF);
     seedInstalledPlugin(tmpHome);
 
-    const logFile = path.join(tmpHome, 'log.txt');
-    const result = registerPlugin(logFile);
+    const result = registerPlugin(path.join(tmpHome, 'log.txt'));
 
-    assert.equal(result.refBefore, MARKETPLACE_REF, 'old ref captured');
-    assert.equal(result.refAfter, MARKETPLACE_REF, 'ref unchanged');
-    assert.equal(result.pluginUpdated, false, 'no drift → no `plugin update`');
-
-    const calls = readFakeCalls(tmpHome);
-    assert.ok(!calls.some((c) => c.startsWith('plugin update')), 'plugin update was NOT called');
+    assert.equal(result.refBefore, MARKETPLACE_REF);
+    assert.equal(result.refAfter, MARKETPLACE_REF);
+    assert.equal(result.pluginUpdated, false);
+    assert.ok(
+      !readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')),
+      'plugin update NOT called',
+    );
   });
-});
 
-suite('registerPlugin — ref drift after CLI upgrade', () => {
-  test('old ref present, current binary refreshes ref, plugin update is invoked', async () => {
+  test('ref drift after CLI upgrade: refresh marketplace + invoke plugin update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
 
     const OLD_REF = 'v0.0.1';
     assert.notEqual(OLD_REF, MARKETPLACE_REF, 'sanity: old ref must differ from current MARKETPLACE_REF');
-
     seedKnownMarketplace(tmpHome, OLD_REF);
     seedInstalledPlugin(tmpHome);
 
-    const logFile = path.join(tmpHome, 'log.txt');
-    const result = registerPlugin(logFile);
+    const result = registerPlugin(path.join(tmpHome, 'log.txt'));
 
-    assert.equal(result.refBefore, OLD_REF, 'pre-add ref captured');
-    assert.equal(result.refAfter, MARKETPLACE_REF, 'post-add ref is the new MARKETPLACE_REF');
-    assert.equal(result.pluginUpdated, true, 'drift + already-installed → `plugin update` invoked');
-
-    const calls = readFakeCalls(tmpHome);
-    assert.ok(calls.some((c) => c.startsWith('plugin update')), 'plugin update WAS called');
+    assert.equal(result.refBefore, OLD_REF);
+    assert.equal(result.refAfter, MARKETPLACE_REF);
+    assert.equal(result.pluginUpdated, true);
+    assert.ok(
+      readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')),
+      'plugin update WAS called',
+    );
   });
 });
 
