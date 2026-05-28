@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 // SPDX-License-Identifier: MIT
-// SPDX-PackageName: weave-claude-plugin
+// SPDX-PackageName: weave-claude-code
 
-// Tests for the marketplace ref-drift detection in registerPlugin.
+// Tests for marketplace-ref-drift detection in registerPlugin.
 //
 // When the npm CLI is upgraded after a previous install, the binary's new
 // MARKETPLACE_REF differs from what Claude Code last cached in
@@ -10,10 +10,14 @@
 // leave the installed plugin pinned to the old version. registerPlugin must
 // detect that drift and follow up with `claude plugin update`.
 //
+// (Note: the cross-rename migration from `weave-claude-plugin` →
+// `weave-claude-code` does NOT live in the binary — the weave-install skill
+// owns it. See skills/weave-install/SKILL.md, "Updating an Existing Install".)
+//
 // Setup: a fake `claude` binary (tests/fixtures/fake-claude-bin/claude) tracks
-// marketplace registrations and installed plugins under a per-test HOME. Tests
-// pre-populate that state to simulate the three scenarios (fresh, idempotent,
-// drift) and assert on the returned PluginResult plus a call log.
+// marketplace and plugin state under a per-test HOME. Tests pre-populate that
+// state to simulate the three scenarios (fresh, idempotent, drift) and assert
+// on the returned PluginResult plus a call log.
 
 import { test, suite, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,11 +25,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { MARKETPLACE_NAME } from '../src/setup.ts';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE_BIN_DIR = path.join(HERE, 'fixtures', 'fake-claude-bin');
 
-const MARKETPLACE_NAME = 'weave-claude-plugin';
-const PLUGIN_SPEC = 'weave@weave-claude-plugin';
+const PLUGIN_SPEC = `weave@${MARKETPLACE_NAME}`;
 
 function readFakeCalls(home: string): string[] {
   const p = path.join(home, '.claude', 'fake-claude-calls.log');
@@ -40,7 +45,7 @@ function seedKnownMarketplace(home: string, ref: string): void {
     path.join(dir, 'known_marketplaces.json'),
     JSON.stringify({
       [MARKETPLACE_NAME]: {
-        source: { source: 'github', repo: 'wandb/claude_code_weave_plugin', ref },
+        source: { source: 'github', repo: 'wandb/weave-claude-code', ref },
         installLocation: path.join(dir, 'marketplaces', MARKETPLACE_NAME),
         lastUpdated: '2026-01-01T00:00:00Z',
       },
