@@ -1,4 +1,4 @@
 // BEGIN AUTO-MANAGED VERSION
 // This section is maintained by release automation. Do not edit manually.
-export const VERSION = '0.2.3';
+export const VERSION = '0.2.4';
 // END AUTO-MANAGED VERSION
