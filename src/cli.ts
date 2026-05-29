@@ -136,7 +136,7 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
     }
 
     if (envApiKey) {
-      console.warn(`⚠ Using WANDB_API_KEY from environment: ${envApiKey.slice(0, 4)}…`);
+      console.warn(`⚠ Using WANDB_API_KEY from environment: ${maskSecret(envApiKey)}`);
     } else if (!effectiveApiKey) {
       console.warn('- WANDB_API_KEY not set. Run: weave-claude-code config set wandb_api_key <your-api-key>');
     }
@@ -164,7 +164,7 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
         settings = loadSettings();
         settings.wandb_api_key = value;
         saveSettings(settings);
-        console.log(`✓ Set wandb_api_key = ${value.slice(0, 4)}…`);
+        console.log(`✓ Set wandb_api_key = ${maskSecret(value)}`);
       } else {
         console.log('- Skipped wandb_api_key (set later: weave-claude-code config set wandb_api_key <key>)');
       }
