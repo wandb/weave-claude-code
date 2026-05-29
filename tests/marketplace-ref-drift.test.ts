@@ -2,22 +2,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Tests for marketplace-ref-drift detection in registerPlugin.
-//
-// When the npm CLI is upgraded after a previous install, the binary's new
-// MARKETPLACE_REF differs from what Claude Code last cached in
-// known_marketplaces.json. `claude plugin install` is idempotent and would
-// leave the installed plugin pinned to the old version. registerPlugin must
-// detect that drift and follow up with `claude plugin update`.
-//
-// (Note: the cross-rename migration from `weave-claude-plugin` →
-// `weave-claude-code` does NOT live in the binary — the weave-install skill
-// owns it. See skills/weave-install/SKILL.md, "Updating an Existing Install".)
-//
-// Setup: a fake `claude` binary (tests/fixtures/fake-claude-bin/claude) tracks
-// marketplace and plugin state under a per-test HOME. Tests pre-populate that
-// state to simulate the three scenarios (fresh, idempotent, drift) and assert
-// on the returned PluginResult plus a call log.
+// registerPlugin ref-drift: a CLI upgrade that changes MARKETPLACE_REF must
+// follow `plugin install` with `plugin update` to refresh the loaded plugin.
 
 import { test, suite, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -29,8 +15,8 @@ import { MARKETPLACE_NAME } from '../src/setup.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE_BIN_DIR = path.join(HERE, 'fixtures', 'fake-claude-bin');
-
 const PLUGIN_SPEC = `weave@${MARKETPLACE_NAME}`;
+const KNOWN_MARKETPLACES_REL = path.join('.claude', 'plugins', 'known_marketplaces.json');
 
 function readFakeCalls(home: string): string[] {
   const p = path.join(home, '.claude', 'fake-claude-calls.log');
@@ -67,16 +53,11 @@ let savedPath: string | undefined;
 let savedMktName: string | undefined;
 
 beforeEach(() => {
-  // Git clone occasionally drops the executable bit on shell scripts; re-stamp
-  // so the fixture is invokable regardless of how the repo was checked out.
   fs.chmodSync(path.join(FAKE_CLAUDE_BIN_DIR, 'claude'), 0o755);
-
   tmpHome = fs.mkdtempSync('/tmp/wcp-marketplace-test-');
-
   savedHome = process.env.HOME;
   savedPath = process.env.PATH;
   savedMktName = process.env.FAKE_CLAUDE_MARKETPLACE_NAME;
-
   process.env.HOME = tmpHome;
   process.env.PATH = `${FAKE_CLAUDE_BIN_DIR}:${process.env.PATH}`;
   process.env.FAKE_CLAUDE_MARKETPLACE_NAME = MARKETPLACE_NAME;
@@ -89,29 +70,25 @@ afterEach(() => {
   else process.env.PATH = savedPath;
   if (savedMktName === undefined) delete process.env.FAKE_CLAUDE_MARKETPLACE_NAME;
   else process.env.FAKE_CLAUDE_MARKETPLACE_NAME = savedMktName;
-
   fs.rmSync(tmpHome, { recursive: true, force: true });
 });
 
 suite('registerPlugin', () => {
-  test('fresh install: registers + installs, no follow-up update', async () => {
+  test('fresh install: register + install, no update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
-
     const result = registerPlugin(path.join(tmpHome, 'log.txt'));
 
     assert.equal(result.refBefore, null);
     assert.equal(result.refAfter, MARKETPLACE_REF);
     assert.equal(result.pluginUpdated, false);
-
     const calls = readFakeCalls(tmpHome);
-    assert.ok(calls.some((c) => c.startsWith('plugin marketplace add')), 'marketplace add called');
-    assert.ok(calls.some((c) => c.startsWith('plugin install')), 'plugin install called');
-    assert.ok(!calls.some((c) => c.startsWith('plugin update')), 'plugin update NOT called');
+    assert.ok(calls.some((c) => c.startsWith('plugin marketplace add')));
+    assert.ok(calls.some((c) => c.startsWith('plugin install')));
+    assert.ok(!calls.some((c) => c.startsWith('plugin update')));
   });
 
-  test('idempotent re-run: same ref already registered → no plugin update', async () => {
+  test('idempotent re-run: same ref → no update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
-
     seedKnownMarketplace(tmpHome, MARKETPLACE_REF);
     seedInstalledPlugin(tmpHome);
 
@@ -120,17 +97,13 @@ suite('registerPlugin', () => {
     assert.equal(result.refBefore, MARKETPLACE_REF);
     assert.equal(result.refAfter, MARKETPLACE_REF);
     assert.equal(result.pluginUpdated, false);
-    assert.ok(
-      !readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')),
-      'plugin update NOT called',
-    );
+    assert.ok(!readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')));
   });
 
-  test('ref drift after CLI upgrade: refresh marketplace + invoke plugin update', async () => {
+  test('ref drift: refresh marketplace + plugin update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
-
     const OLD_REF = 'v0.0.1';
-    assert.notEqual(OLD_REF, MARKETPLACE_REF, 'sanity: old ref must differ from current MARKETPLACE_REF');
+    assert.notEqual(OLD_REF, MARKETPLACE_REF);
     seedKnownMarketplace(tmpHome, OLD_REF);
     seedInstalledPlugin(tmpHome);
 
@@ -139,36 +112,19 @@ suite('registerPlugin', () => {
     assert.equal(result.refBefore, OLD_REF);
     assert.equal(result.refAfter, MARKETPLACE_REF);
     assert.equal(result.pluginUpdated, true);
-    assert.ok(
-      readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')),
-      'plugin update WAS called',
-    );
+    assert.ok(readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')));
   });
 });
 
-suite('readRegisteredMarketplaceRef', () => {
-  test('returns null when known_marketplaces.json is absent', async () => {
-    const { readRegisteredMarketplaceRef } = await import('../src/setup.ts');
-    assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), null);
-  });
+test('readRegisteredMarketplaceRef: file/key/parse edge cases', async () => {
+  const { readRegisteredMarketplaceRef } = await import('../src/setup.ts');
 
-  test('returns the registered ref when present', async () => {
-    const { readRegisteredMarketplaceRef } = await import('../src/setup.ts');
-    seedKnownMarketplace(tmpHome, 'v9.9.9');
-    assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), 'v9.9.9');
-  });
+  assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), null);
 
-  test('returns null when the marketplace name is absent from the file', async () => {
-    const { readRegisteredMarketplaceRef } = await import('../src/setup.ts');
-    seedKnownMarketplace(tmpHome, 'v1.0.0');
-    assert.equal(readRegisteredMarketplaceRef('some-other-marketplace'), null);
-  });
+  seedKnownMarketplace(tmpHome, 'v9.9.9');
+  assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), 'v9.9.9');
+  assert.equal(readRegisteredMarketplaceRef('some-other-marketplace'), null);
 
-  test('returns null when the file is malformed JSON', async () => {
-    const { readRegisteredMarketplaceRef } = await import('../src/setup.ts');
-    const dir = path.join(tmpHome, '.claude', 'plugins');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'known_marketplaces.json'), '{ not valid json');
-    assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), null);
-  });
+  fs.writeFileSync(path.join(tmpHome, KNOWN_MARKETPLACES_REL), '{ not valid json');
+  assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), null);
 });
