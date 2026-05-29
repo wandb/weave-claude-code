@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+// SPDX-License-Identifier: MIT
+// SPDX-PackageName: weave-claude-code
+
+// Stand-in for `claude` CLI used by registerPlugin tests. Tracks marketplace and
+// plugin state under $HOME/.claude/ and mimics the real CLI's behavior for the
+// three subcommands registerPlugin invokes:
+//
+//   plugin marketplace add <repo>#<ref>   — writes known_marketplaces.json; prints
+//                                            "already on disk" when ref unchanged,
+//                                            otherwise overwrites the registration.
+//   plugin install <plugin>@<marketplace> — tracks installed plugins; prints
+//                                            "already installed" on re-run.
+//   plugin update <plugin>@<marketplace>  — succeeds only if the plugin is already
+//                                            installed; logs the call so tests can
+//                                            assert it was invoked.
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+const args = process.argv.slice(2);
+const home = process.env.HOME;
+if (!home) {
+  console.error('fake-claude: HOME must be set');
+  process.exit(2);
+}
+
+const knownPath = path.join(home, '.claude', 'plugins', 'known_marketplaces.json');
+const installedPath = path.join(home, '.claude', 'fake-claude-installed-plugins.json');
+const callLogPath = path.join(home, '.claude', 'fake-claude-calls.log');
+
+function readJSON(p) {
+  if (!fs.existsSync(p)) return {};
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+function writeJSON(p, data) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(data, null, 2));
+}
+function logCall() {
+  fs.mkdirSync(path.dirname(callLogPath), { recursive: true });
+  fs.appendFileSync(callLogPath, args.join(' ') + '\n');
+}
+
+logCall();
+
+// plugin marketplace add <source>
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const source = args[3];
+  const m = source.match(/^([^#]+)(?:#(.+))?$/);
+  if (!m) {
+    console.error(`fake-claude: invalid source ${source}`);
+    process.exit(1);
+  }
+  const repo = m[1];
+  const ref = m[2] ?? null;
+  // Tests inject the marketplace NAME via env var since the real CLI derives it
+  // from cloning the repo and reading marketplace.json — too much for a fixture.
+  const name = process.env.FAKE_CLAUDE_MARKETPLACE_NAME;
+  if (!name) {
+    console.error('fake-claude: FAKE_CLAUDE_MARKETPLACE_NAME must be set');
+    process.exit(2);
+  }
+  const known = readJSON(knownPath);
+  const existing = known[name];
+  if (existing && existing.source && existing.source.ref === ref) {
+    console.log(`✔ Marketplace '${name}' already on disk`);
+    process.exit(0);
+  }
+  known[name] = {
+    source: { source: 'github', repo, ...(ref ? { ref } : {}) },
+    installLocation: path.join(home, '.claude', 'plugins', 'marketplaces', name),
+    lastUpdated: new Date().toISOString(),
+  };
+  writeJSON(knownPath, known);
+  console.log(`✔ Successfully added marketplace: ${name}`);
+  process.exit(0);
+}
+
+// plugin install <plugin>@<marketplace> --scope user
+if (args[0] === 'plugin' && args[1] === 'install') {
+  const spec = args[2];
+  const installed = readJSON(installedPath);
+  if (installed[spec]) {
+    console.log(`✔ Plugin "${spec}" is already installed`);
+    process.exit(0);
+  }
+  installed[spec] = { installedAt: new Date().toISOString() };
+  writeJSON(installedPath, installed);
+  console.log(`✔ Installed plugin "${spec}"`);
+  process.exit(0);
+}
+
+// plugin update <plugin>@<marketplace> --scope user
+if (args[0] === 'plugin' && args[1] === 'update') {
+  const spec = args[2];
+  const installed = readJSON(installedPath);
+  if (!installed[spec]) {
+    console.error(`✘ Plugin "${spec}" not found`);
+    process.exit(1);
+  }
+  installed[spec].lastUpdated = new Date().toISOString();
+  writeJSON(installedPath, installed);
+  console.log(`✔ Plugin updated`);
+  process.exit(0);
+}
+
+console.error(`fake-claude: unknown args: ${args.join(' ')}`);
+process.exit(2);

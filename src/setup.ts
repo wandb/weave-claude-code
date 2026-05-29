@@ -36,13 +36,24 @@ export enum MarketplaceStatus {
 export enum PluginStatus {
   /** Plugin was freshly installed at user scope on this run. */
   Installed = 'installed',
-  /** Plugin was already installed — no change made. */
+  /**
+   * `claude plugin install` was a no-op because the plugin was already
+   * registered at user scope. Independent of `pluginUpdated` on the result:
+   * even when this value is returned, the drift path may have followed up
+   * with `claude plugin update` — check `pluginUpdated` for the upgrade signal.
+   */
   AlreadyInstalled = 'already_installed',
 }
 
 export interface PluginResult {
   marketplaceStatus: MarketplaceStatus;
   pluginStatus: PluginStatus;
+  /** True when the marketplace ref drifted and `claude plugin update` was invoked to upgrade the installed plugin. */
+  pluginUpdated: boolean;
+  /** The marketplace ref Claude Code had registered before this run (null if not previously registered). */
+  refBefore: string | null;
+  /** The marketplace ref Claude Code has registered after this run. */
+  refAfter: string | null;
 }
 
 export enum RemovalStatus {
@@ -103,11 +114,36 @@ export function createConfig(configDir: string): ConfigResult {
 }
 
 /**
+ * Read the ref Claude Code has registered for the given marketplace, or null
+ * if the marketplace isn't registered. Used to detect drift when re-running
+ * `install` after a CLI upgrade: a new binary's MARKETPLACE_REF may differ from
+ * what Claude Code last cached, in which case the installed plugin is stale
+ * and needs a follow-up `claude plugin update`.
+ */
+export function readRegisteredMarketplaceRef(marketplaceName: string): string | null {
+  const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
+  if (!fs.existsSync(knownPath)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(knownPath, 'utf8')) as Record<string, { source?: { ref?: string } }>;
+    return data[marketplaceName]?.source?.ref ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Register the marketplace in Claude Code and install the plugin at user scope.
  *
  * Requires the `claude` CLI to be in PATH. Throws (and writes to logFile) on
- * any unrecoverable error. Idempotent — "already registered/installed" is not
- * treated as an error.
+ * any unrecoverable error. "Already registered/installed" is not treated as
+ * an error.
+ *
+ * Convergent rather than strictly idempotent: a repeat call with the same
+ * binary version is a no-op, but a repeat call with an upgraded binary (whose
+ * `MARKETPLACE_REF` differs from what Claude Code has cached) will follow up
+ * with `claude plugin update` to bring the installed plugin in line with the
+ * refreshed marketplace. Final state is always "marketplace at current
+ * MARKETPLACE_REF, plugin at the version that marketplace advertises."
  */
 export function registerPlugin(logFile: string): PluginResult {
   const claudePath = findClaudeCLI();
@@ -121,6 +157,8 @@ export function registerPlugin(logFile: string): PluginResult {
     appendToLog(logFile, 'ERROR', msg);
     throw new Error(msg);
   }
+
+  const refBefore = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
 
   // Register marketplace
   const mktResult = spawnSync(
@@ -136,6 +174,9 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
+  const refAfter = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
+  const refDrifted = refBefore !== null && refBefore !== refAfter;
+
   // Install plugin at user scope
   const pluginResult = spawnSync(
     claudePath,
@@ -150,10 +191,46 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
+  const { updated: pluginUpdated } = maybeUpdateOutdatedPlugin(claudePath, logFile, refDrifted, pluginAlready);
+
   return {
     marketplaceStatus: mktAlready ? MarketplaceStatus.AlreadyRegistered : MarketplaceStatus.Registered,
     pluginStatus: pluginAlready ? PluginStatus.AlreadyInstalled : PluginStatus.Installed,
+    pluginUpdated,
+    refBefore,
+    refAfter,
   };
+}
+
+/**
+ * Follow `claude plugin install` with `claude plugin update` when the
+ * marketplace ref drifted but the plugin was already there at the old ref —
+ * `install` short-circuits as "already installed" without re-pulling from the
+ * refreshed marketplace. Fresh installs (refBefore === null) don't need this:
+ * `install` installs from the freshly-registered marketplace. `claude plugin
+ * marketplace remove` removes the plugin too, so refBefore === null with
+ * pluginAlready === true isn't reachable through normal CLI use.
+ */
+function maybeUpdateOutdatedPlugin(
+  claudePath: string,
+  logFile: string,
+  refDrifted: boolean,
+  pluginAlready: boolean,
+): { updated: boolean } {
+  if (!(refDrifted && pluginAlready)) return { updated: false };
+
+  const updateResult = spawnSync(
+    claudePath,
+    ['plugin', 'update', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  if (updateResult.status !== 0) {
+    const output = ((updateResult.stderr ?? '') + (updateResult.stdout ?? '')).trim();
+    const msg = `Failed to update plugin '${PLUGIN_NAME}': ${output}`;
+    appendToLog(logFile, 'ERROR', msg);
+    throw new Error(msg);
+  }
+  return { updated: true };
 }
 
 /**
