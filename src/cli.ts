@@ -186,6 +186,14 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
 // config
 // ---------------------------------------------------------------------------
 
+// Single source of truth for how secret values appear in user-facing output.
+// `config show`, `config set`, and `status` all route the API key through here
+// so a future change to the mask format (or to the set of sensitive keys) only
+// touches one place.
+function maskSecret(value: string): string {
+  return `${value.slice(0, 4)}…`;
+}
+
 async function cmdConfig(args: string[]): Promise<void> {
   const action = args[0];
 
@@ -211,7 +219,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       : settings.wandb_api_key
         ? 'settings.json'
         : 'not set';
-    const apiKeyDisplay = effectiveApiKey ? `${effectiveApiKey.slice(0, 4)}… [${apiKeySource}]` : `(not set)`;
+    const apiKeyDisplay = effectiveApiKey ? `${maskSecret(effectiveApiKey)} [${apiKeySource}]` : `(not set)`;
 
     console.log('Current configuration:');
     console.log(`  log_file:      ${settings.log_file}`);
@@ -289,7 +297,10 @@ async function cmdConfig(args: string[]): Promise<void> {
     const coerced = key === 'debug' ? value === 'true' : value;
     (settings as unknown as Record<string, unknown>)[key] = coerced;
     saveSettings(settings);
-    console.log(`✓ Set ${key} = ${value}`);
+    const displayValue = key === 'wandb_api_key' && typeof coerced === 'string'
+      ? maskSecret(coerced)
+      : coerced;
+    console.log(`✓ Set ${key} = ${displayValue}`);
     return;
   }
 
@@ -345,7 +356,7 @@ async function cmdStatus(): Promise<void> {
   const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
   if (effectiveApiKey) {
     const apiKeySource = process.env['WANDB_API_KEY'] ? 'WANDB_API_KEY env var' : 'settings.json';
-    console.log(`✓ W&B API key: ${effectiveApiKey.slice(0, 4)}… (from ${apiKeySource})`);
+    console.log(`✓ W&B API key: ${maskSecret(effectiveApiKey)} (from ${apiKeySource})`);
   } else {
     console.log('✗ W&B API key: not configured');
     console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
