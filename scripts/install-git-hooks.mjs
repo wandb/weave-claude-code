@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+// SPDX-License-Identifier: MIT
+// SPDX-PackageName: weave-claude-plugin
+
 import { spawnSync } from 'node:child_process';
 
 const result = spawnSync('git', ['config', 'core.hooksPath', '.githooks'], {
