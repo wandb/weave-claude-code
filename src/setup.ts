@@ -191,28 +191,7 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
-  // Marketplace ref drifted and the plugin was already there at the old ref —
-  // `plugin install` short-circuits as "already installed" without re-pulling
-  // from the refreshed marketplace, so explicitly run `plugin update`. Fresh
-  // installs (refBefore === null) don't need this: `plugin install` above
-  // installs from the freshly-registered marketplace. `claude plugin
-  // marketplace remove` removes the plugin too, so refBefore === null with
-  // pluginAlready === true isn't reachable through normal CLI use.
-  let pluginUpdated = false;
-  if (refDrifted && pluginAlready) {
-    const updateResult = spawnSync(
-      claudePath,
-      ['plugin', 'update', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
-    );
-    if (updateResult.status !== 0) {
-      const output = ((updateResult.stderr ?? '') + (updateResult.stdout ?? '')).trim();
-      const msg = `Failed to update plugin '${PLUGIN_NAME}': ${output}`;
-      appendToLog(logFile, 'ERROR', msg);
-      throw new Error(msg);
-    }
-    pluginUpdated = true;
-  }
+  const { updated: pluginUpdated } = maybeUpdateOutdatedPlugin(claudePath, logFile, refDrifted, pluginAlready);
 
   return {
     marketplaceStatus: mktAlready ? MarketplaceStatus.AlreadyRegistered : MarketplaceStatus.Registered,
@@ -221,6 +200,37 @@ export function registerPlugin(logFile: string): PluginResult {
     refBefore,
     refAfter,
   };
+}
+
+/**
+ * Follow `claude plugin install` with `claude plugin update` when the
+ * marketplace ref drifted but the plugin was already there at the old ref —
+ * `install` short-circuits as "already installed" without re-pulling from the
+ * refreshed marketplace. Fresh installs (refBefore === null) don't need this:
+ * `install` installs from the freshly-registered marketplace. `claude plugin
+ * marketplace remove` removes the plugin too, so refBefore === null with
+ * pluginAlready === true isn't reachable through normal CLI use.
+ */
+function maybeUpdateOutdatedPlugin(
+  claudePath: string,
+  logFile: string,
+  refDrifted: boolean,
+  pluginAlready: boolean,
+): { updated: boolean } {
+  if (!(refDrifted && pluginAlready)) return { updated: false };
+
+  const updateResult = spawnSync(
+    claudePath,
+    ['plugin', 'update', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  if (updateResult.status !== 0) {
+    const output = ((updateResult.stderr ?? '') + (updateResult.stdout ?? '')).trim();
+    const msg = `Failed to update plugin '${PLUGIN_NAME}': ${output}`;
+    appendToLog(logFile, 'ERROR', msg);
+    throw new Error(msg);
+  }
+  return { updated: true };
 }
 
 /**

@@ -94,7 +94,7 @@ On success, tell the user Claude Code sessions will now be traced to their Weave
 
 The package was renamed in #63 (v0.2.3). Users on v0.2.0–v0.2.2 installed the old `weave-claude-plugin` package and need a one-time migration. **Do this BEFORE running `weave-claude-code install`** — otherwise you end up with two `weave` plugins (`weave@weave-claude-plugin` and `weave@weave-claude-code`) firing hooks in parallel.
 
-### M1 — Capture the user's existing settings
+### Step 1 — Capture the user's existing settings
 
 The legacy `~/.weave_claude_plugin/settings.json` likely contains the user's configured `weave_project` and `wandb_api_key`. Capture them into shell variables so they survive the cleanup and can be re-applied to the new install.
 
@@ -110,7 +110,7 @@ Only the length of the API key is echoed — never the value itself.
 
 If `~/.weave_claude_plugin/settings.json` doesn't exist, both variables stay empty and the rest of this section still applies.
 
-### M2 — Remove the legacy marketplace from Claude Code
+### Step 2 — Remove the legacy marketplace from Claude Code
 
 ```bash
 claude plugin marketplace remove weave-claude-plugin
@@ -118,7 +118,7 @@ claude plugin marketplace remove weave-claude-plugin
 
 This is the **load-bearing step**. Claude Code couples plugins to their marketplace: removing the `weave-claude-plugin` marketplace also uninstalls the `weave@weave-claude-plugin` plugin. If the marketplace was already absent (the binary was installed via npm but `install` was never run), the CLI will print `No configured marketplace named "weave-claude-plugin"` — that's fine, continue.
 
-### M3 — Install the new package
+### Step 3 — Install the new package
 
 ```bash
 npm install -g weave-claude-code@latest
@@ -127,7 +127,7 @@ which weave-claude-code
 
 Retry with `sudo` if the install fails with EACCES — but only after confirming with the user.
 
-### M4 — Run the new install
+### Step 4 — Run the new install
 
 Do not use `--non-interactive` here unless the user explicitly asked for it; the install command is harmless to re-run, and TTY output is more informative.
 
@@ -135,9 +135,9 @@ Do not use `--non-interactive` here unless the user explicitly asked for it; the
 weave-claude-code install
 ```
 
-If the prompts for `weave_project` / `wandb_api_key` come up, skip them with blank input — M5 re-applies the captured values without needing user retyping.
+If the prompts for `weave_project` / `wandb_api_key` come up, skip them with blank input — Step 5 below re-applies the captured values without needing user retyping.
 
-### M5 — Re-apply the captured settings
+### Step 5 — Re-apply the captured settings
 
 Only set values that were actually captured (skip blanks):
 
@@ -148,15 +148,15 @@ Only set values that were actually captured (skip blanks):
 
 The shell substitution keeps the API key out of your tool transcript; `config set` itself only echoes the first four characters.
 
-### M6 — Remove the legacy config dir
+### Step 6 — Remove the legacy config dir
 
 ```bash
 rm -rf ~/.weave_claude_plugin
 ```
 
-Don't do this before M1 — the settings live in there.
+Don't do this before Step 1 — the settings live in there.
 
-### M7 — Uninstall the legacy npm package
+### Step 7 — Uninstall the legacy npm package
 
 ```bash
 npm uninstall -g weave-claude-plugin
@@ -164,8 +164,8 @@ npm uninstall -g weave-claude-plugin
 
 If this fails with EACCES, confirm with the user before retrying with `sudo`. If the user declines, that's fine — leaving the old binary on PATH is harmless once the marketplace and config dir are gone (the hooks no longer reference it). Note in your final report that they should remove it themselves when convenient.
 
-### M8 — Continue from Step 3
+### Step 8 — Resume the main install flow
 
-The migration is complete. Continue the install flow at **Step 3 (Configure Weave Project)** above to validate that the carried-forward settings landed correctly, then proceed through Steps 4 and 5.
+The migration is complete. Jump back to the main install flow above at **Step 3 (Configure Weave Project)** to validate that the carried-forward settings landed correctly, then proceed through the main flow's Steps 4 and 5.
 
-In Step 5's final report, mention that the user is now on `weave-claude-code` (rename from `weave-claude-plugin`) and remind them to run `/reload-plugins` or restart Claude Code so the new plugin code is loaded.
+In the main flow's Step 5 final report, mention that the user is now on `weave-claude-code` (rename from `weave-claude-plugin`) and remind them to run `/reload-plugins` or restart Claude Code so the new plugin code is loaded.
