@@ -186,10 +186,6 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
 // config
 // ---------------------------------------------------------------------------
 
-// Single source of truth for how secret values appear in user-facing output.
-// `config show`, `config set`, and `status` all route the API key through here
-// so a future change to the mask format (or to the set of sensitive keys) only
-// touches one place.
 function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
 }
