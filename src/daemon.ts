@@ -83,6 +83,43 @@ function hashPrompt(prompt: string): string {
 }
 
 /**
+ * Pull the subagent's reply text out of a Claude-Code `tool_response` value.
+ * Anthropic-style responses arrive as
+ *   `{ content: [{ type: 'text', text: '...' }, ...], ... }`
+ * with optional `prompt`, `agentId`, `agentType`, etc. sibling fields. The
+ * chat view should render just the assistant's reply, not the whole
+ * envelope. Behavior:
+ *   - string input → returned verbatim (orphan-path lastAssistantText,
+ *     error-path messages),
+ *   - recognized envelope (object with a `content` array) → joined `text`
+ *     blocks, possibly the empty string if no text blocks were present.
+ *     Falling through to JSON.stringify on an empty/text-less recognized
+ *     envelope would re-emit the wrapper and reintroduce the bug this
+ *     helper exists to prevent, so the recognized-shape path always wins.
+ *   - anything else (unrecognized object shape, numbers, booleans, etc.)
+ *     → JSON-stringified so we never silently lose data.
+ */
+function extractSubagentReplyText(toolResponse: unknown): string {
+  if (typeof toolResponse === 'string') return toolResponse;
+  if (toolResponse !== null && typeof toolResponse === 'object') {
+    const content = (toolResponse as Record<string, unknown>)['content'];
+    if (Array.isArray(content)) {
+      const texts: string[] = [];
+      for (const block of content) {
+        if (block && typeof block === 'object') {
+          const b = block as Record<string, unknown>;
+          if (b['type'] === 'text' && typeof b['text'] === 'string') {
+            texts.push(b['text']);
+          }
+        }
+      }
+      return texts.join('\n');
+    }
+  }
+  return JSON.stringify(toolResponse);
+}
+
+/**
  * Map a parent transcript path + subagent agent_id to the subagent's transcript
  * file. Claude Code writes subagent transcripts as siblings of the parent in a
  * `<session_id>/subagents/` subdirectory:
@@ -823,6 +860,17 @@ export class GlobalDaemon {
    * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
    * regardless of order. Sets `gen_ai.output.messages` from the canonical
    * tool return string when available; marks the span ERROR on failure.
+   *
+   * Unlike the regular tool path in `handlePostToolUse`, we deliberately do
+   * not set `gen_ai.tool.call.result` here: the subagent is modeled as an
+   * `invoke_agent` (chat-flavored) span, not a `tool_call` span, so the
+   * semconv attribute split mirrors the span-type split. The envelope
+   * sibling fields (`status`, `prompt`, `agentId`, `agentType`,
+   * `description`, `totalDurationMs`, `totalTokens`) are already
+   * reconstructible from other attributes: dispatch metadata is set on the
+   * span at PreToolUse from `tool_input`, duration is recoverable from the
+   * span's own start/end timestamps, and per-turn token counts (with cache
+   * breakdowns) live on child chat spans.
    */
   private closeSubagentInvokeAgentSpan(
     tracker: SubagentTracker,
@@ -833,10 +881,12 @@ export class GlobalDaemon {
     if (!span || tracker.ended) return;
 
     if (output !== undefined && output !== null && output !== '') {
-      const outputText = typeof output === 'string' ? output : jsonStr(output);
+      // `output` is the Anthropic tool_response envelope on success or a
+      // plain error string on failure — extractSubagentReplyText handles both.
+      const replyText = extractSubagentReplyText(output);
       span.setAttribute(
         ATTR.OUTPUT_MESSAGES,
-        jsonStr([{ role: 'assistant', content: outputText }]),
+        jsonStr([{ role: 'assistant', content: replyText }]),
       );
     }
     if (failure) {
