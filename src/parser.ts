@@ -117,11 +117,22 @@ function buildSession(lines: unknown[]): ParsedSession {
       currentAssistantLines.push({ line: entry, prevTimestamp });
     } else if (role === 'user') {
       const rawContent = message?.['content'];
-      const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
-      // A user message with text content marks the end of the previous turn.
-      const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
-      if (hasText && currentAssistantLines.length > 0) {
+      // Only a typed user prompt — a bare string `content` — marks a turn
+      // boundary. Array-form `content` covers two non-boundary shapes:
+      //   (a) `[{type: 'tool_result', ...}]` — tool replies, never a turn end.
+      //   (b) `[{type: 'text', text: '...'}]` — mid-turn user-text injections
+      //       (skill content, command-message envelopes, system reminders,
+      //       `"[Request interrupted by user for tool use]"`). These are
+      //       written by the harness during a turn, not typed by the user,
+      //       so treating them as turn boundaries splits one Claude Code
+      //       turn into multiple parser turns and (when the split lands
+      //       between a tool dispatch and its synthesis) drops the
+      //       synthesis chat span at `handleStop`'s `turns[-1]`.
+      // The bare-string case is the one Claude Code uses for actual user
+      // prompts (`message.content: '/talk-to-tim ...'`).
+      const isTypedUserPrompt = typeof rawContent === 'string';
+      if (isTypedUserPrompt && currentAssistantLines.length > 0) {
         turns.push(buildTurn(currentAssistantLines));
         currentAssistantLines = [];
       }
