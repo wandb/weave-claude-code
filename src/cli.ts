@@ -171,7 +171,7 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
     }
 
     if (!effectiveApiKey) {
-      console.log('\nGet your API key at: https://wandb.ai/authorize');
+      console.log('\nGet your API key at: https://wandb.ai/authorize (update domain for other deployments)');
       const answer = await prompt('W&B API key: ');
       const value = answer.trim();
       if (value) {
