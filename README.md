@@ -41,7 +41,15 @@ In non-interactive mode, the installer still creates config, registers the Claud
 - Warns and continues if either value is missing
 - Leaves environment-provided values in the environment rather than writing them into `settings.json`
 
-**3. Launch Claude Code from any folder**
+**3. Restart or launch Claude Code**
+
+If Claude Code is already running, reload plugins from inside the session:
+
+```
+/reload-plugins
+```
+
+Otherwise, launch Claude Code from any folder:
 
 ```bash
 claude
@@ -77,8 +85,11 @@ or compliance requirements, do not install or enable this plugin yet.
 ## Configuration
 
 ```bash
-# Show all current settings
+# Show all current settings (env-var overrides are flagged in the output)
 weave-claude-code config show
+
+# Read a single setting (resolves env-var overrides)
+weave-claude-code config get weave_project
 
 # Set your Weave project
 weave-claude-code config set weave_project my-entity/my-project
@@ -145,24 +156,26 @@ Each line shows `✓` (OK), `✗` (action needed), or `-` (not yet active but no
 If sessions are not appearing in Weave, check the daemon log for errors:
 
 ```bash
-weave-claude-code logs
-```
-
-Or tail it in real time:
-
-```bash
-weave-claude-code logs --follow
+weave-claude-code logs              # last 50 lines (default)
+weave-claude-code logs --tail 200   # last N lines
+weave-claude-code logs --follow     # tail -f
 ```
 
 The log file is also directly at `~/.weave-claude-code/logs/daemon.log`.
+
+For more verbose daemon output while diagnosing an issue, enable debug mode:
+
+```bash
+weave-claude-code config set debug true
+# or, just for the current shell session:
+export WEAVE_CLAUDE_DEBUG=1
+```
 
 ---
 
 ## Skills
 
-Once the plugin is installed, three skills are available directly inside any Claude Code session:
-
-To avoid collisions with Claude Code's built-in skills, the config and status skills use unique hyphenated names. Their user-facing commands are `/weave:weave-config` and `/weave:weave-status`.
+Once the plugin is installed, three skills are available directly inside any Claude Code session. They use a `/weave:weave-*` naming pattern (rather than the shorter `/weave:install` form) to avoid colliding with Claude Code's built-in skills.
 
 ### `/weave:weave-install`
 
