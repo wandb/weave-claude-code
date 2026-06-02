@@ -1,5 +1,10 @@
 # Weave Claude Code Plugin
 
+[![npm](https://img.shields.io/npm/v/weave-claude-code)](https://www.npmjs.com/package/weave-claude-code)
+[![CI](https://github.com/wandb/weave-claude-code/actions/workflows/format-and-lint.yaml/badge.svg)](https://github.com/wandb/weave-claude-code/actions/workflows/format-and-lint.yaml)
+[![license](https://img.shields.io/npm/l/weave-claude-code)](LICENSES/MIT.txt)
+[![node](https://img.shields.io/node/v/weave-claude-code)](package.json)
+
 Track Claude Code sessions in [Weave](https://wandb.ai/) for observability and debugging. Every session, turn, tool call, and subagent is automatically logged as a structured trace — no code changes required.
 
 ## Quick Start
@@ -20,16 +25,6 @@ This will:
 - Create `~/.weave-claude-code/settings.json`
 - Register the plugin in Claude Code
 - Prompt for your Weave project (`entity/project`) and W&B API key if not already set
-
-Marketplace installs are pinned to a specific release tag rather than the
-repository default branch. New releases are cut via two GitHub Actions:
-
-1. **Version Bump** — dispatched with a version like `0.1.2`. Bumps the
-   pinned version across the repo, pins the marketplace to the resulting
-   commit SHA, and creates and pushes the matching `v0.1.2` tag.
-2. **Publish Package** — dispatched with the tag (e.g. `v0.1.2`). Verifies
-   the tag is consistent and not already published, then builds and
-   publishes to npm.
 
 Your W&B API key is available at https://wandb.ai/authorize.
 
@@ -255,3 +250,18 @@ weave-claude-code uninstall
 ```
 
 Pass `--keep-logs` to preserve the log directory.
+
+---
+
+## Releasing
+
+This package is published to npm and pinned in the Claude Code marketplace
+to a specific release tag rather than the repository default branch. New
+releases are cut via two GitHub Actions:
+
+1. **Version Bump** — dispatched with a version like `0.1.2`. Bumps the
+   pinned version across the repo, pins the marketplace to the resulting
+   commit SHA, and creates and pushes the matching `v0.1.2` tag.
+2. **Publish Package** — dispatched with the tag (e.g. `v0.1.2`). Verifies
+   the tag is consistent and not already published, then builds and
+   publishes to npm.
