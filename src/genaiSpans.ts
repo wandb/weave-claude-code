@@ -295,11 +295,19 @@ export function emitChatSpan(
   parentSpan: Span,
   args: ChatSpanArgs,
 ): void {
+  // OTel `input_tokens` is the total prompt; Anthropic splits it into three
+  // disjoint fields (uncached + cache_read + cache_creation), so sum them.
+  // https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
+  const totalInputTokens =
+    args.usage.input_tokens
+    + (args.usage.cache_read_input_tokens ?? 0)
+    + (args.usage.cache_creation_input_tokens ?? 0);
+
   const attrs: Record<string, string | number | boolean | string[]> = {
     [ATTR.OPERATION_NAME]: OP.CHAT,
     [ATTR.REQUEST_MODEL]: args.model,
     [ATTR.CONVERSATION_ID]: args.conversationId,
-    [ATTR.USAGE_INPUT_TOKENS]: args.usage.input_tokens,
+    [ATTR.USAGE_INPUT_TOKENS]: totalInputTokens,
     [ATTR.USAGE_OUTPUT_TOKENS]: args.usage.output_tokens,
     [ATTR.OUTPUT_TYPE]: 'text',
   };
