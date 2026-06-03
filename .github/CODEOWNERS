@@ -1,0 +1,3 @@
+# Auto-request review from the Weave SDK team on every PR.
+# Takes effect only from the default branch (main).
+* @wandb/weave-sdk
