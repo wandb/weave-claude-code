@@ -55,7 +55,9 @@ Otherwise, launch Claude Code from any folder:
 claude
 ```
 
-Sessions are traced automatically from this point. Open your Weave project to see them.
+Sessions are traced automatically from this point, across **all** Claude Code sessions on this machine. Tracing is not scoped to a single project. To stop tracing, run `weave-claude-code uninstall`.
+
+Open your Weave project to see them.
 
 ---
 
