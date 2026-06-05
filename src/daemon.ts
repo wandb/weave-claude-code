@@ -474,6 +474,9 @@ export class GlobalDaemon {
         case 'SubagentStop':
           await this.handleSubagentStop(sessionId, payload);
           break;
+        case 'TeammateIdle':
+          await this.handleTeammateIdle(sessionId, payload);
+          break;
         case 'PreCompact':
           await this.handlePreCompact(sessionId, payload);
           break;
@@ -990,6 +993,82 @@ export class GlobalDaemon {
     if (!tracker.toolUseId) {
       session.subagents.remove(tracker);
     }
+  }
+
+  private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.tracer) return;
+
+    // TeammateIdle payload (per CC docs): session_id/transcript_path are the
+    // COORDINATOR's fields; agent_id is the teammate's session UUID and
+    // agent_type is the teammate's agent name (e.g. "cks-specialist").
+    // The teammate transcript lives at <coordinator_dir>/<agent_id>.jsonl.
+    const agentId = payload['agent_id'] as string | undefined;
+    const agentType = (payload['agent_type'] as string | undefined) ?? 'teammate';
+
+    const transcriptPath = agentId
+      ? path.join(path.dirname(session.transcript.resolvedPath), `${agentId}.jsonl`)
+      : undefined;
+
+    if (!transcriptPath) {
+      this.log('ERROR', `TeammateIdle: missing agent_id in payload for session ${sessionId}; payload keys=${Object.keys(payload).join(',')}`);
+      return;
+    }
+
+    const parentSpan = session.currentTurnSpan;
+    if (!parentSpan) {
+      this.log('DEBUG', `TeammateIdle: no active turn span for session ${sessionId}; skipping ${agentType}`);
+      return;
+    }
+
+    const invokeSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
+      agentType,
+      conversationId: session.conversationId,
+      pluginVersion: VERSION,
+      displayName: `Agent: ${agentType}`,
+    });
+
+    let model: string | undefined;
+    let lastAssistantText: string | undefined;
+    let agentTranscript: TranscriptFile | undefined;
+    try {
+      agentTranscript = new TranscriptFile(transcriptPath);
+      const parsed = parseSessionFd(agentTranscript.getFd());
+      if (parsed) {
+        // Emit chat spans for ALL turns. Teammates are independent top-level
+        // sessions — every turn in their transcript is their own work. This
+        // differs from SubagentStop's last-turn-only approach, which avoids
+        // attributing pre-context carry-in lines to the subagent.
+        for (const turn of parsed.turns) {
+          emitChatSpansFromAssistantCalls(
+            this.tracer,
+            invokeSpan,
+            session.conversationId,
+            turn.assistantCalls(),
+          );
+        }
+        const lastTurn = parsed.turns[parsed.turns.length - 1];
+        model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
+      }
+    } catch (err) {
+      this.log('DEBUG', `TeammateIdle: could not parse transcript ${transcriptPath}: ${err}`);
+    } finally {
+      agentTranscript?.close();
+    }
+
+    if (model) {
+      invokeSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+    }
+    if (lastAssistantText) {
+      invokeSpan.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        JSON.stringify([{ role: 'assistant', content: lastAssistantText }]),
+      );
+    }
+    invokeSpan.end();
+
+    this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath}`);
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
