@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
-  Span,
   Tracer,
   diag,
   DiagConsoleLogger,
@@ -16,16 +15,16 @@ import {
 import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
+import { parseSessionFd, extractAssistantTextBlocks, type AssistantCallDetail } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
   CompactionAttrs,
-  emitChatSpansFromAssistantCalls,
   toolDisplayName,
   promptSnippet,
   jsonStr,
+  providerFromModel,
 } from './genaiSpans.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,12 +203,68 @@ interface SessionState {
   pendingCompaction?: CompactionAttrs;
 }
 
-// Bridge while chat-span emission is still on the raw helper (PR #6).
-// Both Turn and SubAgent hold their underlying Span privately; this cast
-// surfaces it so emitChatSpansFromAssistantCalls can parent chat spans
-// correctly. Deleted in PR #6.
-function parentUnderlyingSpan(p: weave.Turn | weave.SubAgent): Span {
-  return (p as unknown as { span: Span }).span;
+function parseTimestamp(ts: string | undefined): Date | undefined {
+  if (!ts) return undefined;
+  const d = new Date(ts);
+  return Number.isFinite(d.getTime()) ? d : undefined;
+}
+
+/**
+ * Emit one chat span per assistant call in a transcript turn, parented
+ * under either the Turn (main agent) or SubAgent (subagent path). Uses
+ * the SDK's `startLLM` with backdated startTime/endTime so the emitted
+ * span timeline matches the transcript timestamps.
+ */
+function emitChatSpansViaSDK(
+  parent: weave.Turn | weave.SubAgent,
+  conversationId: string,
+  calls: AssistantCallDetail[],
+): void {
+  for (const c of calls) {
+    if (!c.model) continue;
+    const startedAt = parseTimestamp(c.prevTimestamp) ?? parseTimestamp(c.timestamp) ?? new Date();
+    const endedAt = parseTimestamp(c.timestamp) ?? new Date();
+    // OTel `input_tokens` is the total prompt; Anthropic splits it into
+    // three disjoint fields (uncached + cache_read + cache_creation), so
+    // sum them. https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
+    const totalInputTokens =
+      c.usage.input_tokens
+      + (c.usage.cache_read_input_tokens ?? 0)
+      + (c.usage.cache_creation_input_tokens ?? 0);
+
+    const provider = providerFromModel(c.model);
+    const llm = parent.startLLM({
+      model: c.model,
+      ...(provider ? {providerName: provider} : {}),
+      startTime: startedAt,
+    });
+    llm.record({
+      usage: {
+        inputTokens: totalInputTokens,
+        outputTokens: c.usage.output_tokens,
+        ...(c.usage.cache_read_input_tokens !== undefined
+          ? {cacheReadInputTokens: c.usage.cache_read_input_tokens}
+          : {}),
+        ...(c.usage.cache_creation_input_tokens !== undefined
+          ? {cacheCreationInputTokens: c.usage.cache_creation_input_tokens}
+          : {}),
+        ...(c.reasoningTokens !== undefined && c.reasoningTokens > 0
+          ? {reasoningTokens: c.reasoningTokens}
+          : {}),
+      },
+    });
+    llm.setAttribute(ATTR.CONVERSATION_ID, conversationId);
+    llm.setAttribute(ATTR.OUTPUT_TYPE, 'text');
+    if (c.responseId) llm.setAttribute(ATTR.RESPONSE_ID, c.responseId);
+    if (c.finishReason) llm.setAttribute(ATTR.RESPONSE_FINISH_REASONS, [c.finishReason]);
+    if (c.contentBlocks.length) {
+      llm.outputMessages = [{
+        role: 'assistant',
+        content: extractAssistantTextBlocks(c.contentBlocks).join('\n'),
+      }];
+    }
+    llm.end({endTime: endedAt});
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -946,9 +1001,8 @@ export class GlobalDaemon {
         lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          emitChatSpansFromAssistantCalls(
-            this.tracer,
-            parentUnderlyingSpan(chatParent),
+          emitChatSpansViaSDK(
+            chatParent,
             session.conversationId,
             lastTurn.assistantCalls(),
           );
@@ -1030,12 +1084,9 @@ export class GlobalDaemon {
       `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Chat spans still emitted via raw helper until PR #6. Parent context
-    // is the Turn's underlying Span via the temporary bridge.
-    if (currentTurn) {
-      emitChatSpansFromAssistantCalls(
-        this.tracer,
-        parentUnderlyingSpan(session.currentTurn),
+    if (currentTurn && session.currentTurn) {
+      emitChatSpansViaSDK(
+        session.currentTurn,
         session.conversationId,
         currentTurn.assistantCalls(),
       );
