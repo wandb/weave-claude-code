@@ -8,7 +8,6 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import {
   Span,
-  SpanStatusCode,
   Tracer,
   diag,
   DiagConsoleLogger,
@@ -23,11 +22,7 @@ import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
   CompactionAttrs,
-  startToolSpan,
-  startInvokeAgentSpan,
   emitChatSpansFromAssistantCalls,
-  addPermissionRequestEvent,
-  addPermissionResolvedEvent,
   toolDisplayName,
   promptSnippet,
   jsonStr,
@@ -55,42 +50,26 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
 
 /**
  * Stores the tool span opened at PreToolUse so PostToolUse can close it.
- *
- * Two shapes: `sdk` (turn-parented, uses the weave SDK `Tool` wrapper) and
- * `raw` (subagent-parented, still on the raw OTel span). The subagent path
- * migrates to the SDK in PR #5 once `invoke_agent` is wrapped.
+ * All tool spans go through the weave SDK `Tool` wrapper, parented under
+ * either the current `Turn` (top-level tools) or a `SubAgent` (subagent-
+ * spawned tools).
  */
-type PendingToolCall =
-  | {
-      kind: 'sdk';
-      tool: weave.Tool;
-      toolName: string;
-      toolInput: Record<string, unknown>;
-      /** True once a PermissionRequest event has been emitted for this tool. */
-      permissionRequested?: boolean;
-    }
-  | {
-      kind: 'raw';
-      span: Span;
-      toolName: string;
-      toolInput: Record<string, unknown>;
-      /** True once a PermissionRequest event has been emitted for this tool. */
-      permissionRequested?: boolean;
-    };
+interface PendingToolCall {
+  tool: weave.Tool;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  /** True once a PermissionRequest event has been emitted for this tool. */
+  permissionRequested?: boolean;
+}
 
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
-  const ts = new Date();
-  if (pending.kind === 'sdk') {
-    pending.tool.addEvent(
-      ATTR.EVT_PERMISSION_RESOLVED,
-      { [ATTR.EVT_PERMISSION_APPROVED]: approved },
-      ts,
-    );
-  } else {
-    addPermissionResolvedEvent(pending.span, { approved, timestamp: ts });
-  }
+  pending.tool.addEvent(
+    ATTR.EVT_PERMISSION_RESOLVED,
+    { [ATTR.EVT_PERMISSION_APPROVED]: approved },
+    new Date(),
+  );
 }
 
 /** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
@@ -186,7 +165,7 @@ interface SubagentTracker {
   subagentType: string;
   detectedAt: Date;
   toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
-  invokeAgentSpan?: Span;      // subagent's `invoke_agent` span; subagent chat/tool spans parent here
+  subAgent?: weave.SubAgent;   // SDK SubAgent; subagent chat/tool spans parent here via subAgent.startLLM/.startTool
   agentId?: string;
   /** sha256 of the prompt passed to the Agent tool; matched against the
    *  subagent's transcript line-1 user message at SubagentStart. */
@@ -225,9 +204,12 @@ interface SessionState {
   pendingCompaction?: CompactionAttrs;
 }
 
-// Temporary bridge: Tool and SubAgent paths still use raw spans (PRs #4 / #5).
-function turnUnderlyingSpan(turn: weave.Turn): Span {
-  return (turn as unknown as { span: Span }).span;
+// Bridge while chat-span emission is still on the raw helper (PR #6).
+// Both Turn and SubAgent hold their underlying Span privately; this cast
+// surfaces it so emitChatSpansFromAssistantCalls can parent chat spans
+// correctly. Deleted in PR #6.
+function parentUnderlyingSpan(p: weave.Turn | weave.SubAgent): Span {
+  return (p as unknown as { span: Span }).span;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -686,16 +668,6 @@ export class GlobalDaemon {
 
     const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
 
-    // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
-    // a subagent, else the current turn span.
-    const parentSpan = agentId
-      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined)
-      : (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined);
-    if (!parentSpan) {
-      this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
-      return;
-    }
-
     // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
     // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
     // nested invoke_agent spans as their own `agent_start` lifecycle marker; an
@@ -709,58 +681,44 @@ export class GlobalDaemon {
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
-      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
-        agentType: subagentType,
-        conversationId: session.conversationId,
-        pluginVersion: VERSION,
-        inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
-        spawningToolCallId: toolUseId,
-        displayName: toolDisplayName(toolName, toolInput),
-      });
+      if (!session.currentTurn) {
+        this.log('ERROR', `PreToolUse(Agent): no current turn for session=${sessionId}`);
+        return;
+      }
+      const subAgent = session.currentTurn.startSubagent({name: subagentType});
+      subAgent.setAttribute(ATTR.AGENT_VERSION, VERSION);
+      subAgent.setAttribute(ATTR.CONVERSATION_ID, session.conversationId);
+      if (prompt) {
+        subAgent.setAttribute(ATTR.INPUT_MESSAGES, jsonStr([{role: 'user', content: prompt}]));
+      }
+      subAgent.setAttribute(ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID, toolUseId);
+      subAgent.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
       session.subagents.add({
         toolUseId,
         subagentType,
         detectedAt: new Date(),
-        invokeAgentSpan,
+        subAgent,
         promptHash: hashPrompt(prompt),
       });
       return;
     }
 
-    // Subagent-spawned tools (agentId !== undefined) still parent under the
-    // subagent's raw `invoke_agent` span until PR #5 migrates the subagent
-    // path. Non-subagent tools parent under the SDK Turn via `turn.startTool`.
-    if (agentId) {
-      const toolSpan = startToolSpan(this.tracer, parentSpan, {
-        toolName,
-        toolUseId,
-        toolInput,
-        displayName: toolDisplayName(toolName, toolInput),
-      });
-      session.pendingToolCalls.set(toolUseId, {
-        kind: 'raw',
-        span: toolSpan,
-        toolName,
-        toolInput,
-      });
-    } else {
-      if (!session.currentTurn) {
-        this.log('ERROR', `PreToolUse: no current turn for session=${sessionId} tool=${toolName}`);
-        return;
-      }
-      const tool = session.currentTurn.startTool({
-        name: toolName,
-        toolCallId: toolUseId,
-        args: jsonStr(toolInput),
-      });
-      tool.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
-      session.pendingToolCalls.set(toolUseId, {
-        kind: 'sdk',
-        tool,
-        toolName,
-        toolInput,
-      });
+    // Parent: subagent's SubAgent if this PreToolUse comes from inside a
+    // subagent (agentId set), else the current Turn.
+    const parent: weave.Turn | weave.SubAgent | undefined = agentId
+      ? session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn
+      : session.currentTurn;
+    if (!parent) {
+      this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
+      return;
     }
+    const tool = parent.startTool({
+      name: toolName,
+      toolCallId: toolUseId,
+      args: jsonStr(toolInput),
+    });
+    tool.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
+    session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -788,17 +746,10 @@ export class GlobalDaemon {
     pending.permissionRequested = true;
     const ts = new Date();
     const suggestions = payload['permission_suggestions'];
-    if (pending.kind === 'sdk') {
-      const evtAttrs = suggestions !== undefined
-        ? { [ATTR.EVT_PERMISSION_SUGGESTIONS]: jsonStr(suggestions) }
-        : {};
-      pending.tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, evtAttrs, ts);
-    } else {
-      addPermissionRequestEvent(pending.span, {
-        suggestions,
-        timestamp: ts,
-      });
-    }
+    const evtAttrs = suggestions !== undefined
+      ? { [ATTR.EVT_PERMISSION_SUGGESTIONS]: jsonStr(suggestions) }
+      : {};
+    pending.tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, evtAttrs, ts);
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
@@ -814,8 +765,8 @@ export class GlobalDaemon {
     // span (not a pendingToolCall), so we close it here with the subagent's
     // final assistant text as `gen_ai.output.messages`.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+    if (subagentTracker?.subAgent) {
+      this.closeSubagent(subagentTracker, payload['tool_response'], /*failure*/ false);
       session.subagents.remove(subagentTracker);
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
@@ -825,16 +776,9 @@ export class GlobalDaemon {
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
-
     resolvePermissionIfPending(pending, true);
-
-    if (pending.kind === 'sdk') {
-      pending.tool.result = jsonStr(payload['tool_response']);
-      pending.tool.end();
-    } else {
-      pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
-      pending.span.end();
-    }
+    pending.tool.result = jsonStr(payload['tool_response']);
+    pending.tool.end();
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -855,8 +799,8 @@ export class GlobalDaemon {
     // status; subagent chat spans, if any reached SubagentStop, are already
     // attached as children.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+    if (subagentTracker?.subAgent) {
+      this.closeSubagent(subagentTracker, error, /*failure*/ true);
       session.subagents.remove(subagentTracker);
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
@@ -866,20 +810,11 @@ export class GlobalDaemon {
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
-
     resolvePermissionIfPending(pending, false);
-
     const errMsg = typeof error === 'string' ? error : 'tool failed';
-    if (pending.kind === 'sdk') {
-      pending.tool.result = jsonStr(error);
-      pending.tool.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
-      pending.tool.end({ error: new Error(errMsg) });
-    } else {
-      pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
-      pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
-      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
-      pending.span.end();
-    }
+    pending.tool.result = jsonStr(error);
+    pending.tool.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
+    pending.tool.end({ error: new Error(errMsg) });
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -888,34 +823,28 @@ export class GlobalDaemon {
   }
 
   /**
-   * Close a subagent's `invoke_agent` span. Idempotent — guarded by
-   * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
-   * regardless of order. Sets `gen_ai.output.messages` from the canonical
-   * tool return string when available; marks the span ERROR on failure.
+   * Close a subagent's `invoke_agent` span. Idempotent via `tracker.ended`.
+   * Sets `gen_ai.output.messages` from the canonical tool return string when
+   * available; marks the span ERROR on failure.
    */
-  private closeSubagentInvokeAgentSpan(
+  private closeSubagent(
     tracker: SubagentTracker,
     output: unknown,
     failure: boolean,
   ): void {
-    const span = tracker.invokeAgentSpan;
-    if (!span || tracker.ended) return;
+    const sub = tracker.subAgent;
+    if (!sub || tracker.ended) return;
 
     if (output !== undefined && output !== null && output !== '') {
       const outputText = typeof output === 'string' ? output : jsonStr(output);
-      span.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        jsonStr([{ role: 'assistant', content: outputText }]),
-      );
+      sub.setAttribute(ATTR.OUTPUT_MESSAGES, jsonStr([{ role: 'assistant', content: outputText }]));
     }
     if (failure) {
-      span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: typeof output === 'string' ? output : 'subagent failed',
-      });
+      sub.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
+      sub.end({ error: new Error(typeof output === 'string' ? output : 'subagent failed') });
+    } else {
+      sub.end();
     }
-    span.end();
     tracker.ended = true;
   }
 
@@ -961,22 +890,20 @@ export class GlobalDaemon {
         detectedAt: new Date(),
       };
       if (session.currentTurn) {
-        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, turnUnderlyingSpan(session.currentTurn), {
-          agentType,
-          conversationId: session.conversationId,
-          pluginVersion: VERSION,
-          displayName: `Agent: ${agentType}`,
-        });
-        bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
+        bestTracker.subAgent = session.currentTurn.startSubagent({name: agentType});
+        bestTracker.subAgent.setAttribute(ATTR.AGENT_VERSION, VERSION);
+        bestTracker.subAgent.setAttribute(ATTR.CONVERSATION_ID, session.conversationId);
+        bestTracker.subAgent.setAttribute(ATTR.WEAVE_DISPLAY_NAME, `Agent: ${agentType}`);
+        bestTracker.subAgent.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
       }
       session.subagents.add(bestTracker);
     }
 
     bestTracker.agentId = agentId;
-    if (bestTracker.invokeAgentSpan) {
+    if (bestTracker.subAgent) {
       // Stamp the runtime agent_id on the subagent's invoke_agent span — the
       // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
-      bestTracker.invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
+      bestTracker.subAgent.setAttribute(ATTR.AGENT_ID, agentId);
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
@@ -996,9 +923,9 @@ export class GlobalDaemon {
     }
 
     // Chat spans for the subagent's LLM calls parent under the subagent's
-    // own invoke_agent span. For orphan trackers without an invoke_agent
-    // span (no current turn at SubagentStart), fall back to the turn span.
-    const chatParent = tracker.invokeAgentSpan ?? (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined);
+    // own SubAgent. For orphan trackers without a SubAgent (no current turn
+    // at SubagentStart), fall back to the current Turn.
+    const chatParent: weave.Turn | weave.SubAgent | undefined = tracker.subAgent ?? session.currentTurn;
 
     const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
     let model: string | undefined;
@@ -1021,7 +948,7 @@ export class GlobalDaemon {
         if (lastTurn) {
           emitChatSpansFromAssistantCalls(
             this.tracer,
-            chatParent,
+            parentUnderlyingSpan(chatParent),
             session.conversationId,
             lastTurn.assistantCalls(),
           );
@@ -1033,11 +960,11 @@ export class GlobalDaemon {
       }
     }
 
-    if (tracker.invokeAgentSpan) {
+    if (tracker.subAgent) {
       // Stamp the model the subagent actually ran on (Claude Code's
       // SubagentStart payload doesn't carry the model; the transcript does).
       if (model) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+        tracker.subAgent.setAttribute(ATTR.RESPONSE_MODEL, model);
       }
       // Orphan path: no PostToolUse will fire, so close the invoke_agent
       // span here using the subagent's final assistant text as the output.
@@ -1045,7 +972,7 @@ export class GlobalDaemon {
       // canonical tool_response and remove the tracker; if we removed the
       // tracker here, byToolUseId at PostToolUse would miss it.
       if (!tracker.ended && !tracker.toolUseId) {
-        this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+        this.closeSubagent(tracker, lastAssistantText, /*failure*/ false);
       }
     }
 
@@ -1108,7 +1035,7 @@ export class GlobalDaemon {
     if (currentTurn) {
       emitChatSpansFromAssistantCalls(
         this.tracer,
-        turnUnderlyingSpan(session.currentTurn),
+        parentUnderlyingSpan(session.currentTurn),
         session.conversationId,
         currentTurn.assistantCalls(),
       );
@@ -1155,14 +1082,8 @@ export class GlobalDaemon {
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       resolvePermissionIfPending(pending, false);
       const orphanMsg = 'session ended before tool completed';
-      if (pending.kind === 'sdk') {
-        pending.tool.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-        pending.tool.end({ error: new Error(orphanMsg) });
-      } else {
-        pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-        pending.span.setStatus({ code: SpanStatusCode.ERROR, message: orphanMsg });
-        pending.span.end();
-      }
+      pending.tool.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      pending.tool.end({ error: new Error(orphanMsg) });
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
 
@@ -1176,10 +1097,9 @@ export class GlobalDaemon {
     // Close any subagent invoke_agent spans that didn't receive PostToolUse
     // or SubagentStop. Without this they'd leak open and never export.
     for (const tracker of session.subagents.all()) {
-      if (tracker.invokeAgentSpan && !tracker.ended) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
-        tracker.invokeAgentSpan.end();
+      if (tracker.subAgent && !tracker.ended) {
+        tracker.subAgent.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        tracker.subAgent.end({ error: new Error('session ended before subagent completed') });
         tracker.ended = true;
       }
       this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
