@@ -239,19 +239,28 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
 const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
 
-test('TeammateIdle: daemon reads teammate_name/team_name from actual payload schema', async () => {
-  // Start a real daemon with a temp config, send the confirmed-live payload
-  // schema, and verify the log shows "traced cks-specialist" (not "missing agent_id").
+test('TeammateIdle: full TARS sequence — SubagentStart → SubagentStop → TeammateIdle traces with all turns', async () => {
+  // Replicate the real TARS triage sequence:
+  //   1. Coordinator dispatches specialist via Agent tool (PreToolUse not tested here — SubagentStart is the entry point)
+  //   2. SubagentStart fires (orphan — no matching PreToolUse tracker) → creates invoke_agent span, stores transcript path
+  //   3. SubagentStop fires → span kept open (pendingTeammateIdle=true), tracker stays in SubagentTracking
+  //   4. TeammateIdle fires → finds tracker, emits all-turns chat spans, closes span
   const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-inttest-'));
   const configDir = path.join(home, '.weave-claude-code');
   const socketPath = path.join(configDir, 'daemon.sock');
   const logPath = path.join(configDir, 'logs', 'daemon.log');
-  const transcriptDir = path.join(home, '.claude', 'projects', 'test');
-  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
-  fs.mkdirSync(transcriptDir, { recursive: true });
+  const coordinatorSessionId = 'inttest-coord-001';
 
-  // Write settings with a fake key so the tracer initializes (OTLP export will
-  // fail silently since the key is invalid, but spans are still created/logged).
+  // Subagent transcript must live where the daemon expects it:
+  // <coordinator-transcript-dir>/subagents/agent-<agentId>.jsonl
+  const coordinatorTranscriptDir = path.join(home, '.claude', 'projects', 'test', coordinatorSessionId);
+  const subagentsDir = path.join(coordinatorTranscriptDir, 'subagents');
+  const agentId = 'agent-abc123def456';
+  const agentTranscriptPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.mkdirSync(subagentsDir, { recursive: true });
+
   fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
     weave_project: 'test/test',
     wandb_api_key: 'fake-key-for-test',
@@ -260,20 +269,22 @@ test('TeammateIdle: daemon reads teammate_name/team_name from actual payload sch
     debug: true,
   }));
 
-  // Write a fake teammate transcript under home (daemon rejects /tmp paths)
-  const teammatePath = path.join(transcriptDir, 'teammate.jsonl');
-  fs.writeFileSync(teammatePath, [
-    JSON.stringify({ type: 'agent-setting', agentSetting: 'cks-specialist', sessionId: 'tm-001' }),
-    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Investigate' }] } }),
+  // Multi-turn teammate transcript (two investigation turns)
+  fs.writeFileSync(agentTranscriptPath, [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Investigate CKS health' }] } }),
     JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: 'msg1',
       usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-      stop_reason: 'end_turn', content: [{ type: 'text', text: 'Looks healthy.' }] } }),
+      stop_reason: 'end_turn', content: [{ type: 'text', text: 'Phase 1: cluster looks healthy.' }] } }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Dig deeper' }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: 'msg2',
+      usage: { input_tokens: 200, output_tokens: 80, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      stop_reason: 'end_turn', content: [{ type: 'text', text: 'Phase 2: no anomalies detected.' }] } }),
   ].join('\n') + '\n');
 
-  const coordinatorPath = path.join(transcriptDir, 'coord.jsonl');
+  const coordinatorPath = path.join(coordinatorTranscriptDir, `${coordinatorSessionId}.jsonl`);
+  fs.mkdirSync(coordinatorTranscriptDir, { recursive: true });
   fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
 
-  // Start daemon
   const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
     env: { ...process.env, HOME: home },
     stdio: 'ignore',
@@ -296,27 +307,48 @@ test('TeammateIdle: daemon reads teammate_name/team_name from actual payload sch
 
   try {
     await waitForSocket();
-    await new Promise(r => setTimeout(r, 200)); // let daemon fully start
+    await new Promise(r => setTimeout(r, 200));
 
-    const sessionId = 'inttest-coord-001';
-    await sendEvent({ hook_event_name: 'SessionStart', session_id: sessionId, transcript_path: coordinatorPath });
+    // Step 1: Coordinator session starts and submits prompt
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: coordinatorSessionId, transcript_path: coordinatorPath });
     await new Promise(r => setTimeout(r, 100));
-    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, transcript_path: coordinatorPath });
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordinatorSessionId, transcript_path: coordinatorPath, prompt: '/triage supp-99999' });
     await new Promise(r => setTimeout(r, 100));
 
-    // Send TeammateIdle with ACTUAL payload schema (teammate_name, not agent_id)
+    // Step 2: SubagentStart (orphan — no matching PreToolUse)
+    await sendEvent({
+      hook_event_name: 'SubagentStart',
+      session_id: coordinatorSessionId,
+      agent_id: agentId,
+      agent_type: 'cks-specialist',
+      transcript_path: agentTranscriptPath,
+    });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 3: SubagentStop — should keep span open (pendingTeammateIdle)
+    await sendEvent({
+      hook_event_name: 'SubagentStop',
+      session_id: coordinatorSessionId,
+      agent_id: agentId,
+      agent_transcript_path: agentTranscriptPath,
+    });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 4: TeammateIdle — should close span with all-turns content
+    // CC sends coordinator's transcript_path (not the agent's) — daemon uses stored path instead
     await sendEvent({
       hook_event_name: 'TeammateIdle',
-      session_id: sessionId,
-      transcript_path: teammatePath,  // teammate's transcript (not coordinator's)
+      session_id: coordinatorSessionId,
+      transcript_path: coordinatorPath,  // coordinator's path (as CC sends it)
       teammate_name: 'cks-specialist',
       team_name: 'triage-inttest',
     });
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 400));
 
     const log = readLog();
-    assert.match(log, /TeammateIdle: traced cks-specialist/, 'should trace cks-specialist using teammate_name field');
+    assert.match(log, /TeammateIdle: traced cks-specialist/, 'should trace cks-specialist');
     assert.doesNotMatch(log, /missing agent_id/, 'should not error on missing agent_id');
+    assert.doesNotMatch(log, /no pending tracker for cks-specialist/, 'should find the pending tracker from SubagentStart');
   } finally {
     daemon.kill();
     fs.rmSync(home, { recursive: true, force: true });
