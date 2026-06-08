@@ -143,9 +143,9 @@ test('TeammateIdle span tree: invoke_agent span contains chat child', async () =
     const parsed = parseSessionFile(filePath);
     assert.ok(parsed);
 
-    // Mimic what handleTeammateIdle does: agent_type comes from payload directly
-    // (not from reading line 1), transcript path is derived from agent_id.
-    const agentType = 'cks-specialist'; // from payload['agent_type']
+    // Mimic what handleTeammateIdle does: agent type comes from payload['teammate_name'],
+    // transcript path comes from payload['transcript_path'].
+    const agentType = 'cks-specialist'; // from payload['teammate_name']
     const parentSpan = tracer.startSpan('turn');
     const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
       agentType,

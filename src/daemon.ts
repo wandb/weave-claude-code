@@ -999,25 +999,33 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracer) return;
 
-    // TeammateIdle payload (per CC docs): session_id/transcript_path are the
-    // COORDINATOR's fields; agent_id is the teammate's session UUID and
-    // agent_type is the teammate's agent name (e.g. "cks-specialist").
-    // The teammate transcript lives at <coordinator_dir>/<agent_id>.jsonl.
-    const agentId = payload['agent_id'] as string | undefined;
-    const agentType = (payload['agent_type'] as string | undefined) ?? 'teammate';
+    // TeammateIdle payload (actual schema, confirmed from live TARS triage):
+    //   session_id       — coordinator's session UUID
+    //   transcript_path  — teammate's transcript path (CC passes the triggering
+    //                       session's transcript; differs from coordinator's path)
+    //   teammate_name    — agent name, e.g. "cks-specialist"
+    //   team_name        — team name, e.g. "triage-supp-25017"
+    //
+    // Note: CC docs incorrectly listed agent_id / agent_type — those fields do
+    // not appear in practice.
+    const agentType = (payload['teammate_name'] as string | undefined) ?? 'teammate';
 
-    const transcriptPath = agentId
-      ? path.join(path.dirname(session.transcript.resolvedPath), `${agentId}.jsonl`)
-      : undefined;
+    // Use transcript_path from the payload. If it's the same as the coordinator's
+    // transcript this was mis-documented and we have no teammate transcript.
+    const rawTranscriptPath = payload['transcript_path'] as string | undefined;
+    const transcriptPath =
+      rawTranscriptPath && rawTranscriptPath !== session.transcript.resolvedPath
+        ? rawTranscriptPath
+        : undefined;
 
-    if (!transcriptPath) {
-      this.log('ERROR', `TeammateIdle: missing agent_id in payload for session ${sessionId}; payload keys=${Object.keys(payload).join(',')}`);
-      return;
-    }
+    this.log(
+      'DEBUG',
+      `TeammateIdle: agent=${agentType} team=${payload['team_name'] ?? '?'} transcript=${transcriptPath ?? '(none — same as coordinator or missing)'}`,
+    );
 
     const parentSpan = session.currentTurnSpan;
     if (!parentSpan) {
-      this.log('DEBUG', `TeammateIdle: no active turn span for session ${sessionId}; skipping ${agentType}`);
+      this.log('DEBUG', `TeammateIdle: no active turn span for session ${sessionId}; skipping ${agentType} ${payload['team_name'] ?? ''}`);
       return;
     }
 
@@ -1032,6 +1040,7 @@ export class GlobalDaemon {
     let lastAssistantText: string | undefined;
     let agentTranscript: TranscriptFile | undefined;
     try {
+      if (!transcriptPath) throw new Error('no teammate transcript path in payload');
       agentTranscript = new TranscriptFile(transcriptPath);
       const parsed = parseSessionFd(agentTranscript.getFd());
       if (parsed) {
@@ -1068,7 +1077,7 @@ export class GlobalDaemon {
     }
     invokeSpan.end();
 
-    this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath}`);
+    this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath ?? '(no transcript)'}`);
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
