@@ -9,15 +9,22 @@
 //   2. The first line is an agent-setting record, not a user message:
 //      {"type":"agent-setting","agentSetting":"cks-specialist","sessionId":"..."}
 //
-// The handler reads agentSetting from line 1, then calls parseSessionFd to
-// extract LLM call details. This test suite validates both behaviours using
-// real temp files so there are no mocking surprises.
+// Actual TeammateIdle payload schema (confirmed from live TARS triage, NOT CC docs):
+//   teammate_name  — agent name, e.g. "cks-specialist"   (docs said: agent_type)
+//   team_name      — team name, e.g. "triage-supp-25017" (docs said: agent_id)
+//   transcript_path — teammate's transcript path          (docs said: coordinator's)
+//
+// The integration test below sends this real payload schema through the daemon
+// to catch any regression in field-name reading.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -223,5 +230,95 @@ test('TeammateIdle: multi-turn transcript emits chat spans from all turns', () =
     assert.equal(totalCalls, 2, 'should have 2 assistant calls across both turns');
   } finally {
     fs.rmSync(path.dirname(filePath), { recursive: true });
+  }
+});
+
+// ── integration: actual payload field names ───────────────────────────────────
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..');
+const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
+
+test('TeammateIdle: daemon reads teammate_name/team_name from actual payload schema', async () => {
+  // Start a real daemon with a temp config, send the confirmed-live payload
+  // schema, and verify the log shows "traced cks-specialist" (not "missing agent_id").
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-inttest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  const transcriptDir = path.join(home, '.claude', 'projects', 'test');
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.mkdirSync(transcriptDir, { recursive: true });
+
+  // Write settings with a fake key so the tracer initializes (OTLP export will
+  // fail silently since the key is invalid, but spans are still created/logged).
+  fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
+    weave_project: 'test/test',
+    wandb_api_key: 'fake-key-for-test',
+    daemon_socket: socketPath,
+    log_file: logPath,
+    debug: true,
+  }));
+
+  // Write a fake teammate transcript under home (daemon rejects /tmp paths)
+  const teammatePath = path.join(transcriptDir, 'teammate.jsonl');
+  fs.writeFileSync(teammatePath, [
+    JSON.stringify({ type: 'agent-setting', agentSetting: 'cks-specialist', sessionId: 'tm-001' }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Investigate' }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: 'msg1',
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      stop_reason: 'end_turn', content: [{ type: 'text', text: 'Looks healthy.' }] } }),
+  ].join('\n') + '\n');
+
+  const coordinatorPath = path.join(transcriptDir, 'coord.jsonl');
+  fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  // Start daemon
+  const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home },
+    stdio: 'ignore',
+  });
+
+  const sendEvent = (payload: object): Promise<void> => new Promise((resolve, reject) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', reject);
+    s.on('connect', () => { s.end(JSON.stringify(payload)); });
+    s.on('close', () => resolve());
+  });
+
+  const waitForSocket = (): Promise<void> => new Promise((resolve) => {
+    const poll = setInterval(() => {
+      if (fs.existsSync(socketPath)) { clearInterval(poll); resolve(); }
+    }, 50);
+  });
+
+  const readLog = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+
+  try {
+    await waitForSocket();
+    await new Promise(r => setTimeout(r, 200)); // let daemon fully start
+
+    const sessionId = 'inttest-coord-001';
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: sessionId, transcript_path: coordinatorPath });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, transcript_path: coordinatorPath });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Send TeammateIdle with ACTUAL payload schema (teammate_name, not agent_id)
+    await sendEvent({
+      hook_event_name: 'TeammateIdle',
+      session_id: sessionId,
+      transcript_path: teammatePath,  // teammate's transcript (not coordinator's)
+      teammate_name: 'cks-specialist',
+      team_name: 'triage-inttest',
+    });
+    await new Promise(r => setTimeout(r, 300));
+
+    const log = readLog();
+    assert.match(log, /TeammateIdle: traced cks-specialist/, 'should trace cks-specialist using teammate_name field');
+    assert.doesNotMatch(log, /missing agent_id/, 'should not error on missing agent_id');
+  } finally {
+    daemon.kill();
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
