@@ -218,6 +218,9 @@ interface SessionState {
    *  for fresh (non-forked) sessions. Resolved once at SessionStart by
    *  walking `forkedFrom.sessionId` pointers across transcript files. */
   conversationId: string;
+  /** SDK Session object. Caches conversationId + agentName for child Turn
+   *  spans created in subsequent events. Ended at SessionEnd. */
+  weaveSession: weave.Session;
   transcript: TranscriptFile;
   cwd: string;
   source: string;
@@ -588,6 +591,11 @@ export class GlobalDaemon {
     this.sessions.set(sessionId, {
       sessionId,
       conversationId,
+      weaveSession: weave.startSession({
+        sessionId: conversationId,
+        agentName: this.agentName,
+        ...(initialRequestModel ? {model: initialRequestModel} : {}),
+      }),
       transcript,
       cwd,
       source,
@@ -1421,6 +1429,7 @@ export class GlobalDaemon {
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
     session.transcript.close();
+    session.weaveSession.end();
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
