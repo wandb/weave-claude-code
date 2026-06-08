@@ -53,22 +53,44 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   );
 }
 
-/** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
-interface PendingToolCall {
-  span: Span;
-  toolName: string;
-  toolInput: Record<string, unknown>;
-  /** True once a PermissionRequest event has been emitted for this tool. */
-  permissionRequested?: boolean;
-}
+/**
+ * Stores the tool span opened at PreToolUse so PostToolUse can close it.
+ *
+ * Two shapes: `sdk` (turn-parented, uses the weave SDK `Tool` wrapper) and
+ * `raw` (subagent-parented, still on the raw OTel span). The subagent path
+ * migrates to the SDK in PR #5 once `invoke_agent` is wrapped.
+ */
+type PendingToolCall =
+  | {
+      kind: 'sdk';
+      tool: weave.Tool;
+      toolName: string;
+      toolInput: Record<string, unknown>;
+      /** True once a PermissionRequest event has been emitted for this tool. */
+      permissionRequested?: boolean;
+    }
+  | {
+      kind: 'raw';
+      span: Span;
+      toolName: string;
+      toolInput: Record<string, unknown>;
+      /** True once a PermissionRequest event has been emitted for this tool. */
+      permissionRequested?: boolean;
+    };
 
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
-  addPermissionResolvedEvent(pending.span, {
-    approved,
-    timestamp: new Date(),
-  });
+  const ts = new Date();
+  if (pending.kind === 'sdk') {
+    pending.tool.addEvent(
+      ATTR.EVT_PERMISSION_RESOLVED,
+      { [ATTR.EVT_PERMISSION_APPROVED]: approved },
+      ts,
+    );
+  } else {
+    addPermissionResolvedEvent(pending.span, { approved, timestamp: ts });
+  }
 }
 
 /** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
@@ -705,13 +727,40 @@ export class GlobalDaemon {
       return;
     }
 
-    const toolSpan = startToolSpan(this.tracer, parentSpan, {
-      toolName,
-      toolUseId,
-      toolInput,
-      displayName: toolDisplayName(toolName, toolInput),
-    });
-    session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
+    // Subagent-spawned tools (agentId !== undefined) still parent under the
+    // subagent's raw `invoke_agent` span until PR #5 migrates the subagent
+    // path. Non-subagent tools parent under the SDK Turn via `turn.startTool`.
+    if (agentId) {
+      const toolSpan = startToolSpan(this.tracer, parentSpan, {
+        toolName,
+        toolUseId,
+        toolInput,
+        displayName: toolDisplayName(toolName, toolInput),
+      });
+      session.pendingToolCalls.set(toolUseId, {
+        kind: 'raw',
+        span: toolSpan,
+        toolName,
+        toolInput,
+      });
+    } else {
+      if (!session.currentTurn) {
+        this.log('ERROR', `PreToolUse: no current turn for session=${sessionId} tool=${toolName}`);
+        return;
+      }
+      const tool = session.currentTurn.startTool({
+        name: toolName,
+        toolCallId: toolUseId,
+        args: jsonStr(toolInput),
+      });
+      tool.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
+      session.pendingToolCalls.set(toolUseId, {
+        kind: 'sdk',
+        tool,
+        toolName,
+        toolInput,
+      });
+    }
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -737,10 +786,19 @@ export class GlobalDaemon {
     }
 
     pending.permissionRequested = true;
-    addPermissionRequestEvent(pending.span, {
-      suggestions: payload['permission_suggestions'],
-      timestamp: new Date(),
-    });
+    const ts = new Date();
+    const suggestions = payload['permission_suggestions'];
+    if (pending.kind === 'sdk') {
+      const evtAttrs = suggestions !== undefined
+        ? { [ATTR.EVT_PERMISSION_SUGGESTIONS]: jsonStr(suggestions) }
+        : {};
+      pending.tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, evtAttrs, ts);
+    } else {
+      addPermissionRequestEvent(pending.span, {
+        suggestions,
+        timestamp: ts,
+      });
+    }
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
@@ -770,8 +828,13 @@ export class GlobalDaemon {
 
     resolvePermissionIfPending(pending, true);
 
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
-    pending.span.end();
+    if (pending.kind === 'sdk') {
+      pending.tool.result = jsonStr(payload['tool_response']);
+      pending.tool.end();
+    } else {
+      pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
+      pending.span.end();
+    }
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -806,10 +869,17 @@ export class GlobalDaemon {
 
     resolvePermissionIfPending(pending, false);
 
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
-    pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
-    pending.span.setStatus({ code: SpanStatusCode.ERROR, message: typeof error === 'string' ? error : 'tool failed' });
-    pending.span.end();
+    const errMsg = typeof error === 'string' ? error : 'tool failed';
+    if (pending.kind === 'sdk') {
+      pending.tool.result = jsonStr(error);
+      pending.tool.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
+      pending.tool.end({ error: new Error(errMsg) });
+    } else {
+      pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
+      pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
+      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+      pending.span.end();
+    }
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -1084,9 +1154,15 @@ export class GlobalDaemon {
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       resolvePermissionIfPending(pending, false);
-      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
-      pending.span.end();
+      const orphanMsg = 'session ended before tool completed';
+      if (pending.kind === 'sdk') {
+        pending.tool.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        pending.tool.end({ error: new Error(orphanMsg) });
+      } else {
+        pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        pending.span.setStatus({ code: SpanStatusCode.ERROR, message: orphanMsg });
+        pending.span.end();
+      }
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
 
