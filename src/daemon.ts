@@ -14,10 +14,7 @@ import {
   DiagConsoleLogger,
   DiagLogLevel,
 } from '@opentelemetry/api';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { resourceFromAttributes } from '@opentelemetry/resources';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
@@ -333,7 +330,7 @@ export class GlobalDaemon {
   private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
-  private provider: NodeTracerProvider | null = null;
+  private weaveInitialized = false;
   private tracer: Tracer | null = null;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
    *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. The
@@ -355,16 +352,16 @@ export class GlobalDaemon {
     // Initialize the OTel tracer if Weave is configured
     if (this.weaveProject && this.apiKey) {
       try {
-        this.initTracer();
-        this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
+        await this.initTracer();
+        this.log('INFO', `OTel tracer initialized - project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
         this.log('INFO', `View traces: https://wandb.ai/${this.weaveProject}/weave/agents`);
       } catch (err) {
-        this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
-        this.provider = null;
+        this.log('ERROR', `Failed to initialize OTel tracer: ${err} - continuing without tracing`);
+        this.weaveInitialized = false;
         this.tracer = null;
       }
     } else {
-      this.log('INFO', 'No weave_project / API key configured — tracing disabled');
+      this.log('INFO', 'No weave_project / API key configured - tracing disabled');
     }
 
     // Herd prevention: probe the socket before removing it. Concurrent hook
@@ -418,40 +415,26 @@ export class GlobalDaemon {
 
   // ── tracer initialization ───────────────────────────────────────────────
 
-  private initTracer(): void {
+  private async initTracer(): Promise<void> {
     if (!this.weaveProject) throw new Error('weaveProject required to init tracer');
     if (!this.apiKey) throw new Error('apiKey required to init tracer');
 
-    const [entity, project] = this.weaveProject.split('/', 2);
-    if (!entity || !project) {
-      throw new Error(`Invalid weave_project format: '${this.weaveProject}' (expected entity/project)`);
-    }
-
-    // Route OTel diagnostics into the daemon log so exporter errors surface.
     if (this.debugEnabled) {
       diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN);
     }
+    // The Weave SDK reads WANDB_API_KEY and WANDB_BASE_URL from env when
+    // building its OTLP exporter target and auth header (see
+    // weave/sdks/node/src/wandb/settings.ts). weave.login() would also
+    // perform a synchronous connectivity probe and write to netrc, neither
+    // of which fit a background daemon. Direct env writes are the
+    // documented path for programmatic configuration today; revisit if the
+    // SDK exposes a programmatic settings API.
+    process.env['WANDB_API_KEY'] = this.apiKey;
+    process.env['WANDB_BASE_URL'] = this.baseUrl;
 
-    const resource = resourceFromAttributes({
-      // service.name has always mirrored the agent name; keep that coupling
-      // so a custom agent_name renames the OTel service too.
-      'service.name': this.agentName,
-      'service.version': VERSION,
-      'wandb.entity': entity,
-      'wandb.project': project,
-    });
-
-    const exporter = new OTLPTraceExporter({
-      url: `${this.baseUrl}/agents/otel/v1/traces`,
-      headers: { 'wandb-api-key': this.apiKey },
-    });
-
-    this.provider = new NodeTracerProvider({
-      resource,
-      spanProcessors: [new BatchSpanProcessor(exporter)],
-    });
-    this.provider.register();
-    this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
+    await weave.init(this.weaveProject);
+    this.weaveInitialized = true;
+    this.tracer = weave.getWeaveTracer('weave-claude-code');
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -529,50 +512,52 @@ export class GlobalDaemon {
 
     this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
 
-    try {
-      switch (eventName) {
-        case 'SessionStart':
-          await this.handleSessionStart(sessionId, payload);
-          break;
-        case 'UserPromptSubmit':
-          await this.handleUserPromptSubmit(sessionId, payload);
-          break;
-        case 'PreToolUse':
-          await this.handlePreToolUse(sessionId, agentId, payload);
-          break;
-        case 'PermissionRequest':
-          await this.handlePermissionRequest(sessionId, payload);
-          break;
-        case 'PostToolUse':
-          await this.handlePostToolUse(sessionId, payload);
-          break;
-        case 'PostToolUseFailure':
-          await this.handlePostToolUseFailure(sessionId, payload);
-          break;
-        case 'SubagentStart':
-          await this.handleSubagentStart(sessionId, payload);
-          break;
-        case 'SubagentStop':
-          await this.handleSubagentStop(sessionId, payload);
-          break;
-        case 'TeammateIdle':
-          await this.handleTeammateIdle(sessionId, payload);
-          break;
-        case 'PreCompact':
-          await this.handlePreCompact(sessionId, payload);
-          break;
-        case 'Stop':
-          await this.handleStop(sessionId, payload);
-          break;
-        case 'SessionEnd':
-          await this.handleSessionEnd(sessionId, payload);
-          break;
-        default:
-          break;
+    await weave.runIsolated(async () => {
+      try {
+        switch (eventName) {
+          case 'SessionStart':
+            await this.handleSessionStart(sessionId, payload);
+            break;
+          case 'UserPromptSubmit':
+            await this.handleUserPromptSubmit(sessionId, payload);
+            break;
+          case 'PreToolUse':
+            await this.handlePreToolUse(sessionId, agentId, payload);
+            break;
+          case 'PermissionRequest':
+            await this.handlePermissionRequest(sessionId, payload);
+            break;
+          case 'PostToolUse':
+            await this.handlePostToolUse(sessionId, payload);
+            break;
+          case 'PostToolUseFailure':
+            await this.handlePostToolUseFailure(sessionId, payload);
+            break;
+          case 'SubagentStart':
+            await this.handleSubagentStart(sessionId, payload);
+            break;
+          case 'SubagentStop':
+            await this.handleSubagentStop(sessionId, payload);
+            break;
+          case 'TeammateIdle':
+            await this.handleTeammateIdle(sessionId, payload);
+            break;
+          case 'PreCompact':
+            await this.handlePreCompact(sessionId, payload);
+            break;
+          case 'Stop':
+            await this.handleStop(sessionId, payload);
+            break;
+          case 'SessionEnd':
+            await this.handleSessionEnd(sessionId, payload);
+            break;
+          default:
+            break;
+        }
+      } catch (err) {
+        this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
       }
-    } catch (err) {
-      this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
-    }
+    });
   }
 
   // ── event handlers ────────────────────────────────────────────────────────
@@ -1481,11 +1466,11 @@ export class GlobalDaemon {
       }
     }
     this.teamMembers.clear();
-    if (this.provider) {
+    if (this.weaveInitialized) {
       try {
-        await this.provider.shutdown();
+        await weave.flushOTel();
       } catch (err) {
-        this.log('ERROR', `Error shutting down OTel provider: ${err}`);
+        this.log('ERROR', `Error flushing Weave SDK: ${err}`);
       }
     }
     for (const session of this.sessions.values()) {
