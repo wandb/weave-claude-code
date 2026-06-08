@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
-  Tracer,
   diag,
   DiagConsoleLogger,
   DiagLogLevel,
@@ -20,12 +19,23 @@ import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
-  CompactionAttrs,
   toolDisplayName,
   promptSnippet,
   jsonStr,
   providerFromModel,
 } from './genaiSpans.js';
+
+/**
+ * Compaction attributes captured from PreCompact and stamped on a turn span.
+ * The Weave Agents backend extracts these into dedicated columns
+ * (`compaction_summary`, `compaction_items_before`, `compaction_items_after`)
+ * and renders a "context_compacted" card in the chat view.
+ */
+interface CompactionAttrs {
+  summary?: string;
+  itemsBefore?: number;
+  itemsAfter?: number;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -215,7 +225,7 @@ function parseTimestamp(ts: string | undefined): Date | undefined {
  * the SDK's `startLLM` with backdated startTime/endTime so the emitted
  * span timeline matches the transcript timestamps.
  */
-function emitChatSpansViaSDK(
+export function emitChatSpansViaSDK(
   parent: weave.Turn | weave.SubAgent,
   conversationId: string,
   calls: AssistantCallDetail[],
@@ -339,7 +349,6 @@ export class GlobalDaemon {
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private weaveInitialized = false;
-  private tracer: Tracer | null = null;
 
   constructor(
     private readonly socketPath: string,
@@ -360,7 +369,6 @@ export class GlobalDaemon {
       } catch (err) {
         this.log('ERROR', `Failed to initialize OTel tracer: ${err} - continuing without tracing`);
         this.weaveInitialized = false;
-        this.tracer = null;
       }
     } else {
       this.log('INFO', 'No weave_project / API key configured - tracing disabled');
@@ -420,7 +428,6 @@ export class GlobalDaemon {
 
     await weave.init(this.weaveProject);
     this.weaveInitialized = true;
-    this.tracer = weave.getWeaveTracer('weave-claude-code');
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -677,7 +684,7 @@ export class GlobalDaemon {
       this.log('ERROR', `Unknown session: ${sessionId}`);
       return;
     }
-    if (!this.tracer) return;
+    if (!this.weaveInitialized) return;
 
     const prompt = (payload['prompt'] as string | undefined) ?? '';
     this.log(
@@ -715,7 +722,7 @@ export class GlobalDaemon {
 
   private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     const toolName = payload['tool_name'] as string | undefined;
@@ -905,7 +912,7 @@ export class GlobalDaemon {
 
   private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -966,7 +973,7 @@ export class GlobalDaemon {
 
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -1066,7 +1073,7 @@ export class GlobalDaemon {
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurn || !this.tracer) return;
+    if (!session?.currentTurn || !this.weaveInitialized) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
     // flush, otherwise the final chat span drops when the read races the writer.
