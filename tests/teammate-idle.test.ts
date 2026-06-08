@@ -25,29 +25,10 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
 import { readFirstTranscriptLine } from '../src/transcriptFile.ts';
 import { parseSessionFile } from '../src/parser.ts';
-import { startInvokeAgentSpan, emitChatSpansFromAssistantCalls, ATTR } from '../src/genaiSpans.ts';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-function setupTracer(): {
-  tracer: ReturnType<BasicTracerProvider['getTracer']>;
-  exporter: InMemorySpanExporter;
-  provider: BasicTracerProvider;
-} {
-  const exporter = new InMemorySpanExporter();
-  const provider = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(exporter)],
-  });
-  const tracer = provider.getTracer('test');
-  return { tracer, exporter, provider };
-}
 
 /** Write a fake teammate transcript to a temp file and return its path.
  *
@@ -142,59 +123,10 @@ test('parseSessionFile: skips agent-setting lines, parses LLM calls from teammat
   }
 });
 
-test('TeammateIdle span tree: invoke_agent span contains chat child', async () => {
-  const filePath = writeTeammateTranscript([AGENT_SETTING_LINE, MODE_LINE, USER_LINE, ASSISTANT_LINE]);
-  const { tracer, exporter, provider } = setupTracer();
-
-  try {
-    const parsed = parseSessionFile(filePath);
-    assert.ok(parsed);
-
-    // Mimic what handleTeammateIdle does: agent type comes from payload['teammate_name'],
-    // transcript path comes from payload['transcript_path'].
-    const agentType = 'cks-specialist'; // from payload['teammate_name']
-    const parentSpan = tracer.startSpan('turn');
-    const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
-      agentType,
-      conversationId: 'conv-1',
-      pluginVersion: '0.2.6',
-      displayName: `Agent: ${agentType}`,
-    });
-
-    for (const turn of parsed.turns) {
-      emitChatSpansFromAssistantCalls(tracer, invokeSpan, 'conv-1', turn.assistantCalls());
-    }
-    invokeSpan.end();
-    parentSpan.end();
-
-    await provider.forceFlush();
-
-    const spans = exporter.getFinishedSpans();
-    const invokeAgentSpan = spans.find(s => s.name === 'invoke_agent cks-specialist');
-    assert.ok(invokeAgentSpan, 'invoke_agent span should exist');
-    assert.equal(
-      invokeAgentSpan.attributes[ATTR.AGENT_NAME],
-      'cks-specialist',
-      'gen_ai.agent.name should be set',
-    );
-
-    const chatSpan = spans.find(s => s.name === 'chat claude-opus-4-8');
-    assert.ok(chatSpan, 'chat span should exist');
-
-    // Chat span should be a child of the invoke_agent span.
-    assert.equal(
-      chatSpan.parentSpanContext?.spanId,
-      invokeAgentSpan.spanContext().spanId,
-      'chat span should be child of invoke_agent span',
-    );
-
-    // Token counts should be correct (cache-inclusive total for input).
-    assert.equal(chatSpan.attributes[ATTR.USAGE_INPUT_TOKENS], 1500, 'input_tokens = 1000 + 500 cache_read');
-    assert.equal(chatSpan.attributes[ATTR.USAGE_OUTPUT_TOKENS], 200);
-  } finally {
-    fs.rmSync(path.dirname(filePath), { recursive: true });
-  }
-});
+// The invoke_agent -> chat span-tree shape and cache-inclusive token math are
+// covered by the SDK's own genai tests (subagent.ts nesting) and
+// genai-span-usage-tokens.test.ts (emitChatSpansViaSDK); the daemon-level
+// integration tests below exercise the full TeammateIdle path end-to-end.
 
 test('TeammateIdle: multi-turn transcript emits chat spans from all turns', () => {
   const turn2User = {

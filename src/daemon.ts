@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
-  Tracer,
   diag,
   DiagConsoleLogger,
   DiagLogLevel,
@@ -20,12 +19,23 @@ import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   DEFAULT_AGENT_NAME,
-  CompactionAttrs,
   toolDisplayName,
   promptSnippet,
   jsonStr,
   providerFromModel,
 } from './genaiSpans.js';
+
+/**
+ * Compaction attributes captured from PreCompact and stamped on a turn span.
+ * The Weave Agents backend extracts these into dedicated columns
+ * (`compaction_summary`, `compaction_items_before`, `compaction_items_after`)
+ * and renders a "context_compacted" card in the chat view.
+ */
+interface CompactionAttrs {
+  summary?: string;
+  itemsBefore?: number;
+  itemsAfter?: number;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -251,7 +261,7 @@ function parseTimestamp(ts: string | undefined): Date | undefined {
  * the SDK's `startLLM` with backdated startTime/endTime so the emitted
  * span timeline matches the transcript timestamps.
  */
-function emitChatSpansViaSDK(
+export function emitChatSpansViaSDK(
   parent: weave.Turn | weave.SubAgent,
   conversationId: string,
   calls: AssistantCallDetail[],
@@ -289,10 +299,12 @@ function emitChatSpansViaSDK(
           : {}),
       },
     });
-    llm.setAttribute(ATTR.CONVERSATION_ID, conversationId);
-    llm.setAttribute(ATTR.OUTPUT_TYPE, 'text');
-    if (c.responseId) llm.setAttribute(ATTR.RESPONSE_ID, c.responseId);
-    if (c.finishReason) llm.setAttribute(ATTR.RESPONSE_FINISH_REASONS, [c.finishReason]);
+    llm.setAttributes({
+      [ATTR.CONVERSATION_ID]: conversationId,
+      [ATTR.OUTPUT_TYPE]: 'text',
+    });
+    if (c.responseId) llm.setAttributes({ [ATTR.RESPONSE_ID]: c.responseId });
+    if (c.finishReason) llm.setAttributes({ [ATTR.RESPONSE_FINISH_REASONS]: [c.finishReason] });
     if (c.contentBlocks.length) {
       llm.outputMessages = [{
         role: 'assistant',
@@ -396,7 +408,6 @@ export class GlobalDaemon {
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private weaveInitialized = false;
-  private tracer: Tracer | null = null;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
    *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. The
    *  value is a FIFO queue: a re-spawned `${team}::${name}` appends rather than
@@ -423,7 +434,6 @@ export class GlobalDaemon {
       } catch (err) {
         this.log('ERROR', `Failed to initialize OTel tracer: ${err} - continuing without tracing`);
         this.weaveInitialized = false;
-        this.tracer = null;
       }
     } else {
       this.log('INFO', 'No weave_project / API key configured - tracing disabled');
@@ -499,7 +509,6 @@ export class GlobalDaemon {
 
     await weave.init(this.weaveProject);
     this.weaveInitialized = true;
-    this.tracer = weave.getWeaveTracer('weave-claude-code');
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -759,7 +768,7 @@ export class GlobalDaemon {
       this.log('ERROR', `Unknown session: ${sessionId}`);
       return;
     }
-    if (!this.tracer) return;
+    if (!this.weaveInitialized) return;
 
     const prompt = (payload['prompt'] as string | undefined) ?? '';
     this.log(
@@ -797,7 +806,7 @@ export class GlobalDaemon {
 
   private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     const toolName = payload['tool_name'] as string | undefined;
@@ -1025,7 +1034,7 @@ export class GlobalDaemon {
 
   private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -1090,7 +1099,7 @@ export class GlobalDaemon {
 
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -1170,7 +1179,7 @@ export class GlobalDaemon {
   }
 
   private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
-    if (!this.tracer) return;
+    if (!this.weaveInitialized) return;
     // FAIL-OPEN on a missing session: in the agent-teams model this hook fires
     // under the TEAMMATE's session_id, which may not be registered with this
     // daemon (only the coordinator is). `session` is therefore OPTIONAL for the
@@ -1261,12 +1270,7 @@ export class GlobalDaemon {
         // sessions — every turn is their own work. SubagentStop only emitted
         // the last turn; we replace that with full coverage here.
         for (const turn of parsed.turns) {
-          emitChatSpansFromAssistantCalls(
-            this.tracer,
-            parentUnderlyingSpan(tracker.subAgent),
-            session.conversationId,
-            turn.assistantCalls(),
-          );
+          emitChatSpansViaSDK(tracker.subAgent, session.conversationId, turn.assistantCalls());
         }
         const lastTurn = parsed.turns[parsed.turns.length - 1];
         model = lastTurn?.primaryModel();
@@ -1336,9 +1340,9 @@ export class GlobalDaemon {
       if (!transcriptPath) throw new Error('no teammate transcript path');
       t = new TranscriptFile(transcriptPath);
       const parsed = parseSessionFd(t.getFd());
-      if (parsed && this.tracer) {
+      if (parsed && this.weaveInitialized) {
         for (const turn of parsed.turns) {
-          emitChatSpansFromAssistantCalls(this.tracer, parentUnderlyingSpan(subAgent), conversationId, turn.assistantCalls());
+          emitChatSpansViaSDK(subAgent, conversationId, turn.assistantCalls());
         }
         const lastTurn = parsed.turns[parsed.turns.length - 1];
         model = lastTurn?.primaryModel();
@@ -1382,7 +1386,7 @@ export class GlobalDaemon {
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurn || !this.tracer) return;
+    if (!session?.currentTurn || !this.weaveInitialized) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
     // flush, otherwise the final chat span drops when the read races the writer.
