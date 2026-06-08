@@ -23,13 +23,11 @@ import {
   ATTR,
   DEFAULT_AGENT_NAME,
   CompactionAttrs,
-  startTurnSpan,
   startToolSpan,
   startInvokeAgentSpan,
   emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
-  setCompactionAttrs,
   toolDisplayName,
   promptSnippet,
   jsonStr,
@@ -226,7 +224,7 @@ interface SessionState {
   source: string;
   initialRequestModel?: string;
 
-  currentTurnSpan?: Span;
+  currentTurn?: weave.Turn;
 
   turnNumber: number;
   totalToolCalls: number;
@@ -239,6 +237,11 @@ interface SessionState {
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
 
+}
+
+// Temporary bridge: Tool and SubAgent paths still use raw spans (PRs #4 / #5).
+function turnUnderlyingSpan(turn: weave.Turn): Span {
+  return (turn as unknown as { span: Span }).span;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -702,36 +705,35 @@ export class GlobalDaemon {
     const prompt = (payload['prompt'] as string | undefined) ?? '';
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurnSpan ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
     );
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
-    const turnSpan = startTurnSpan(this.tracer, {
-      sessionId: session.sessionId,
-      conversationId: session.conversationId,
-      turnNumber: session.turnNumber,
-      prompt,
-      cwd: session.cwd,
-      source: session.source,
-      pluginVersion: VERSION,
+    const turn = session.weaveSession.startTurn({
       agentName: this.agentName,
-      requestModel: session.initialRequestModel,
-      displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+      ...(session.initialRequestModel ? {model: session.initialRequestModel} : {}),
     });
-    session.currentTurnSpan = turnSpan;
+    turn.setAttribute(ATTR.AGENT_VERSION, VERSION);
+    turn.setAttribute(ATTR.WEAVE_SESSION_ID, session.sessionId);
+    turn.setAttribute(ATTR.WEAVE_CWD, session.cwd);
+    turn.setAttribute(ATTR.WEAVE_SOURCE, session.source);
+    turn.setAttribute(ATTR.WEAVE_PLUGIN_VERSION, VERSION);
+    turn.setAttribute(ATTR.WEAVE_TURN_NUMBER, session.turnNumber);
+    turn.setAttribute(ATTR.WEAVE_DISPLAY_NAME, `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`);
+    turn.setAttribute(ATTR.INPUT_MESSAGES, jsonStr([{ role: 'user', content: prompt }]));
+    session.currentTurn = turn;
 
     // Drain compaction attrs buffered while no turn was open.
     if (session.pendingCompaction) {
-      setCompactionAttrs(turnSpan, session.pendingCompaction);
+      const c = session.pendingCompaction;
+      if (c.summary !== undefined) turn.setAttribute(ATTR.COMPACTION_SUMMARY, c.summary);
+      if (c.itemsBefore !== undefined) turn.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, c.itemsBefore);
+      if (c.itemsAfter !== undefined) turn.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, c.itemsAfter);
       session.pendingCompaction = undefined;
     }
 
-
-    this.log(
-      'INFO',
-      `Created turn span (turn ${session.turnNumber}) trace_id=${turnSpan.spanContext().traceId}`,
-    );
+    this.log('INFO', `Created turn span (turn ${session.turnNumber})`);
   }
 
   private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
@@ -747,8 +749,8 @@ export class GlobalDaemon {
     // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
     // a subagent, else the current turn span.
     const parentSpan = agentId
-      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? session.currentTurnSpan
-      : session.currentTurnSpan;
+      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined)
+      : (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined);
     if (!parentSpan) {
       this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
       return;
@@ -1010,8 +1012,8 @@ export class GlobalDaemon {
         transcriptPath: subagentPath,
         pendingTeammateIdle: true,
       };
-      if (session.currentTurnSpan) {
-        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
+      if (session.currentTurn) {
+        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, turnUnderlyingSpan(session.currentTurn), {
           agentType,
           conversationId: session.conversationId,
           pluginVersion: VERSION,
@@ -1048,7 +1050,7 @@ export class GlobalDaemon {
     // Chat spans for the subagent's LLM calls parent under the subagent's
     // own invoke_agent span. For orphan trackers without an invoke_agent
     // span (no current turn at SubagentStart), fall back to the turn span.
-    const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
+    const chatParent = tracker.invokeAgentSpan ?? (session.currentTurn ? turnUnderlyingSpan(session.currentTurn) : undefined);
 
     const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
     let model: string | undefined;
@@ -1319,8 +1321,10 @@ export class GlobalDaemon {
       itemsAfter: typeof payload['items_after'] === 'number' ? (payload['items_after'] as number) : undefined,
     };
 
-    if (session.currentTurnSpan) {
-      setCompactionAttrs(session.currentTurnSpan, attrs);
+    if (session.currentTurn) {
+      if (attrs.summary !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_SUMMARY, attrs.summary);
+      if (attrs.itemsBefore !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, attrs.itemsBefore);
+      if (attrs.itemsAfter !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, attrs.itemsAfter);
       this.log('INFO', `PreCompact attached to active turn ${session.turnNumber} (session ${sessionId})`);
     } else {
       // Buffer until the next UserPromptSubmit opens a turn span.
@@ -1331,10 +1335,10 @@ export class GlobalDaemon {
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurnSpan || !this.tracer) return;
+    if (!session?.currentTurn || !this.tracer) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
-    // flush — otherwise the final chat span drops when the read races the writer.
+    // flush, otherwise the final chat span drops when the read races the writer.
     const rawFinalMessage = payload['last_assistant_message'];
     const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
     const parsedSession = await this.parseSessionFileWithRetry(
@@ -1346,14 +1350,15 @@ export class GlobalDaemon {
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Emit one chat span per LLM call within this turn
+    // Chat spans still emitted via raw helper until PR #6. Parent context
+    // is the Turn's underlying Span via the temporary bridge.
     if (currentTurn) {
       emitChatSpansFromAssistantCalls(
         this.tracer,
-        session.currentTurnSpan,
+        turnUnderlyingSpan(session.currentTurn),
         session.conversationId,
         currentTurn.assistantCalls(),
       );
@@ -1364,7 +1369,7 @@ export class GlobalDaemon {
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
     if (assistantMessages.length) {
-      session.currentTurnSpan.setAttribute(
+      session.currentTurn.setAttribute(
         ATTR.OUTPUT_MESSAGES,
         jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m }))),
       );
@@ -1373,16 +1378,16 @@ export class GlobalDaemon {
     // Aggregate finish reasons from per-call detail
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {
-      session.currentTurnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
+      session.currentTurn.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
     }
 
     if (model) {
-      session.currentTurnSpan.setAttribute(ATTR.REQUEST_MODEL, model);
+      session.currentTurn.setAttribute(ATTR.REQUEST_MODEL, model);
     }
 
-    session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
-    session.currentTurnSpan.end();
-    session.currentTurnSpan = undefined;
+    session.currentTurn.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
+    session.currentTurn.end();
+    session.currentTurn = undefined;
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
@@ -1406,9 +1411,9 @@ export class GlobalDaemon {
     }
 
     // Close the current turn if still open
-    if (session.currentTurnSpan) {
-      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      session.currentTurnSpan.end();
+    if (session.currentTurn) {
+      session.currentTurn.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.currentTurn.end();
       this.log('DEBUG', `Closed orphaned turn span`);
     }
 
