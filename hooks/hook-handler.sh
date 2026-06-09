@@ -8,7 +8,8 @@
 # Weave daemon via Unix socket. Starts the daemon first if it is not running.
 #
 # Assumptions:
-#   - weave-claude-code is on PATH (installed globally via npm install -g)
+#   - weave-claude-code is on PATH (installed globally via npm install -g),
+#     which implies node is on PATH too.
 #
 # Errors are written to ~/.weave-claude-code/logs/hook-errors.log.
 # The script always exits 0 so it never disrupts Claude Code.
@@ -19,6 +20,12 @@ CONFIG_DIR="${HOME}/.weave-claude-code"
 SETTINGS_FILE="${CONFIG_DIR}/settings.json"
 ERROR_LOG="${CONFIG_DIR}/logs/hook-errors.log"
 SOCKET_PATH="${CONFIG_DIR}/daemon.sock"
+
+# Resolve the directory this script lives in so we can find hook-socket.mjs
+# (shipped alongside in the same hooks/ directory). The .mjs replaces the
+# previous `nc -U -w1` calls (see hook-socket.mjs for details).
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_SOCKET="${HOOK_DIR}/hook-socket.mjs"
 
 # Ensure the log directory exists so we can always write errors
 mkdir -p "${CONFIG_DIR}/logs"
@@ -63,11 +70,10 @@ fi
 # dies ungracefully (terminal SIGHUP, OOM, kill -9), its UNIX socket inode
 # remains on disk with no listener. `[ -S "$SOCKET_PATH" ]` returns true in
 # that state, but connect() will then fail and silently drop every event.
-# Probe the socket instead via the `probe-socket` subcommand, which does a
-# real connect() attempt and exits 0 only when a listener accepts.
+# Probe via hook-socket.mjs which does a real connect() attempt.
 
 is_daemon_alive() {
-  weave-claude-code probe-socket --path "${SOCKET_PATH}" >/dev/null 2>&1
+  node "${HOOK_SOCKET}" probe "${SOCKET_PATH}" >/dev/null 2>&1
 }
 
 if ! is_daemon_alive; then
@@ -93,12 +99,12 @@ fi
 
 # ── forward event to daemon ───────────────────────────────────────────────────
 #
-# `send-event` reads stdin, optionally merges WEAVE_PARENT_CALL_ID and
-# WEAVE_TRACE_ID env vars into the payload, then writes to the socket. The
-# subcommand exits 1 on connect failure; we log that to ERROR_LOG but always
-# exit 0 so a hook failure never disrupts Claude Code.
+# hook-socket.mjs send reads stdin, optionally merges WEAVE_PARENT_CALL_ID and
+# WEAVE_TRACE_ID env vars into the payload, then writes to the socket. It exits
+# 1 on connect failure; we log that to ERROR_LOG but always exit 0 so a hook
+# failure never disrupts Claude Code.
 
-weave-claude-code send-event --path "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
+node "${HOOK_SOCKET}" send "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
   echo "$(date -Iseconds) | ERROR | Failed to send event to daemon" >> "${ERROR_LOG}"
 }
 

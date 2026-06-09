@@ -44,8 +44,6 @@ Commands:
   status             Check installation status
   logs               Display daemon logs (--tail N, --follow)
   daemon             Start the background daemon (used by hook handler)
-  send-event         Forward a hook event payload from stdin to the daemon socket
-  probe-socket       Probe the daemon socket; exit 0 if alive, 1 otherwise
   uninstall          Remove the plugin and all associated files
 
 Options:
@@ -534,92 +532,6 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// send-event / probe-socket
-// ---------------------------------------------------------------------------
-//
-// These two subcommands are invoked by hooks/hook-handler.sh and exist so the
-// shell script does not need `nc` (netcat), a runtime dependency that is not
-// always present on Linux containers and was previously undocumented. Both
-// commands default the socket path to settings.json's `daemon_socket`, but the
-// hook always passes `--path` explicitly so it can run before `install` has
-// written settings.json.
-
-function getOptArg(args: string[], name: string): string | undefined {
-  const idx = args.indexOf(name);
-  if (idx === -1) return undefined;
-  return args[idx + 1];
-}
-
-function readAllStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => { data += chunk; });
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', reject);
-  });
-}
-
-function resolveSocketPath(args: string[]): string {
-  const explicit = getOptArg(args, '--path');
-  if (explicit) return explicit;
-  return loadSettings().daemon_socket;
-}
-
-// Merge WEAVE_PARENT_CALL_ID / WEAVE_TRACE_ID into the JSON payload when set in
-// the environment. Mirrors the inline `node -e` block that used to live in
-// hook-handler.sh.
-function mergeWeaveEnvContext(payload: string): string {
-  const parentCallId = process.env['WEAVE_PARENT_CALL_ID'];
-  const traceId = process.env['WEAVE_TRACE_ID'];
-  if (!parentCallId && !traceId) return payload;
-  const obj = JSON.parse(payload) as Record<string, unknown>;
-  if (parentCallId) obj['weave_parent_call_id'] = parentCallId;
-  if (traceId) obj['weave_trace_id'] = traceId;
-  return JSON.stringify(obj);
-}
-
-async function cmdSendEvent(args: string[]): Promise<void> {
-  let socketPath: string;
-  try {
-    socketPath = resolveSocketPath(args);
-  } catch (err) {
-    console.error(`send-event: ${(err as Error).message}`);
-    process.exit(1);
-  }
-
-  let payload = await readAllStdin();
-  try {
-    payload = mergeWeaveEnvContext(payload);
-  } catch (err) {
-    console.error(`send-event: failed to merge Weave context: ${(err as Error).message}`);
-    process.exit(1);
-  }
-
-  try {
-    await sendToSocket(socketPath, payload);
-  } catch (err) {
-    console.error(`send-event: ${(err as Error).message}`);
-    process.exit(1);
-  }
-}
-
-async function cmdProbeSocket(args: string[]): Promise<void> {
-  let socketPath: string;
-  try {
-    socketPath = resolveSocketPath(args);
-  } catch (err) {
-    console.error(`probe-socket: ${(err as Error).message}`);
-    process.exit(1);
-  }
-  const timeoutArg = getOptArg(args, '--timeout-ms');
-  const timeoutMs = timeoutArg ? parseInt(timeoutArg, 10) : 250;
-
-  const state = await probeUnixSocket(socketPath, timeoutMs);
-  process.exit(state === 'alive' ? 0 : 1);
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -674,16 +586,6 @@ async function main(): Promise<void> {
 
   if (cmd === 'daemon') {
     await runDaemon();
-    return;
-  }
-
-  if (cmd === 'send-event') {
-    await cmdSendEvent(args.slice(1));
-    return;
-  }
-
-  if (cmd === 'probe-socket') {
-    await cmdProbeSocket(args.slice(1));
     return;
   }
 
