@@ -351,6 +351,7 @@ test('TeammateIdle: full TARS sequence — SubagentStart → SubagentStop → Te
     assert.doesNotMatch(log, /no pending tracker for cks-specialist/, 'should find the pending tracker from SubagentStart');
   } finally {
     daemon.kill();
+    await new Promise<void>(resolve => daemon.once('exit', () => resolve()));
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
