@@ -23,7 +23,7 @@ import {
   saveSettings,
   type Settings,
 } from './setup.js';
-import { prompt, sendToSocket, probeUnixSocket } from './utils.js';
+import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
 
 // ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ Usage:
 Commands:
   install            Set up the plugin (records runtime paths, creates config)
   config <action>    Manage configuration (show | get <key> | set <key> <value>)
-  status             Check installation status
+  status             Check installation status (pass --json for machine-readable output)
   logs               Display daemon logs (--tail N, --follow)
   daemon             Start the background daemon (used by hook handler)
   uninstall          Remove the plugin and all associated files
@@ -217,18 +217,18 @@ async function cmdConfig(args: string[]): Promise<void> {
     }
 
     const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-    const projectSource = process.env['WEAVE_PROJECT']
-      ? 'WEAVE_PROJECT env var'
+    const projectSource: WeaveProjectSource = process.env['WEAVE_PROJECT']
+      ? WeaveProjectSource.EnvVar
       : settings.weave_project
-        ? 'settings.json'
-        : 'not set';
+        ? WeaveProjectSource.Settings
+        : WeaveProjectSource.NotSet;
 
     const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-    const apiKeySource = process.env['WANDB_API_KEY']
-      ? 'WANDB_API_KEY env var'
+    const apiKeySource: ApiKeySource = process.env['WANDB_API_KEY']
+      ? ApiKeySource.EnvVar
       : settings.wandb_api_key
-        ? 'settings.json'
-        : 'not set';
+        ? ApiKeySource.Settings
+        : ApiKeySource.NotSet;
     const apiKeyDisplay = effectiveApiKey ? `${maskSecret(effectiveApiKey)} [${apiKeySource}]` : `(not set)`;
 
     console.log('Current configuration:');
@@ -322,95 +322,209 @@ async function cmdConfig(args: string[]): Promise<void> {
 // status
 // ---------------------------------------------------------------------------
 
-async function cmdStatus(): Promise<void> {
-  console.log('Weave Claude Code Plugin Status');
-  console.log('================================');
+/** Where a configured value (project, API key) came from at gather time. */
+export enum WeaveProjectSource {
+  EnvVar = 'WEAVE_PROJECT env var',
+  Settings = 'settings.json',
+  NotSet = 'not set',
+}
+export enum ApiKeySource {
+  EnvVar = 'WANDB_API_KEY env var',
+  Settings = 'settings.json',
+  NotSet = 'not set',
+}
 
-  // Check settings file
+/** Whether settings.json could be read at gather time. */
+export enum ConfigState {
+  Ok = 'ok',
+  Missing = 'missing',
+  Unreadable = 'unreadable',
+}
+
+/**
+ * Public JSON schema returned by `status --json`. Consumers (harness
+ * integrations, CI scripts) depend on these field names — treat it as a
+ * stable contract. The raw API key is never included, only a boolean.
+ */
+interface StatusReport {
+  version: string;
+  settings_file: string;
+  cli_path: string | null;
+  weave_project: string | null;
+  weave_project_source: WeaveProjectSource;
+  api_key_configured: boolean;
+  daemon_socket: { path: string | null; state: SocketState | null };
+  log_file: { path: string | null; size_bytes: number | null };
+  ready_to_trace: boolean;
+  view_traces_url: string | null;
+}
+
+/**
+ * Everything `gatherStatus` produces. Bundles the public JSON `report` with
+ * pretty-print-only fields (masked key, key source, config error message) so
+ * the print paths never re-read settings, env vars, or the socket themselves.
+ */
+interface StatusSnapshot {
+  report: StatusReport;
+  config_state: ConfigState;
+  config_error: string | null;
+  api_key_masked: string | null;
+  api_key_source: ApiKeySource;
+}
+
+async function gatherStatus(): Promise<StatusSnapshot> {
+  const report: StatusReport = {
+    version: VERSION,
+    settings_file: SETTINGS_FILE,
+    cli_path: null,
+    weave_project: null,
+    weave_project_source: WeaveProjectSource.NotSet,
+    api_key_configured: false,
+    daemon_socket: { path: null, state: null },
+    log_file: { path: null, size_bytes: null },
+    ready_to_trace: false,
+    view_traces_url: null,
+  };
+  const snap: StatusSnapshot = {
+    report,
+    config_state: ConfigState.Ok,
+    config_error: null,
+    api_key_masked: null,
+    api_key_source: ApiKeySource.NotSet,
+  };
+
+  const whichResult = spawnSync('which', ['weave-claude-code'], { encoding: 'utf8' });
+  if (whichResult.status === 0 && whichResult.stdout.trim()) {
+    report.cli_path = whichResult.stdout.trim();
+  }
+
   if (!fs.existsSync(SETTINGS_FILE)) {
-    console.log(`✗ Configuration: not found at ${SETTINGS_FILE}`);
-    console.log('\nRun: weave-claude-code install');
-    process.exit(1);
+    snap.config_state = ConfigState.Missing;
+    return snap;
   }
 
   let settings: Settings;
   try {
     settings = loadSettings();
   } catch (err) {
-    console.log(`✗ Configuration: failed to read (${err})`);
-    process.exit(1);
+    snap.config_state = ConfigState.Unreadable;
+    snap.config_error = String(err);
+    return snap;
   }
 
-  console.log(`✓ Configuration: ${SETTINGS_FILE}`);
-
-  // Check weave-claude-code is on PATH
-  const whichResult = spawnSync('which', ['weave-claude-code'], { encoding: 'utf8' });
-  if (whichResult.status === 0 && whichResult.stdout.trim()) {
-    console.log(`✓ CLI: ${whichResult.stdout.trim()} (v${VERSION})`);
-  } else {
-    console.log('✗ CLI: weave-claude-code not found in PATH');
-    console.log('  Run: npm install -g weave-claude-code');
-  }
-
-  // Check weave_project (env var takes precedence over settings file)
+  // Env vars take precedence over settings.json for both project and key.
   const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   if (effectiveProject) {
-    const source = process.env['WEAVE_PROJECT'] ? 'WEAVE_PROJECT env var' : 'settings.json';
-    console.log(`✓ Weave project: ${effectiveProject} (from ${source})`);
-  } else {
-    console.log('✗ Weave project: not configured');
-    console.log('  Run: weave-claude-code config set weave_project ENTITY/PROJECT');
+    report.weave_project = effectiveProject;
+    report.weave_project_source = process.env['WEAVE_PROJECT'] ? WeaveProjectSource.EnvVar : WeaveProjectSource.Settings;
   }
 
-  // Check WANDB_API_KEY (env var takes precedence over settings file)
   const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
   if (effectiveApiKey) {
-    const apiKeySource = process.env['WANDB_API_KEY'] ? 'WANDB_API_KEY env var' : 'settings.json';
-    console.log(`✓ W&B API key: ${maskSecret(effectiveApiKey)} (from ${apiKeySource})`);
-  } else {
-    console.log('✗ W&B API key: not configured');
-    console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
+    report.api_key_configured = true;
+    snap.api_key_masked = maskSecret(effectiveApiKey);
+    snap.api_key_source = process.env['WANDB_API_KEY'] ? ApiKeySource.EnvVar : ApiKeySource.Settings;
   }
 
   // Probe daemon socket — distinguishes alive (listening) from stale (file
   // exists but no listener, eg. daemon crashed). Reporting "(exists)" purely
   // from the inode hides crashes and makes "Ready to trace" lie.
-  const socketPath = settings.daemon_socket;
-  const socketState = await probeUnixSocket(socketPath);
-  if (socketState === 'alive') {
+  report.daemon_socket.path = settings.daemon_socket;
+  report.daemon_socket.state = await probeUnixSocket(settings.daemon_socket);
+
+  report.log_file.path = settings.log_file;
+  if (fs.existsSync(settings.log_file)) {
+    report.log_file.size_bytes = fs.statSync(settings.log_file).size;
+  }
+
+  if (effectiveProject && effectiveApiKey && report.daemon_socket.state !== SocketState.Stale) {
+    report.ready_to_trace = true;
+    report.view_traces_url = `https://wandb.ai/${effectiveProject}/weave/agents`;
+  }
+
+  return snap;
+}
+
+function printPrettyStatus(snap: StatusSnapshot): void {
+  const { report, config_state, config_error, api_key_masked, api_key_source } = snap;
+
+  console.log('Weave Claude Code Plugin Status');
+  console.log('================================');
+
+  if (config_state === ConfigState.Missing) {
+    console.log(`✗ Configuration: not found at ${report.settings_file}`);
+    console.log('\nRun: weave-claude-code install');
+    return;
+  }
+  if (config_state === ConfigState.Unreadable) {
+    console.log(`✗ Configuration: failed to read (${config_error})`);
+    return;
+  }
+  console.log(`✓ Configuration: ${report.settings_file}`);
+
+  if (report.cli_path) {
+    console.log(`✓ CLI: ${report.cli_path} (v${report.version})`);
+  } else {
+    console.log('✗ CLI: weave-claude-code not found in PATH');
+    console.log('  Run: npm install -g weave-claude-code');
+  }
+
+  if (report.weave_project) {
+    console.log(`✓ Weave project: ${report.weave_project} (from ${report.weave_project_source})`);
+  } else {
+    console.log('✗ Weave project: not configured');
+    console.log('  Run: weave-claude-code config set weave_project ENTITY/PROJECT');
+  }
+
+  if (report.api_key_configured) {
+    console.log(`✓ W&B API key: ${api_key_masked} (from ${api_key_source})`);
+  } else {
+    console.log('✗ W&B API key: not configured');
+    console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
+  }
+
+  const { path: socketPath, state: socketState } = report.daemon_socket;
+  if (socketState === SocketState.Alive) {
     console.log(`✓ Daemon socket: ${socketPath} (alive)`);
-  } else if (socketState === 'stale') {
+  } else if (socketState === SocketState.Stale) {
     console.log(`✗ Daemon socket: ${socketPath} (stale — file exists but no listener)`);
     console.log(`  Auto-recovers on next Claude Code session — no action needed.`);
   } else {
     console.log(`- Daemon socket: ${socketPath} (not running)`);
   }
 
-  // Check log file
-  const logFile = settings.log_file;
-  if (fs.existsSync(logFile)) {
-    const stat = fs.statSync(logFile);
-    const kb = (stat.size / 1024).toFixed(1);
-    console.log(`✓ Log file: ${logFile} (${kb} KB)`);
+  if (report.log_file.size_bytes !== null) {
+    const kb = (report.log_file.size_bytes / 1024).toFixed(1);
+    console.log(`✓ Log file: ${report.log_file.path} (${kb} KB)`);
   } else {
-    console.log(`- Log file: ${logFile} (not created yet)`);
+    console.log(`- Log file: ${report.log_file.path} (not created yet)`);
   }
 
   console.log('');
-  if (effectiveProject && effectiveApiKey && socketState !== 'stale') {
+  if (report.ready_to_trace) {
     console.log('Status: Ready to trace');
-    console.log(`View traces: https://wandb.ai/${effectiveProject}/weave/agents`);
-  } else if (socketState === 'stale') {
+    console.log(`View traces: ${report.view_traces_url}`);
+  } else if (socketState === SocketState.Stale) {
     console.log('Status: Daemon socket is stale — will auto-recover on next Claude Code hook');
   } else {
     const missing = [
-      !effectiveProject && 'weave_project',
-      !effectiveApiKey && 'wandb_api_key',
+      !report.weave_project && 'weave_project',
+      !report.api_key_configured && 'wandb_api_key',
     ].filter(Boolean).join(', ');
     console.log(`Status: Configuration incomplete — set ${missing} to start tracing`);
   }
+}
 
-  if (socketState === 'stale') {
+async function cmdStatus(opts: { json: boolean } = { json: false }): Promise<void> {
+  const snap = await gatherStatus();
+
+  if (opts.json) {
+    console.log(JSON.stringify(snap.report, null, 2));
+  } else {
+    printPrettyStatus(snap);
+  }
+
+  if (snap.config_state !== ConfigState.Ok || snap.report.daemon_socket.state === SocketState.Stale) {
     process.exit(1);
   }
 }
@@ -560,7 +674,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'status') {
-    await cmdStatus();
+    await cmdStatus({ json: args.includes('--json') });
     return;
   }
 

@@ -85,37 +85,46 @@ export function isPathWithinBase(targetPath: string, basePath: string): boolean 
 }
 
 /**
+ * Possible states of a Unix-domain socket inode. String-valued so JSON
+ * consumers and assertions see the literal value (`'alive'`, `'stale'`,
+ * `'absent'`), not a numeric ordinal.
+ */
+export enum SocketState {
+  /** connect() succeeded; something is listening. */
+  Alive = 'alive',
+  /** Inode exists but connect() failed (ECONNREFUSED, ENOTSOCK, hang, etc.);
+   *  a daemon died without cleaning up its socket. */
+  Stale = 'stale',
+  /** No inode at the path. */
+  Absent = 'absent',
+}
+
+/**
  * Probe a Unix-domain socket and distinguish the three states a daemon socket
- * file can be in:
- *   - 'absent' — no inode at the path
- *   - 'alive'  — connect() succeeded; something is listening
- *   - 'stale'  — inode exists but connect() failed (ECONNREFUSED, ENOTSOCK,
- *                hang, etc.); a daemon died without cleaning up its socket
- *
- * The `[ -S path ]` / fs.existsSync(path) test alone cannot tell 'alive' from
- * 'stale': the socket inode persists across an ungraceful exit. Only an actual
- * connect attempt distinguishes them.
+ * file can be in. The `[ -S path ]` / `fs.existsSync(path)` test alone cannot
+ * tell `Alive` from `Stale`: the socket inode persists across an ungraceful
+ * exit. Only an actual connect attempt distinguishes them.
  */
 export function probeUnixSocket(
   socketPath: string,
   timeoutMs = 250,
-): Promise<'alive' | 'stale' | 'absent'> {
+): Promise<SocketState> {
   return new Promise((resolve) => {
     if (!fs.existsSync(socketPath)) {
-      resolve('absent');
+      resolve(SocketState.Absent);
       return;
     }
     const client = net.createConnection(socketPath);
     let settled = false;
-    const settle = (v: 'alive' | 'stale'): void => {
+    const settle = (v: SocketState.Alive | SocketState.Stale): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       client.destroy();
       resolve(v);
     };
-    const timer = setTimeout(() => settle('stale'), timeoutMs);
-    client.once('connect', () => settle('alive'));
-    client.once('error', () => settle('stale'));
+    const timer = setTimeout(() => settle(SocketState.Stale), timeoutMs);
+    client.once('connect', () => settle(SocketState.Alive));
+    client.once('error', () => settle(SocketState.Stale));
   });
 }
