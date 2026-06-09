@@ -323,9 +323,9 @@ async function cmdConfig(args: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Machine-readable status snapshot. Stable schema: consumers (harness
- * integrations, CI scripts) depend on the field names. Never include the raw
- * API key value, only a boolean.
+ * Public JSON schema returned by `status --json`. Consumers (harness
+ * integrations, CI scripts) depend on these field names — treat it as a
+ * stable contract. The raw API key is never included, only a boolean.
  */
 interface StatusReport {
   version: string;
@@ -341,19 +341,19 @@ interface StatusReport {
 }
 
 /**
- * Internal state shared by the JSON and pretty-print paths. `report` is the
- * public contract; `settings` and `settingsState` stay private so the pretty
- * renderer can mask the raw key for human display and distinguish "missing"
- * from "unreadable" without re-doing any of the gathering work.
+ * Everything `gatherStatus` produces. Bundles the public JSON `report` with
+ * pretty-print-only fields (masked key, key source, config error message) so
+ * the print paths never re-read settings, env vars, or the socket themselves.
  */
-interface StatusState {
+interface StatusSnapshot {
   report: StatusReport;
-  settings: Settings | null;
-  settingsState: 'ok' | 'missing' | 'unreadable';
-  settingsError: string | null;
+  config_state: 'ok' | 'missing' | 'unreadable';
+  config_error: string | null;
+  api_key_masked: string | null;
+  api_key_source: 'WANDB_API_KEY env var' | 'settings.json' | 'not set';
 }
 
-async function gatherStatus(): Promise<StatusState> {
+async function gatherStatus(): Promise<StatusSnapshot> {
   const report: StatusReport = {
     version: VERSION,
     settings_file: SETTINGS_FILE,
@@ -366,6 +366,13 @@ async function gatherStatus(): Promise<StatusState> {
     ready_to_trace: false,
     view_traces_url: null,
   };
+  const snap: StatusSnapshot = {
+    report,
+    config_state: 'ok',
+    config_error: null,
+    api_key_masked: null,
+    api_key_source: 'not set',
+  };
 
   const whichResult = spawnSync('which', ['weave-claude-code'], { encoding: 'utf8' });
   if (whichResult.status === 0 && whichResult.stdout.trim()) {
@@ -373,14 +380,17 @@ async function gatherStatus(): Promise<StatusState> {
   }
 
   if (!fs.existsSync(SETTINGS_FILE)) {
-    return { report, settings: null, settingsState: 'missing', settingsError: null };
+    snap.config_state = 'missing';
+    return snap;
   }
 
   let settings: Settings;
   try {
     settings = loadSettings();
   } catch (err) {
-    return { report, settings: null, settingsState: 'unreadable', settingsError: String(err) };
+    snap.config_state = 'unreadable';
+    snap.config_error = String(err);
+    return snap;
   }
 
   // Env vars take precedence over settings.json for both project and key.
@@ -391,7 +401,11 @@ async function gatherStatus(): Promise<StatusState> {
   }
 
   const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-  report.api_key_configured = !!effectiveApiKey;
+  if (effectiveApiKey) {
+    report.api_key_configured = true;
+    snap.api_key_masked = maskSecret(effectiveApiKey);
+    snap.api_key_source = process.env['WANDB_API_KEY'] ? 'WANDB_API_KEY env var' : 'settings.json';
+  }
 
   // Probe daemon socket — distinguishes alive (listening) from stale (file
   // exists but no listener, eg. daemon crashed). Reporting "(exists)" purely
@@ -409,22 +423,22 @@ async function gatherStatus(): Promise<StatusState> {
     report.view_traces_url = `https://wandb.ai/${effectiveProject}/weave/agents`;
   }
 
-  return { report, settings, settingsState: 'ok', settingsError: null };
+  return snap;
 }
 
-function printPrettyStatus(state: StatusState): void {
-  const { report, settings, settingsState, settingsError } = state;
+function printPrettyStatus(snap: StatusSnapshot): void {
+  const { report, config_state, config_error, api_key_masked, api_key_source } = snap;
 
   console.log('Weave Claude Code Plugin Status');
   console.log('================================');
 
-  if (settingsState === 'missing') {
+  if (config_state === 'missing') {
     console.log(`✗ Configuration: not found at ${report.settings_file}`);
     console.log('\nRun: weave-claude-code install');
     return;
   }
-  if (settingsState === 'unreadable') {
-    console.log(`✗ Configuration: failed to read (${settingsError})`);
+  if (config_state === 'unreadable') {
+    console.log(`✗ Configuration: failed to read (${config_error})`);
     return;
   }
   console.log(`✓ Configuration: ${report.settings_file}`);
@@ -443,17 +457,14 @@ function printPrettyStatus(state: StatusState): void {
     console.log('  Run: weave-claude-code config set weave_project ENTITY/PROJECT');
   }
 
-  if (report.api_key_configured && settings) {
-    const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? '';
-    const apiKeySource = process.env['WANDB_API_KEY'] ? 'WANDB_API_KEY env var' : 'settings.json';
-    console.log(`✓ W&B API key: ${maskSecret(effectiveApiKey)} (from ${apiKeySource})`);
+  if (report.api_key_configured) {
+    console.log(`✓ W&B API key: ${api_key_masked} (from ${api_key_source})`);
   } else {
     console.log('✗ W&B API key: not configured');
     console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
   }
 
-  const socketPath = report.daemon_socket.path!;
-  const socketState = report.daemon_socket.state!;
+  const { path: socketPath, state: socketState } = report.daemon_socket;
   if (socketState === 'alive') {
     console.log(`✓ Daemon socket: ${socketPath} (alive)`);
   } else if (socketState === 'stale') {
@@ -486,15 +497,15 @@ function printPrettyStatus(state: StatusState): void {
 }
 
 async function cmdStatus(opts: { json: boolean } = { json: false }): Promise<void> {
-  const state = await gatherStatus();
+  const snap = await gatherStatus();
 
   if (opts.json) {
-    console.log(JSON.stringify(state.report, null, 2));
+    console.log(JSON.stringify(snap.report, null, 2));
   } else {
-    printPrettyStatus(state);
+    printPrettyStatus(snap);
   }
 
-  if (state.settingsState !== 'ok' || state.report.daemon_socket.state === 'stale') {
+  if (snap.config_state !== 'ok' || snap.report.daemon_socket.state === 'stale') {
     process.exit(1);
   }
 }
