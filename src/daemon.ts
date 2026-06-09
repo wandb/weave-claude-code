@@ -177,6 +177,14 @@ interface SubagentTracker {
   /** True once the invoke_agent span has been ended. Guards against
    *  double-end when PostToolUse and SubagentStop both try to close it. */
   ended?: boolean;
+  /** Subagent transcript path — stored at SubagentStart so TeammateIdle can
+   *  read all turns without relying on the payload's transcript_path (which
+   *  CC sets to the coordinator's path, not the subagent's). */
+  transcriptPath?: string;
+  /** Set on orphan trackers when SubagentStop fires before TeammateIdle.
+   *  Suppresses span closure at SubagentStop so TeammateIdle can close it
+   *  with full all-turns content. */
+  pendingTeammateIdle?: boolean;
 }
 
 interface SessionState {
@@ -203,6 +211,7 @@ interface SessionState {
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +255,19 @@ class SubagentTracking {
 
   byAgentId(agentId: string): SubagentTracker | undefined {
     return this.trackers.find(t => t.agentId === agentId);
+  }
+
+  /** Find a tracker awaiting TeammateIdle by its subagentType. Used to
+   *  correlate TeammateIdle(teammate_name) with the orphan tracker created
+   *  at SubagentStart. Returns the oldest pending match (FIFO). */
+  findPendingTeammateIdle(subagentType: string): SubagentTracker | undefined {
+    let best: SubagentTracker | undefined;
+    for (const t of this.trackers) {
+      if (!t.pendingTeammateIdle) continue;
+      if (t.subagentType !== subagentType) continue;
+      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
+    }
+    return best;
   }
 
   /** Lookup by spawning Agent tool's tool_use_id. Used at PostToolUse to find
@@ -474,6 +496,9 @@ export class GlobalDaemon {
         case 'SubagentStop':
           await this.handleSubagentStop(sessionId, payload);
           break;
+        case 'TeammateIdle':
+          await this.handleTeammateIdle(sessionId, payload);
+          break;
         case 'PreCompact':
           await this.handlePreCompact(sessionId, payload);
           break;
@@ -648,6 +673,7 @@ export class GlobalDaemon {
       setCompactionAttrs(turnSpan, session.pendingCompaction);
       session.pendingCompaction = undefined;
     }
+
 
     this.log(
       'INFO',
@@ -890,6 +916,8 @@ export class GlobalDaemon {
       bestTracker = {
         subagentType: agentType,
         detectedAt: new Date(),
+        transcriptPath: subagentPath,
+        pendingTeammateIdle: true,
       };
       if (session.currentTurnSpan) {
         bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
@@ -971,11 +999,13 @@ export class GlobalDaemon {
         tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
       }
       // Orphan path: no PostToolUse will fire, so close the invoke_agent
-      // span here using the subagent's final assistant text as the output.
+      // span here — unless TeammateIdle is expected to follow (FleetView/
+      // Teammate pattern). In that case, keep the span open so TeammateIdle
+      // can emit all-turns content and close it correctly.
       // Matched path: leave the span open for PostToolUse to close with the
       // canonical tool_response and remove the tracker; if we removed the
       // tracker here, byToolUseId at PostToolUse would miss it.
-      if (!tracker.ended && !tracker.toolUseId) {
+      if (!tracker.ended && !tracker.toolUseId && !tracker.pendingTeammateIdle) {
         this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
       }
     }
@@ -987,9 +1017,86 @@ export class GlobalDaemon {
 
     // Only remove orphan trackers here. Matched trackers stay until
     // PostToolUse(Agent) closes the invoke_agent span and removes them.
-    if (!tracker.toolUseId) {
+    // Orphans awaiting TeammateIdle also stay — TeammateIdle will close and remove.
+    if (!tracker.toolUseId && !tracker.pendingTeammateIdle) {
       session.subagents.remove(tracker);
     }
+  }
+
+  private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.tracer) return;
+
+    // TeammateIdle payload (actual schema, confirmed from live TARS triage):
+    //   session_id    — coordinator's session UUID
+    //   teammate_name — agent name, e.g. "cks-specialist"
+    //   team_name     — team name, e.g. "triage-supp-25017"
+    //   transcript_path — CC sets this to the coordinator's transcript (not the
+    //                     teammate's), so we ignore it and use the path stored
+    //                     at SubagentStart instead.
+    //
+    // Note: CC docs incorrectly listed agent_id / agent_type — those fields do
+    // not appear in practice.
+    const agentType = (payload['teammate_name'] as string | undefined) ?? 'teammate';
+    const teamName = (payload['team_name'] as string | undefined) ?? '?';
+
+    // Find the orphan tracker created at SubagentStart for this teammate.
+    // SubagentStop has already fired but left the invoke_agent span open
+    // specifically so TeammateIdle can close it with full all-turns content.
+    const tracker = session.subagents.findPendingTeammateIdle(agentType);
+
+    if (!tracker?.invokeAgentSpan) {
+      this.log('DEBUG', `TeammateIdle: no pending tracker for ${agentType} team=${teamName} — skipping`);
+      return;
+    }
+
+    // Use the transcript path stored at SubagentStart — more reliable than
+    // the payload's transcript_path which CC sets to the coordinator's path.
+    const transcriptPath = tracker.transcriptPath;
+
+    this.log('DEBUG', `TeammateIdle: agent=${agentType} team=${teamName} transcript=${transcriptPath ?? '(none)'}`);
+
+    let model: string | undefined;
+    let lastAssistantText: string | undefined;
+    let agentTranscript: TranscriptFile | undefined;
+    try {
+      if (!transcriptPath) throw new Error('no transcript path stored at SubagentStart');
+      agentTranscript = new TranscriptFile(transcriptPath);
+      const parsed = parseSessionFd(agentTranscript.getFd());
+      if (parsed) {
+        // Emit chat spans for ALL turns. Teammates are independent top-level
+        // sessions — every turn is their own work. SubagentStop only emitted
+        // the last turn; we replace that with full coverage here.
+        for (const turn of parsed.turns) {
+          emitChatSpansFromAssistantCalls(
+            this.tracer,
+            tracker.invokeAgentSpan,
+            session.conversationId,
+            turn.assistantCalls(),
+          );
+        }
+        const lastTurn = parsed.turns[parsed.turns.length - 1];
+        model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
+      }
+    } catch (err) {
+      this.log('DEBUG', `TeammateIdle: could not parse transcript ${transcriptPath}: ${err}`);
+    } finally {
+      agentTranscript?.close();
+    }
+
+    if (model) tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+    if (lastAssistantText) {
+      tracker.invokeAgentSpan.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        JSON.stringify([{ role: 'assistant', content: lastAssistantText }]),
+      );
+    }
+
+    this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+    session.subagents.remove(tracker);
+
+    this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath ?? '(no transcript)'}`);
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
