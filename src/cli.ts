@@ -13,6 +13,7 @@ import {
   MARKETPLACE_NAME,
   PLUGIN_NAME,
   VERSION,
+  InstallSource,
   MarketplaceStatus,
   PluginStatus,
   RemovalStatus,
@@ -50,10 +51,16 @@ Options:
   --version, -v      Print version
   --help, -h         Print this help message
   --non-interactive  Skip install prompts and rely on env/config values
+  --source=<src>     Where 'install' pulls the marketplace from:
+                       github (default) - clone wandb/weave-claude-code over git
+                       local            - register the npm-installed tree on disk
+                                          (requires 'npm install -g weave-claude-code';
+                                          use in CI/sandboxes without git/SSH access)
 
 Examples:
   weave-claude-code install
   weave-claude-code install --non-interactive
+  weave-claude-code install --non-interactive --source=local
   weave-claude-code config set weave_project my-entity/my-project
   weave-claude-code status
   weave-claude-code logs --tail 100
@@ -63,7 +70,25 @@ Examples:
 // install
 // ---------------------------------------------------------------------------
 
-async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void> {
+/**
+ * Parse `--source=github|local` from argv. Returns null when the flag is
+ * present with an unrecognized value so the caller can surface a clear error;
+ * returns the default (`GitHub`) when the flag is absent.
+ */
+function parseInstallSource(args: string[]): InstallSource | null {
+  const flag = args.find((a) => a.startsWith('--source='));
+  if (!flag) return InstallSource.GitHub;
+  const value = flag.slice('--source='.length);
+  if (value === 'github') return InstallSource.GitHub;
+  if (value === 'local') return InstallSource.Local;
+  return null;
+}
+
+async function cmdInstall(
+  force: boolean,
+  nonInteractive: boolean,
+  source: InstallSource,
+): Promise<void> {
   let configResult;
   if (fs.existsSync(SETTINGS_FILE) && !force) {
     let settings: Settings;
@@ -98,7 +123,7 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
 
   let pluginResult;
   try {
-    pluginResult = registerPlugin(configResult.logFile);
+    pluginResult = registerPlugin(configResult.logFile, source);
   } catch (err) {
     console.error(`✗ ${err}`);
     process.exit(1);
@@ -664,7 +689,12 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'install') {
-    await cmdInstall(args.includes('--force'), args.includes('--non-interactive'));
+    const source = parseInstallSource(args);
+    if (source === null) {
+      console.error("Invalid --source: expected 'github' or 'local'.");
+      process.exit(1);
+    }
+    await cmdInstall(args.includes('--force'), args.includes('--non-interactive'), source);
     return;
   }
 

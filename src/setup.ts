@@ -26,6 +26,19 @@ export interface ConfigResult {
   logFile: string;
 }
 
+/**
+ * Where `registerPlugin` should pull the marketplace from.
+ *
+ * `GitHub` (default) hands Claude Code a `repo#ref` source spec and lets it
+ * clone over git. `Local` points Claude Code at the npm-installed plugin tree
+ * on disk so it never touches the network — required in CI/sandbox
+ * environments without git/SSH access to GitHub.
+ */
+export enum InstallSource {
+  GitHub = 'github',
+  Local = 'local',
+}
+
 export enum MarketplaceStatus {
   /** Marketplace was freshly added to Claude Code on this run. */
   Registered = 'registered',
@@ -114,6 +127,27 @@ export function createConfig(configDir: string): ConfigResult {
 }
 
 /**
+ * Locate the npm-installed weave-claude-code package tree, or null if the
+ * package isn't installed globally. Used by `InstallSource.Local` to register
+ * the marketplace from disk instead of cloning from GitHub.
+ *
+ * The npm tarball ships `.claude-plugin/marketplace.json`
+ * (see `package.json#files`), so its presence is the marker for a usable
+ * local source.
+ */
+export function findLocalPluginPath(): string | null {
+  const result = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  const root = result.stdout.trim();
+  if (!root) return null;
+  const candidate = path.join(root, 'weave-claude-code');
+  if (!fs.existsSync(path.join(candidate, '.claude-plugin', 'marketplace.json'))) {
+    return null;
+  }
+  return candidate;
+}
+
+/**
  * Read the ref Claude Code has registered for the given marketplace, or null
  * if the marketplace isn't registered. Used to detect drift when re-running
  * `install` after a CLI upgrade: a new binary's MARKETPLACE_REF may differ from
@@ -145,7 +179,10 @@ export function readRegisteredMarketplaceRef(marketplaceName: string): string | 
  * refreshed marketplace. Final state is always "marketplace at current
  * MARKETPLACE_REF, plugin at the version that marketplace advertises."
  */
-export function registerPlugin(logFile: string): PluginResult {
+export function registerPlugin(
+  logFile: string,
+  source: InstallSource = InstallSource.GitHub,
+): PluginResult {
   const claudePath = findClaudeCLI();
   if (!claudePath) {
     const msg = [
@@ -158,24 +195,44 @@ export function registerPlugin(logFile: string): PluginResult {
     throw new Error(msg);
   }
 
+  let marketplaceArg: string;
+  if (source === InstallSource.Local) {
+    const localPath = findLocalPluginPath();
+    if (!localPath) {
+      const msg = [
+        '--source=local requires weave-claude-code to be installed globally via npm,',
+        "but `npm root -g` did not yield a weave-claude-code/.claude-plugin/marketplace.json.",
+        'Run: npm install -g weave-claude-code',
+      ].join('\n');
+      appendToLog(logFile, 'ERROR', msg);
+      throw new Error(msg);
+    }
+    marketplaceArg = localPath;
+  } else {
+    marketplaceArg = MARKETPLACE_SOURCE;
+  }
+
   const refBefore = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
 
   // Register marketplace
   const mktResult = spawnSync(
     claudePath,
-    ['plugin', 'marketplace', 'add', MARKETPLACE_SOURCE],
+    ['plugin', 'marketplace', 'add', marketplaceArg],
     { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
   );
   const mktAlready = /already/i.test((mktResult.stderr ?? '') + (mktResult.stdout ?? ''));
   if (mktResult.status !== 0 && !mktAlready) {
     const output = ((mktResult.stderr ?? '') + (mktResult.stdout ?? '')).trim();
-    const msg = `Failed to register marketplace '${MARKETPLACE_SOURCE}': ${output}`;
+    const msg = `Failed to register marketplace '${marketplaceArg}': ${output}`;
     appendToLog(logFile, 'ERROR', msg);
     throw new Error(msg);
   }
 
   const refAfter = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
-  const refDrifted = refBefore !== null && refBefore !== refAfter;
+  // Drift detection compares marketplace refs (version tags). Local sources
+  // have no version tag — npm is the version-of-record — so skip the check
+  // and let the user re-run `npm install -g weave-claude-code` to upgrade.
+  const refDrifted = source !== InstallSource.Local && refBefore !== null && refBefore !== refAfter;
 
   // Install plugin at user scope
   const pluginResult = spawnSync(
