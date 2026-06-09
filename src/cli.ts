@@ -41,7 +41,7 @@ Usage:
 Commands:
   install            Set up the plugin (records runtime paths, creates config)
   config <action>    Manage configuration (show | get <key> | set <key> <value>)
-  status             Check installation status
+  status             Check installation status (pass --json for machine-readable output)
   logs               Display daemon logs (--tail N, --follow)
   daemon             Start the background daemon (used by hook handler)
   uninstall          Remove the plugin and all associated files
@@ -322,7 +322,88 @@ async function cmdConfig(args: string[]): Promise<void> {
 // status
 // ---------------------------------------------------------------------------
 
-async function cmdStatus(): Promise<void> {
+/**
+ * Machine-readable status snapshot. Stable schema: consumers (harness
+ * integrations, CI scripts) depend on the field names. Never include the raw
+ * API key value, only a boolean.
+ */
+interface StatusReport {
+  version: string;
+  settings_file: string;
+  cli_path: string | null;
+  weave_project: string | null;
+  weave_project_source: 'WEAVE_PROJECT env var' | 'settings.json' | 'not set';
+  api_key_configured: boolean;
+  daemon_socket: { path: string | null; state: 'alive' | 'stale' | 'absent' | null };
+  log_file: { path: string | null; size_bytes: number | null };
+  ready_to_trace: boolean;
+  view_traces_url: string | null;
+}
+
+async function gatherStatus(): Promise<StatusReport> {
+  const report: StatusReport = {
+    version: VERSION,
+    settings_file: SETTINGS_FILE,
+    cli_path: null,
+    weave_project: null,
+    weave_project_source: 'not set',
+    api_key_configured: false,
+    daemon_socket: { path: null, state: null },
+    log_file: { path: null, size_bytes: null },
+    ready_to_trace: false,
+    view_traces_url: null,
+  };
+
+  const whichResult = spawnSync('which', ['weave-claude-code'], { encoding: 'utf8' });
+  if (whichResult.status === 0 && whichResult.stdout.trim()) {
+    report.cli_path = whichResult.stdout.trim();
+  }
+
+  if (!fs.existsSync(SETTINGS_FILE)) return report;
+
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch {
+    return report;
+  }
+
+  const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+  if (effectiveProject) {
+    report.weave_project = effectiveProject;
+    report.weave_project_source = process.env['WEAVE_PROJECT'] ? 'WEAVE_PROJECT env var' : 'settings.json';
+  }
+
+  const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  report.api_key_configured = !!effectiveApiKey;
+
+  report.daemon_socket.path = settings.daemon_socket;
+  report.daemon_socket.state = await probeUnixSocket(settings.daemon_socket);
+
+  report.log_file.path = settings.log_file;
+  if (fs.existsSync(settings.log_file)) {
+    report.log_file.size_bytes = fs.statSync(settings.log_file).size;
+  }
+
+  if (effectiveProject && effectiveApiKey && report.daemon_socket.state !== 'stale') {
+    report.ready_to_trace = true;
+    report.view_traces_url = `https://wandb.ai/${effectiveProject}/weave/agents`;
+  }
+
+  return report;
+}
+
+async function cmdStatus(opts: { json: boolean } = { json: false }): Promise<void> {
+  if (opts.json) {
+    const report = await gatherStatus();
+    console.log(JSON.stringify(report, null, 2));
+    // Preserve pretty-print exit semantics: non-zero on missing config or stale socket.
+    if (!fs.existsSync(SETTINGS_FILE) || report.daemon_socket.state === 'stale') {
+      process.exit(1);
+    }
+    return;
+  }
+
   console.log('Weave Claude Code Plugin Status');
   console.log('================================');
 
@@ -560,7 +641,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'status') {
-    await cmdStatus();
+    await cmdStatus({ json: args.includes('--json') });
     return;
   }
 
