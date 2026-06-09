@@ -11,28 +11,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MARKETPLACE_NAME } from '../src/setup.ts';
-import { readFakeCalls } from './helpers.ts';
+import { MARKETPLACE_NAME, MARKETPLACE_REPO } from '../src/setup.ts';
+import { readFakeCalls, writeKnownMarketplace } from './helpers.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE_BIN_DIR = path.join(HERE, 'fixtures', 'fake-claude-bin');
 const PLUGIN_SPEC = `weave@${MARKETPLACE_NAME}`;
 const KNOWN_MARKETPLACES_REL = path.join('.claude', 'plugins', 'known_marketplaces.json');
-
-function seedKnownMarketplace(home: string, ref: string): void {
-  const dir = path.join(home, '.claude', 'plugins');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(
-    path.join(dir, 'known_marketplaces.json'),
-    JSON.stringify({
-      [MARKETPLACE_NAME]: {
-        source: { source: 'github', repo: 'wandb/weave-claude-code', ref },
-        installLocation: path.join(dir, 'marketplaces', MARKETPLACE_NAME),
-        lastUpdated: '2026-01-01T00:00:00Z',
-      },
-    }),
-  );
-}
 
 function seedInstalledPlugin(home: string): void {
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -84,7 +69,7 @@ suite('registerPlugin', () => {
 
   test('idempotent re-run: same ref → no update', async () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
-    seedKnownMarketplace(tmpHome, MARKETPLACE_REF);
+    writeKnownMarketplace(tmpHome, { source: 'github', repo: MARKETPLACE_REPO, ref: MARKETPLACE_REF });
     seedInstalledPlugin(tmpHome);
 
     const result = registerPlugin(path.join(tmpHome, 'log.txt'));
@@ -99,7 +84,7 @@ suite('registerPlugin', () => {
     const { registerPlugin, MARKETPLACE_REF } = await import('../src/setup.ts');
     const OLD_REF = 'v0.0.1';
     assert.notEqual(OLD_REF, MARKETPLACE_REF);
-    seedKnownMarketplace(tmpHome, OLD_REF);
+    writeKnownMarketplace(tmpHome, { source: 'github', repo: MARKETPLACE_REPO, ref: OLD_REF });
     seedInstalledPlugin(tmpHome);
 
     const result = registerPlugin(path.join(tmpHome, 'log.txt'));
@@ -116,7 +101,7 @@ test('readRegisteredMarketplaceRef: file/key/parse edge cases', async () => {
 
   assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), null);
 
-  seedKnownMarketplace(tmpHome, 'v9.9.9');
+  writeKnownMarketplace(tmpHome, { source: 'github', repo: MARKETPLACE_REPO, ref: 'v9.9.9' });
   assert.equal(readRegisteredMarketplaceRef(MARKETPLACE_NAME), 'v9.9.9');
   assert.equal(readRegisteredMarketplaceRef('some-other-marketplace'), null);
 

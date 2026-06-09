@@ -13,6 +13,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { writeKnownMarketplace } from './helpers.ts';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
 const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
@@ -24,21 +26,6 @@ after(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 interface SettingsOverrides {
   weave_project?: string | null;
   wandb_api_key?: string | null;
-}
-
-function writeKnownMarketplace(home: string, source: Record<string, unknown>): void {
-  const dir = path.join(home, '.claude', 'plugins');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(
-    path.join(dir, 'known_marketplaces.json'),
-    JSON.stringify({
-      'weave-claude-code': {
-        source,
-        installLocation: path.join(dir, 'marketplaces', 'weave-claude-code'),
-        lastUpdated: '2026-06-09T00:00:00Z',
-      },
-    }),
-  );
 }
 
 function writeSettings(home: string, overrides: SettingsOverrides = {}): { socketPath: string; logFile: string } {
@@ -204,59 +191,57 @@ suite('weave-claude-code status --json', () => {
   });
 });
 
+// Parametrized: same flow (write settings + maybe seed known_marketplaces +
+// run status) varies only by source spec and expected output. Splitting into
+// per-case `test()` calls was identical setup with one assertion swapped, so
+// this is one test per output mode with a case table inside.
+const PLUGIN_SOURCE_CASES: ReadonlyArray<{
+  name: string;
+  seed: Record<string, unknown> | null;
+  prettyPattern: RegExp;
+  jsonValue: unknown;
+}> = [
+  {
+    name: 'github source',
+    seed: { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+    prettyPattern: /Source:\s+github wandb\/weave-claude-code @ v0\.2\.7/,
+    jsonValue: { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+  },
+  {
+    name: 'directory source',
+    seed: { source: 'directory', path: '/opt/weave-claude-code' },
+    prettyPattern: /Source:\s+directory \/opt\/weave-claude-code/,
+    jsonValue: { type: 'directory', path: '/opt/weave-claude-code' },
+  },
+  {
+    name: 'not registered',
+    seed: null,
+    prettyPattern: /Source:.+not registered/,
+    jsonValue: null,
+  },
+];
+
 suite('weave-claude-code status (plugin source)', () => {
-  test('pretty: reports github source with repo and ref', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-github-pretty-'));
-    writeSettings(home);
-    writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
+  test('pretty: renders each source type', async () => {
+    for (const c of PLUGIN_SOURCE_CASES) {
+      const home = fs.mkdtempSync(path.join(scratch, `src-pretty-${c.name.replace(/\s+/g, '-')}-`));
+      writeSettings(home);
+      if (c.seed) writeKnownMarketplace(home, c.seed);
 
-    const r = await runStatus(home);
-    assert.match(r.stdout, /Source:\s+github wandb\/weave-claude-code @ v0\.2\.7/);
+      const r = await runStatus(home);
+      assert.match(r.stdout, c.prettyPattern, `case "${c.name}": stdout=${r.stdout}`);
+    }
   });
 
-  test('pretty: reports directory source with path', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-local-pretty-'));
-    writeSettings(home);
-    writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
+  test('json: emits the documented shape for each source type', async () => {
+    for (const c of PLUGIN_SOURCE_CASES) {
+      const home = fs.mkdtempSync(path.join(scratch, `src-json-${c.name.replace(/\s+/g, '-')}-`));
+      writeSettings(home);
+      if (c.seed) writeKnownMarketplace(home, c.seed);
 
-    const r = await runStatus(home);
-    assert.match(r.stdout, /Source:\s+directory \/opt\/weave-claude-code/);
-  });
-
-  test('pretty: reports "not registered" when known_marketplaces.json is absent', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-absent-pretty-'));
-    writeSettings(home);
-
-    const r = await runStatus(home);
-    assert.match(r.stdout, /Source:.+not registered/);
-  });
-
-  test('json: github source shape', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-github-json-'));
-    writeSettings(home);
-    writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
-
-    const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
-    assert.deepEqual(parsed.plugin_source, { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
-  });
-
-  test('json: directory source shape', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-local-json-'));
-    writeSettings(home);
-    writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
-
-    const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
-    assert.deepEqual(parsed.plugin_source, { type: 'directory', path: '/opt/weave-claude-code' });
-  });
-
-  test('json: plugin_source is null when not registered', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'src-absent-json-'));
-    writeSettings(home);
-
-    const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
-    assert.equal(parsed.plugin_source, null);
+      const r = await runStatus(home, ['--json']);
+      const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
+      assert.deepEqual(parsed.plugin_source, c.jsonValue, `case "${c.name}"`);
+    }
   });
 });
