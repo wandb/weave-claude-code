@@ -27,12 +27,12 @@
     "uuidv7": "1.2.1"
   },
   "devDependencies": {
-    "@types/node": "^24.12.2",
+    "@types/node": "^18.19.0",
     "tsx": "^4.19.0",
     "typescript": "^6.0.2"
   },
   "engines": {
-    "node": ">=24.14.0"
+    "node": ">=18.19.0"
   },
   "files": [
     "dist/",
