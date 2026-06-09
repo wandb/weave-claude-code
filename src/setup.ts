@@ -94,6 +94,13 @@ export const MARKETPLACE_SOURCE = `${MARKETPLACE_REPO}#${MARKETPLACE_REF}`;
 export const MARKETPLACE_NAME = 'weave-claude-code';
 export const PLUGIN_NAME = 'weave';
 
+// The npm package name shipped to the registry (matches package.json#name).
+// Coincidentally equal to MARKETPLACE_NAME today but a distinct concept — the
+// marketplace name lives in .claude-plugin/marketplace.json, the npm package
+// name lives in package.json. Kept separate so renaming one does not silently
+// break the other.
+export const NPM_PACKAGE_NAME = 'weave-claude-code';
+
 /**
  * Create (or recreate) the config directory, log directory, and settings.json.
  *
@@ -140,7 +147,7 @@ export function findLocalPluginPath(): string | null {
   if (result.status !== 0) return null;
   const root = result.stdout.trim();
   if (!root) return null;
-  const candidate = path.join(root, 'weave-claude-code');
+  const candidate = path.join(root, NPM_PACKAGE_NAME);
   if (!fs.existsSync(path.join(candidate, '.claude-plugin', 'marketplace.json'))) {
     return null;
   }

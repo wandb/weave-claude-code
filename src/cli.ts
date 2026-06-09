@@ -70,20 +70,6 @@ Examples:
 // install
 // ---------------------------------------------------------------------------
 
-/**
- * Parse `--source=github|local` from argv. Returns null when the flag is
- * present with an unrecognized value so the caller can surface a clear error;
- * returns the default (`GitHub`) when the flag is absent.
- */
-function parseInstallSource(args: string[]): InstallSource | null {
-  const flag = args.find((a) => a.startsWith('--source='));
-  if (!flag) return InstallSource.GitHub;
-  const value = flag.slice('--source='.length);
-  if (value === 'github') return InstallSource.GitHub;
-  if (value === 'local') return InstallSource.Local;
-  return null;
-}
-
 async function cmdInstall(
   force: boolean,
   nonInteractive: boolean,
@@ -689,11 +675,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'install') {
-    const source = parseInstallSource(args);
-    if (source === null) {
-      console.error("Invalid --source: expected 'github' or 'local'.");
-      process.exit(1);
-    }
+    const source = args.includes('--source=local') ? InstallSource.Local : InstallSource.GitHub;
     await cmdInstall(args.includes('--force'), args.includes('--non-interactive'), source);
     return;
   }

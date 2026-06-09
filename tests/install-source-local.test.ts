@@ -91,33 +91,24 @@ suite('findLocalPluginPath', () => {
 });
 
 suite('registerPlugin with InstallSource.Local', () => {
-  test('calls `plugin marketplace add <local-path>` instead of github source', async () => {
+  test('registers from the local path, installs the plugin, and skips the drift-update', async () => {
+    // Local source bypasses github cloning entirely: marketplace is registered
+    // from the npm-installed directory, plugin installs as normal, and the
+    // drift-detection update never fires (npm is the version-of-record, so the
+    // marketplace "ref" is a directory path with no meaningful comparison).
     const { registerPlugin, InstallSource } = await import('../src/setup.ts');
     const pkgDir = seedLocalPluginTree(tmpNpmPrefix);
 
-    registerPlugin(path.join(tmpHome, 'log.txt'), InstallSource.Local);
+    const result = registerPlugin(path.join(tmpHome, 'log.txt'), InstallSource.Local);
 
     const calls = readFakeCalls(tmpHome);
     const addCall = calls.find((c) => c.startsWith('plugin marketplace add'));
     assert.ok(addCall, 'expected plugin marketplace add to be called');
-    assert.ok(
-      addCall.includes(pkgDir),
-      `expected marketplace add arg to be local path ${pkgDir}, got: ${addCall}`,
-    );
-    assert.ok(
-      !addCall.includes('wandb/weave-claude-code#'),
-      `expected no github source in local mode, got: ${addCall}`,
-    );
-  });
-
-  test('still installs the plugin after registering the local marketplace', async () => {
-    const { registerPlugin, InstallSource } = await import('../src/setup.ts');
-    seedLocalPluginTree(tmpNpmPrefix);
-
-    registerPlugin(path.join(tmpHome, 'log.txt'), InstallSource.Local);
-
-    const calls = readFakeCalls(tmpHome);
+    assert.ok(addCall.includes(pkgDir), `expected local path ${pkgDir} in: ${addCall}`);
+    assert.ok(!addCall.includes('wandb/weave-claude-code#'), `expected no github source in: ${addCall}`);
     assert.ok(calls.some((c) => c.startsWith('plugin install')));
+    assert.ok(!calls.some((c) => c.startsWith('plugin update')));
+    assert.equal(result.pluginUpdated, false);
   });
 
   test('throws with a helpful error when no local plugin tree is found', async () => {
@@ -127,18 +118,6 @@ suite('registerPlugin with InstallSource.Local', () => {
       () => registerPlugin(path.join(tmpHome, 'log.txt'), InstallSource.Local),
       /npm install -g weave-claude-code/,
     );
-  });
-
-  test('does not run `plugin update` for local source even when marketplace ref drifted', async () => {
-    // Local source uses npm as the version-of-record; the github-ref drift
-    // check does not apply (the "ref" is a directory path, not a version tag).
-    const { registerPlugin, InstallSource } = await import('../src/setup.ts');
-    seedLocalPluginTree(tmpNpmPrefix);
-
-    const result = registerPlugin(path.join(tmpHome, 'log.txt'), InstallSource.Local);
-
-    assert.equal(result.pluginUpdated, false);
-    assert.ok(!readFakeCalls(tmpHome).some((c) => c.startsWith('plugin update')));
   });
 });
 
