@@ -7,36 +7,35 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
-  Span,
-  SpanStatusCode,
-  Tracer,
   diag,
   DiagConsoleLogger,
   DiagLogLevel,
 } from '@opentelemetry/api';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { resourceFromAttributes } from '@opentelemetry/resources';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
+import { parseSessionFd, extractAssistantTextBlocks, type AssistantCallDetail } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   AGENT_NAME_CLAUDE_CODE,
-  CompactionAttrs,
-  startTurnSpan,
-  startToolSpan,
-  startInvokeAgentSpan,
-  emitChatSpansFromAssistantCalls,
-  addPermissionRequestEvent,
-  addPermissionResolvedEvent,
-  setCompactionAttrs,
   toolDisplayName,
   promptSnippet,
   jsonStr,
+  providerFromModel,
 } from './genaiSpans.js';
+
+/**
+ * Compaction attributes captured from PreCompact and stamped on a turn span.
+ * The Weave Agents backend extracts these into dedicated columns
+ * (`compaction_summary`, `compaction_items_before`, `compaction_items_after`)
+ * and renders a "context_compacted" card in the chat view.
+ */
+interface CompactionAttrs {
+  summary?: string;
+  itemsBefore?: number;
+  itemsAfter?: number;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -58,9 +57,14 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   );
 }
 
-/** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
+/**
+ * Stores the tool span opened at PreToolUse so PostToolUse can close it.
+ * All tool spans go through the weave SDK `Tool` wrapper, parented under
+ * either the current `Turn` (top-level tools) or a `SubAgent` (subagent-
+ * spawned tools).
+ */
 interface PendingToolCall {
-  span: Span;
+  tool: weave.Tool;
   toolName: string;
   toolInput: Record<string, unknown>;
   /** True once a PermissionRequest event has been emitted for this tool. */
@@ -70,10 +74,11 @@ interface PendingToolCall {
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
-  addPermissionResolvedEvent(pending.span, {
-    approved,
-    timestamp: new Date(),
-  });
+  pending.tool.addEvent(
+    ATTR.EVT_PERMISSION_RESOLVED,
+    { [ATTR.EVT_PERMISSION_APPROVED]: approved },
+    new Date(),
+  );
 }
 
 /** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
@@ -169,7 +174,7 @@ interface SubagentTracker {
   subagentType: string;
   detectedAt: Date;
   toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
-  invokeAgentSpan?: Span;      // subagent's `invoke_agent` span; subagent chat/tool spans parent here
+  subAgent?: weave.SubAgent;   // SDK SubAgent; subagent chat/tool spans parent here via subAgent.startLLM/.startTool
   agentId?: string;
   /** sha256 of the prompt passed to the Agent tool; matched against the
    *  subagent's transcript line-1 user message at SubagentStart. */
@@ -186,12 +191,15 @@ interface SessionState {
    *  for fresh (non-forked) sessions. Resolved once at SessionStart by
    *  walking `forkedFrom.sessionId` pointers across transcript files. */
   conversationId: string;
+  /** SDK Session object. Caches conversationId + agentName for child Turn
+   *  spans created in subsequent events. Ended at SessionEnd. */
+  weaveSession: weave.Session;
   transcript: TranscriptFile;
   cwd: string;
   source: string;
   initialRequestModel?: string;
 
-  currentTurnSpan?: Span;
+  currentTurn?: weave.Turn;
 
   turnNumber: number;
   totalToolCalls: number;
@@ -203,6 +211,70 @@ interface SessionState {
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
+}
+
+function parseTimestamp(ts: string | undefined): Date | undefined {
+  if (!ts) return undefined;
+  const d = new Date(ts);
+  return Number.isFinite(d.getTime()) ? d : undefined;
+}
+
+/**
+ * Emit one chat span per assistant call in a transcript turn, parented
+ * under either the Turn (main agent) or SubAgent (subagent path). Uses
+ * the SDK's `startLLM` with backdated startTime/endTime so the emitted
+ * span timeline matches the transcript timestamps.
+ */
+export function emitChatSpansViaSDK(
+  parent: weave.Turn | weave.SubAgent,
+  conversationId: string,
+  calls: AssistantCallDetail[],
+): void {
+  for (const c of calls) {
+    if (!c.model) continue;
+    const startedAt = parseTimestamp(c.prevTimestamp) ?? parseTimestamp(c.timestamp) ?? new Date();
+    const endedAt = parseTimestamp(c.timestamp) ?? new Date();
+    // OTel `input_tokens` is the total prompt; Anthropic splits it into
+    // three disjoint fields (uncached + cache_read + cache_creation), so
+    // sum them. https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
+    const totalInputTokens =
+      c.usage.input_tokens
+      + (c.usage.cache_read_input_tokens ?? 0)
+      + (c.usage.cache_creation_input_tokens ?? 0);
+
+    const provider = providerFromModel(c.model);
+    const llm = parent.startLLM({
+      model: c.model,
+      ...(provider ? {providerName: provider} : {}),
+      startTime: startedAt,
+    });
+    llm.record({
+      usage: {
+        inputTokens: totalInputTokens,
+        outputTokens: c.usage.output_tokens,
+        ...(c.usage.cache_read_input_tokens !== undefined
+          ? {cacheReadInputTokens: c.usage.cache_read_input_tokens}
+          : {}),
+        ...(c.usage.cache_creation_input_tokens !== undefined
+          ? {cacheCreationInputTokens: c.usage.cache_creation_input_tokens}
+          : {}),
+        ...(c.reasoningTokens !== undefined && c.reasoningTokens > 0
+          ? {reasoningTokens: c.reasoningTokens}
+          : {}),
+      },
+    });
+    llm.setAttribute(ATTR.CONVERSATION_ID, conversationId);
+    llm.setAttribute(ATTR.OUTPUT_TYPE, 'text');
+    if (c.responseId) llm.setAttribute(ATTR.RESPONSE_ID, c.responseId);
+    if (c.finishReason) llm.setAttribute(ATTR.RESPONSE_FINISH_REASONS, [c.finishReason]);
+    if (c.contentBlocks.length) {
+      llm.outputMessages = [{
+        role: 'assistant',
+        content: extractAssistantTextBlocks(c.contentBlocks).join('\n'),
+      }];
+    }
+    llm.end({endTime: endedAt});
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,8 +348,7 @@ export class GlobalDaemon {
   private lastActivity = Date.now();
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
-  private provider: NodeTracerProvider | null = null;
-  private tracer: Tracer | null = null;
+  private weaveInitialized = false;
 
   constructor(
     private readonly socketPath: string,
@@ -292,16 +363,15 @@ export class GlobalDaemon {
     // Initialize the OTel tracer if Weave is configured
     if (this.weaveProject && this.apiKey) {
       try {
-        this.initTracer();
-        this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
+        await this.initTracer();
+        this.log('INFO', `OTel tracer initialized - project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
         this.log('INFO', `View traces: https://wandb.ai/${this.weaveProject}/weave/agents`);
       } catch (err) {
-        this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
-        this.provider = null;
-        this.tracer = null;
+        this.log('ERROR', `Failed to initialize OTel tracer: ${err} - continuing without tracing`);
+        this.weaveInitialized = false;
       }
     } else {
-      this.log('INFO', 'No weave_project / API key configured — tracing disabled');
+      this.log('INFO', 'No weave_project / API key configured - tracing disabled');
     }
 
     // Remove any stale socket left by a previous crash
@@ -339,38 +409,25 @@ export class GlobalDaemon {
 
   // ── tracer initialization ───────────────────────────────────────────────
 
-  private initTracer(): void {
+  private async initTracer(): Promise<void> {
     if (!this.weaveProject) throw new Error('weaveProject required to init tracer');
     if (!this.apiKey) throw new Error('apiKey required to init tracer');
 
-    const [entity, project] = this.weaveProject.split('/', 2);
-    if (!entity || !project) {
-      throw new Error(`Invalid weave_project format: '${this.weaveProject}' (expected entity/project)`);
-    }
-
-    // Route OTel diagnostics into the daemon log so exporter errors surface.
     if (this.debugEnabled) {
       diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN);
     }
+    // The Weave SDK reads WANDB_API_KEY and WANDB_BASE_URL from env when
+    // building its OTLP exporter target and auth header (see
+    // weave/sdks/node/src/wandb/settings.ts). weave.login() would also
+    // perform a synchronous connectivity probe and write to netrc, neither
+    // of which fit a background daemon. Direct env writes are the
+    // documented path for programmatic configuration today; revisit if the
+    // SDK exposes a programmatic settings API.
+    process.env['WANDB_API_KEY'] = this.apiKey;
+    process.env['WANDB_BASE_URL'] = this.baseUrl;
 
-    const resource = resourceFromAttributes({
-      'service.name': AGENT_NAME_CLAUDE_CODE,
-      'service.version': VERSION,
-      'wandb.entity': entity,
-      'wandb.project': project,
-    });
-
-    const exporter = new OTLPTraceExporter({
-      url: `${this.baseUrl}/agents/otel/v1/traces`,
-      headers: { 'wandb-api-key': this.apiKey },
-    });
-
-    this.provider = new NodeTracerProvider({
-      resource,
-      spanProcessors: [new BatchSpanProcessor(exporter)],
-    });
-    this.provider.register();
-    this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
+    await weave.init(this.weaveProject);
+    this.weaveInitialized = true;
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -448,47 +505,49 @@ export class GlobalDaemon {
 
     this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
 
-    try {
-      switch (eventName) {
-        case 'SessionStart':
-          await this.handleSessionStart(sessionId, payload);
-          break;
-        case 'UserPromptSubmit':
-          await this.handleUserPromptSubmit(sessionId, payload);
-          break;
-        case 'PreToolUse':
-          await this.handlePreToolUse(sessionId, agentId, payload);
-          break;
-        case 'PermissionRequest':
-          await this.handlePermissionRequest(sessionId, payload);
-          break;
-        case 'PostToolUse':
-          await this.handlePostToolUse(sessionId, payload);
-          break;
-        case 'PostToolUseFailure':
-          await this.handlePostToolUseFailure(sessionId, payload);
-          break;
-        case 'SubagentStart':
-          await this.handleSubagentStart(sessionId, payload);
-          break;
-        case 'SubagentStop':
-          await this.handleSubagentStop(sessionId, payload);
-          break;
-        case 'PreCompact':
-          await this.handlePreCompact(sessionId, payload);
-          break;
-        case 'Stop':
-          await this.handleStop(sessionId, payload);
-          break;
-        case 'SessionEnd':
-          await this.handleSessionEnd(sessionId, payload);
-          break;
-        default:
-          break;
+    await weave.runIsolated(async () => {
+      try {
+        switch (eventName) {
+          case 'SessionStart':
+            await this.handleSessionStart(sessionId, payload);
+            break;
+          case 'UserPromptSubmit':
+            await this.handleUserPromptSubmit(sessionId, payload);
+            break;
+          case 'PreToolUse':
+            await this.handlePreToolUse(sessionId, agentId, payload);
+            break;
+          case 'PermissionRequest':
+            await this.handlePermissionRequest(sessionId, payload);
+            break;
+          case 'PostToolUse':
+            await this.handlePostToolUse(sessionId, payload);
+            break;
+          case 'PostToolUseFailure':
+            await this.handlePostToolUseFailure(sessionId, payload);
+            break;
+          case 'SubagentStart':
+            await this.handleSubagentStart(sessionId, payload);
+            break;
+          case 'SubagentStop':
+            await this.handleSubagentStop(sessionId, payload);
+            break;
+          case 'PreCompact':
+            await this.handlePreCompact(sessionId, payload);
+            break;
+          case 'Stop':
+            await this.handleStop(sessionId, payload);
+            break;
+          case 'SessionEnd':
+            await this.handleSessionEnd(sessionId, payload);
+            break;
+          default:
+            break;
+        }
+      } catch (err) {
+        this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
       }
-    } catch (err) {
-      this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
-    }
+    });
   }
 
   // ── event handlers ────────────────────────────────────────────────────────
@@ -519,6 +578,11 @@ export class GlobalDaemon {
     this.sessions.set(sessionId, {
       sessionId,
       conversationId,
+      weaveSession: weave.startSession({
+        sessionId: conversationId,
+        agentName: AGENT_NAME_CLAUDE_CODE,
+        ...(initialRequestModel ? {model: initialRequestModel} : {}),
+      }),
       transcript,
       cwd,
       source,
@@ -620,60 +684,51 @@ export class GlobalDaemon {
       this.log('ERROR', `Unknown session: ${sessionId}`);
       return;
     }
-    if (!this.tracer) return;
+    if (!this.weaveInitialized) return;
 
     const prompt = (payload['prompt'] as string | undefined) ?? '';
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurnSpan ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
     );
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
-    const turnSpan = startTurnSpan(this.tracer, {
-      sessionId: session.sessionId,
-      conversationId: session.conversationId,
-      turnNumber: session.turnNumber,
-      prompt,
-      cwd: session.cwd,
-      source: session.source,
-      pluginVersion: VERSION,
-      requestModel: session.initialRequestModel,
-      displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+    const turn = session.weaveSession.startTurn({
+      agentName: AGENT_NAME_CLAUDE_CODE,
+      ...(session.initialRequestModel ? {model: session.initialRequestModel} : {}),
     });
-    session.currentTurnSpan = turnSpan;
+    turn.setAttribute(ATTR.AGENT_VERSION, VERSION);
+    turn.setAttribute(ATTR.WEAVE_SESSION_ID, session.sessionId);
+    turn.setAttribute(ATTR.WEAVE_CWD, session.cwd);
+    turn.setAttribute(ATTR.WEAVE_SOURCE, session.source);
+    turn.setAttribute(ATTR.WEAVE_PLUGIN_VERSION, VERSION);
+    turn.setAttribute(ATTR.WEAVE_TURN_NUMBER, session.turnNumber);
+    turn.setAttribute(ATTR.WEAVE_DISPLAY_NAME, `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`);
+    turn.setAttribute(ATTR.INPUT_MESSAGES, jsonStr([{ role: 'user', content: prompt }]));
+    session.currentTurn = turn;
 
     // Drain compaction attrs buffered while no turn was open.
     if (session.pendingCompaction) {
-      setCompactionAttrs(turnSpan, session.pendingCompaction);
+      const c = session.pendingCompaction;
+      if (c.summary !== undefined) turn.setAttribute(ATTR.COMPACTION_SUMMARY, c.summary);
+      if (c.itemsBefore !== undefined) turn.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, c.itemsBefore);
+      if (c.itemsAfter !== undefined) turn.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, c.itemsAfter);
       session.pendingCompaction = undefined;
     }
 
-    this.log(
-      'INFO',
-      `Created turn span (turn ${session.turnNumber}) trace_id=${turnSpan.spanContext().traceId}`,
-    );
+    this.log('INFO', `Created turn span (turn ${session.turnNumber})`);
   }
 
   private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const toolUseId = payload['tool_use_id'] as string | undefined;
     const toolName = payload['tool_name'] as string | undefined;
     if (!toolUseId || !toolName) return;
 
     const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
-
-    // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
-    // a subagent, else the current turn span.
-    const parentSpan = agentId
-      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? session.currentTurnSpan
-      : session.currentTurnSpan;
-    if (!parentSpan) {
-      this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
-      return;
-    }
 
     // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
     // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
@@ -688,31 +743,44 @@ export class GlobalDaemon {
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
-      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
-        agentType: subagentType,
-        conversationId: session.conversationId,
-        pluginVersion: VERSION,
-        inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
-        spawningToolCallId: toolUseId,
-        displayName: toolDisplayName(toolName, toolInput),
-      });
+      if (!session.currentTurn) {
+        this.log('ERROR', `PreToolUse(Agent): no current turn for session=${sessionId}`);
+        return;
+      }
+      const subAgent = session.currentTurn.startSubagent({name: subagentType});
+      subAgent.setAttribute(ATTR.AGENT_VERSION, VERSION);
+      subAgent.setAttribute(ATTR.CONVERSATION_ID, session.conversationId);
+      if (prompt) {
+        subAgent.setAttribute(ATTR.INPUT_MESSAGES, jsonStr([{role: 'user', content: prompt}]));
+      }
+      subAgent.setAttribute(ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID, toolUseId);
+      subAgent.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
       session.subagents.add({
         toolUseId,
         subagentType,
         detectedAt: new Date(),
-        invokeAgentSpan,
+        subAgent,
         promptHash: hashPrompt(prompt),
       });
       return;
     }
 
-    const toolSpan = startToolSpan(this.tracer, parentSpan, {
-      toolName,
-      toolUseId,
-      toolInput,
-      displayName: toolDisplayName(toolName, toolInput),
+    // Parent: subagent's SubAgent if this PreToolUse comes from inside a
+    // subagent (agentId set), else the current Turn.
+    const parent: weave.Turn | weave.SubAgent | undefined = agentId
+      ? session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn
+      : session.currentTurn;
+    if (!parent) {
+      this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
+      return;
+    }
+    const tool = parent.startTool({
+      name: toolName,
+      toolCallId: toolUseId,
+      args: jsonStr(toolInput),
     });
-    session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
+    tool.setAttribute(ATTR.WEAVE_DISPLAY_NAME, toolDisplayName(toolName, toolInput));
+    session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -738,10 +806,12 @@ export class GlobalDaemon {
     }
 
     pending.permissionRequested = true;
-    addPermissionRequestEvent(pending.span, {
-      suggestions: payload['permission_suggestions'],
-      timestamp: new Date(),
-    });
+    const ts = new Date();
+    const suggestions = payload['permission_suggestions'];
+    const evtAttrs = suggestions !== undefined
+      ? { [ATTR.EVT_PERMISSION_SUGGESTIONS]: jsonStr(suggestions) }
+      : {};
+    pending.tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, evtAttrs, ts);
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
@@ -757,8 +827,8 @@ export class GlobalDaemon {
     // span (not a pendingToolCall), so we close it here with the subagent's
     // final assistant text as `gen_ai.output.messages`.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+    if (subagentTracker?.subAgent) {
+      this.closeSubagent(subagentTracker, payload['tool_response'], /*failure*/ false);
       session.subagents.remove(subagentTracker);
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
@@ -768,11 +838,9 @@ export class GlobalDaemon {
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
-
     resolvePermissionIfPending(pending, true);
-
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
-    pending.span.end();
+    pending.tool.result = jsonStr(payload['tool_response']);
+    pending.tool.end();
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -793,8 +861,8 @@ export class GlobalDaemon {
     // status; subagent chat spans, if any reached SubagentStop, are already
     // attached as children.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+    if (subagentTracker?.subAgent) {
+      this.closeSubagent(subagentTracker, error, /*failure*/ true);
       session.subagents.remove(subagentTracker);
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
@@ -804,13 +872,11 @@ export class GlobalDaemon {
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
-
     resolvePermissionIfPending(pending, false);
-
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
-    pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
-    pending.span.setStatus({ code: SpanStatusCode.ERROR, message: typeof error === 'string' ? error : 'tool failed' });
-    pending.span.end();
+    const errMsg = typeof error === 'string' ? error : 'tool failed';
+    pending.tool.result = jsonStr(error);
+    pending.tool.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
+    pending.tool.end({ error: new Error(errMsg) });
 
     session.pendingToolCalls.delete(toolUseId);
     session.totalToolCalls += 1;
@@ -819,40 +885,34 @@ export class GlobalDaemon {
   }
 
   /**
-   * Close a subagent's `invoke_agent` span. Idempotent — guarded by
-   * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
-   * regardless of order. Sets `gen_ai.output.messages` from the canonical
-   * tool return string when available; marks the span ERROR on failure.
+   * Close a subagent's `invoke_agent` span. Idempotent via `tracker.ended`.
+   * Sets `gen_ai.output.messages` from the canonical tool return string when
+   * available; marks the span ERROR on failure.
    */
-  private closeSubagentInvokeAgentSpan(
+  private closeSubagent(
     tracker: SubagentTracker,
     output: unknown,
     failure: boolean,
   ): void {
-    const span = tracker.invokeAgentSpan;
-    if (!span || tracker.ended) return;
+    const sub = tracker.subAgent;
+    if (!sub || tracker.ended) return;
 
     if (output !== undefined && output !== null && output !== '') {
       const outputText = typeof output === 'string' ? output : jsonStr(output);
-      span.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        jsonStr([{ role: 'assistant', content: outputText }]),
-      );
+      sub.setAttribute(ATTR.OUTPUT_MESSAGES, jsonStr([{ role: 'assistant', content: outputText }]));
     }
     if (failure) {
-      span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: typeof output === 'string' ? output : 'subagent failed',
-      });
+      sub.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
+      sub.end({ error: new Error(typeof output === 'string' ? output : 'subagent failed') });
+    } else {
+      sub.end();
     }
-    span.end();
     tracker.ended = true;
   }
 
   private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -891,23 +951,21 @@ export class GlobalDaemon {
         subagentType: agentType,
         detectedAt: new Date(),
       };
-      if (session.currentTurnSpan) {
-        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
-          agentType,
-          conversationId: session.conversationId,
-          pluginVersion: VERSION,
-          displayName: `Agent: ${agentType}`,
-        });
-        bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
+      if (session.currentTurn) {
+        bestTracker.subAgent = session.currentTurn.startSubagent({name: agentType});
+        bestTracker.subAgent.setAttribute(ATTR.AGENT_VERSION, VERSION);
+        bestTracker.subAgent.setAttribute(ATTR.CONVERSATION_ID, session.conversationId);
+        bestTracker.subAgent.setAttribute(ATTR.WEAVE_DISPLAY_NAME, `Agent: ${agentType}`);
+        bestTracker.subAgent.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
       }
       session.subagents.add(bestTracker);
     }
 
     bestTracker.agentId = agentId;
-    if (bestTracker.invokeAgentSpan) {
+    if (bestTracker.subAgent) {
       // Stamp the runtime agent_id on the subagent's invoke_agent span — the
       // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
-      bestTracker.invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
+      bestTracker.subAgent.setAttribute(ATTR.AGENT_ID, agentId);
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
@@ -915,7 +973,7 @@ export class GlobalDaemon {
 
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.weaveInitialized) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
@@ -927,9 +985,9 @@ export class GlobalDaemon {
     }
 
     // Chat spans for the subagent's LLM calls parent under the subagent's
-    // own invoke_agent span. For orphan trackers without an invoke_agent
-    // span (no current turn at SubagentStart), fall back to the turn span.
-    const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
+    // own SubAgent. For orphan trackers without a SubAgent (no current turn
+    // at SubagentStart), fall back to the current Turn.
+    const chatParent: weave.Turn | weave.SubAgent | undefined = tracker.subAgent ?? session.currentTurn;
 
     const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
     let model: string | undefined;
@@ -950,8 +1008,7 @@ export class GlobalDaemon {
         lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          emitChatSpansFromAssistantCalls(
-            this.tracer,
+          emitChatSpansViaSDK(
             chatParent,
             session.conversationId,
             lastTurn.assistantCalls(),
@@ -964,11 +1021,11 @@ export class GlobalDaemon {
       }
     }
 
-    if (tracker.invokeAgentSpan) {
+    if (tracker.subAgent) {
       // Stamp the model the subagent actually ran on (Claude Code's
       // SubagentStart payload doesn't carry the model; the transcript does).
       if (model) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+        tracker.subAgent.setAttribute(ATTR.RESPONSE_MODEL, model);
       }
       // Orphan path: no PostToolUse will fire, so close the invoke_agent
       // span here using the subagent's final assistant text as the output.
@@ -976,7 +1033,7 @@ export class GlobalDaemon {
       // canonical tool_response and remove the tracker; if we removed the
       // tracker here, byToolUseId at PostToolUse would miss it.
       if (!tracker.ended && !tracker.toolUseId) {
-        this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+        this.closeSubagent(tracker, lastAssistantText, /*failure*/ false);
       }
     }
 
@@ -1002,8 +1059,10 @@ export class GlobalDaemon {
       itemsAfter: typeof payload['items_after'] === 'number' ? (payload['items_after'] as number) : undefined,
     };
 
-    if (session.currentTurnSpan) {
-      setCompactionAttrs(session.currentTurnSpan, attrs);
+    if (session.currentTurn) {
+      if (attrs.summary !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_SUMMARY, attrs.summary);
+      if (attrs.itemsBefore !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, attrs.itemsBefore);
+      if (attrs.itemsAfter !== undefined) session.currentTurn.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, attrs.itemsAfter);
       this.log('INFO', `PreCompact attached to active turn ${session.turnNumber} (session ${sessionId})`);
     } else {
       // Buffer until the next UserPromptSubmit opens a turn span.
@@ -1014,10 +1073,10 @@ export class GlobalDaemon {
 
   private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurnSpan || !this.tracer) return;
+    if (!session?.currentTurn || !this.weaveInitialized) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
-    // flush — otherwise the final chat span drops when the read races the writer.
+    // flush, otherwise the final chat span drops when the read races the writer.
     const rawFinalMessage = payload['last_assistant_message'];
     const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
     const parsedSession = await this.parseSessionFileWithRetry(
@@ -1029,14 +1088,12 @@ export class GlobalDaemon {
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Emit one chat span per LLM call within this turn
-    if (currentTurn) {
-      emitChatSpansFromAssistantCalls(
-        this.tracer,
-        session.currentTurnSpan,
+    if (currentTurn && session.currentTurn) {
+      emitChatSpansViaSDK(
+        session.currentTurn,
         session.conversationId,
         currentTurn.assistantCalls(),
       );
@@ -1047,7 +1104,7 @@ export class GlobalDaemon {
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
     if (assistantMessages.length) {
-      session.currentTurnSpan.setAttribute(
+      session.currentTurn.setAttribute(
         ATTR.OUTPUT_MESSAGES,
         jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m }))),
       );
@@ -1056,16 +1113,16 @@ export class GlobalDaemon {
     // Aggregate finish reasons from per-call detail
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {
-      session.currentTurnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
+      session.currentTurn.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
     }
 
     if (model) {
-      session.currentTurnSpan.setAttribute(ATTR.REQUEST_MODEL, model);
+      session.currentTurn.setAttribute(ATTR.REQUEST_MODEL, model);
     }
 
-    session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
-    session.currentTurnSpan.end();
-    session.currentTurnSpan = undefined;
+    session.currentTurn.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
+    session.currentTurn.end();
+    session.currentTurn = undefined;
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
@@ -1082,26 +1139,25 @@ export class GlobalDaemon {
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       resolvePermissionIfPending(pending, false);
-      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
-      pending.span.end();
+      const orphanMsg = 'session ended before tool completed';
+      pending.tool.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      pending.tool.end({ error: new Error(orphanMsg) });
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
 
     // Close the current turn if still open
-    if (session.currentTurnSpan) {
-      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      session.currentTurnSpan.end();
+    if (session.currentTurn) {
+      session.currentTurn.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.currentTurn.end();
       this.log('DEBUG', `Closed orphaned turn span`);
     }
 
     // Close any subagent invoke_agent spans that didn't receive PostToolUse
     // or SubagentStop. Without this they'd leak open and never export.
     for (const tracker of session.subagents.all()) {
-      if (tracker.invokeAgentSpan && !tracker.ended) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
-        tracker.invokeAgentSpan.end();
+      if (tracker.subAgent && !tracker.ended) {
+        tracker.subAgent.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        tracker.subAgent.end({ error: new Error('session ended before subagent completed') });
         tracker.ended = true;
       }
       this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
@@ -1112,6 +1168,7 @@ export class GlobalDaemon {
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
     session.transcript.close();
+    session.weaveSession.end();
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -1128,11 +1185,11 @@ export class GlobalDaemon {
     this.running = false;
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
-    if (this.provider) {
+    if (this.weaveInitialized) {
       try {
-        await this.provider.shutdown();
+        await weave.flushOTel();
       } catch (err) {
-        this.log('ERROR', `Error shutting down OTel provider: ${err}`);
+        this.log('ERROR', `Error flushing Weave SDK: ${err}`);
       }
     }
     for (const session of this.sessions.values()) {
