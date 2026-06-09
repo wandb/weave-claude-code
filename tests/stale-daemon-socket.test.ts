@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Tests for the stale-daemon-socket-detection fix. Four layers, one file:
+// End-to-end tests for the daemon socket lifecycle. Five layers, one file:
 //
-//   probeUnixSocket   — pure helper in src/utils.ts (alive | stale | absent)
-//   cmdStatus         — src/cli.ts surfaces stale state and exits non-zero
-//   hook-handler.sh   — primary fix: probe socket instead of stat-checking it
-//   daemon signals    — src/daemon.ts unlinks the socket on SIGHUP / exit
+//   probeUnixSocket  : pure helper in src/utils.ts (alive | stale | absent)
+//   hook-socket.mjs  : per-event Node client (probe + send subcommands)
+//   cmdStatus        : src/cli.ts surfaces stale state and exits non-zero
+//   hook-handler.sh  : bash hook orchestrating probe, cold-start, send
+//   daemon signals   : src/daemon.ts unlinks the socket on SIGHUP / exit
 //
 // macOS limits UNIX socket paths to 104 chars (Linux 108). The per-user tmpdir
 // on macOS is already ~48 chars, so paths nested under it silently truncate at
@@ -27,6 +28,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
 const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
 const HOOK_SCRIPT = path.join(REPO_ROOT, 'hooks', 'hook-handler.sh');
+const HOOK_SOCKET_MJS = path.join(REPO_ROOT, 'hooks', 'hook-socket.mjs');
 const FAKE_BIN_DIR = path.join(HERE, 'fixtures', 'fake-weave-claude-code-bin');
 const BIND_FIXTURE = new URL('./fixtures/bind-socket-child.mjs', import.meta.url);
 
@@ -127,6 +129,132 @@ suite('probeUnixSocket', () => {
     const w = newWorkspace('probe-stale');
     await abandonSocket(w.socketPath);
     assert.equal(await probeUnixSocket(w.socketPath), 'stale');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Direct tests of hooks/hook-socket.mjs, the per-event Node client invoked by
+// hook-handler.sh (replaces the previous `nc -U -w1` calls). The bash-level
+// integration tests in the `hook-handler.sh` suite below exercise this script
+// transitively; these tests pin the script's CLI contract on its own.
+
+interface MjsResult { code: number | null; stderr: string; stdout: string; }
+
+function runMjs(args: string[], opts: { stdin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<MjsResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [HOOK_SOCKET_MJS, ...args],
+      { env: { ...process.env, ...(opts.env ?? {}) } },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (b) => { stdout += b.toString(); });
+    child.stderr.on('data', (b) => { stderr += b.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve({ code, stderr, stdout }));
+    if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
+    else child.stdin.end();
+  });
+}
+
+suite('hook-socket.mjs probe', () => {
+  test('exits 0 when a listener accepts', async () => {
+    const w = newWorkspace('mjs-probe-alive');
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(w.socketPath, () => resolve());
+    });
+    try {
+      const r = await runMjs(['probe', w.socketPath]);
+      assert.equal(r.code, 0, `expected exit 0; stderr=${r.stderr}`);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  test('exits 1 when the socket path does not exist', async () => {
+    const w = newWorkspace('mjs-probe-absent');
+    const r = await runMjs(['probe', w.socketPath]);
+    assert.equal(r.code, 1);
+  });
+
+  test('exits 1 when the socket inode is stale', async () => {
+    const w = newWorkspace('mjs-probe-stale');
+    await abandonSocket(w.socketPath);
+    const r = await runMjs(['probe', w.socketPath]);
+    assert.equal(r.code, 1);
+  });
+});
+
+suite('hook-socket.mjs send', () => {
+  async function withListener<T>(
+    socketPath: string,
+    fn: (received: string[]) => Promise<T>,
+  ): Promise<T> {
+    const received: string[] = [];
+    const server = net.createServer((c) => {
+      let buf = '';
+      c.on('data', (d) => { buf += d.toString(); });
+      c.on('end', () => { received.push(buf); });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, () => resolve());
+    });
+    try {
+      return await fn(received);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }
+
+  test('delivers stdin payload to the listening socket', async () => {
+    const w = newWorkspace('mjs-send-payload');
+    await withListener(w.socketPath, async (received) => {
+      const r = await runMjs(['send', w.socketPath], { stdin: '{"event":"SessionStart"}' });
+      assert.equal(r.code, 0, `expected exit 0; stderr=${r.stderr}`);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.deepEqual(received, ['{"event":"SessionStart"}']);
+    });
+  });
+
+  test('merges WEAVE_PARENT_CALL_ID and WEAVE_TRACE_ID into the payload', async () => {
+    const w = newWorkspace('mjs-send-merge');
+    await withListener(w.socketPath, async (received) => {
+      const r = await runMjs(['send', w.socketPath], {
+        stdin: '{"event":"PreToolUse"}',
+        env: { WEAVE_PARENT_CALL_ID: 'call-abc', WEAVE_TRACE_ID: 'trace-xyz' },
+      });
+      assert.equal(r.code, 0, `expected exit 0; stderr=${r.stderr}`);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.equal(received.length, 1);
+      const parsed = JSON.parse(received[0]!);
+      assert.equal(parsed.event, 'PreToolUse');
+      assert.equal(parsed.weave_parent_call_id, 'call-abc');
+      assert.equal(parsed.weave_trace_id, 'trace-xyz');
+    });
+  });
+
+  test('passes payload through unchanged when no Weave env vars are set', async () => {
+    const w = newWorkspace('mjs-send-passthrough');
+    await withListener(w.socketPath, async (received) => {
+      const r = await runMjs(['send', w.socketPath], {
+        stdin: '{"event":"Stop","raw":"untouched"}',
+        env: { WEAVE_PARENT_CALL_ID: '', WEAVE_TRACE_ID: '' },
+      });
+      assert.equal(r.code, 0, `expected exit 0; stderr=${r.stderr}`);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.deepEqual(received, ['{"event":"Stop","raw":"untouched"}']);
+    });
+  });
+
+  test('exits 1 when the socket path does not exist', async () => {
+    const w = newWorkspace('mjs-send-absent');
+    const r = await runMjs(['send', w.socketPath], { stdin: '{}' });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /hook-socket send/);
   });
 });
 
