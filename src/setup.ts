@@ -155,21 +155,55 @@ export function findLocalPluginPath(): string | null {
 }
 
 /**
- * Read the ref Claude Code has registered for the given marketplace, or null
- * if the marketplace isn't registered. Used to detect drift when re-running
- * `install` after a CLI upgrade: a new binary's MARKETPLACE_REF may differ from
- * what Claude Code last cached, in which case the installed plugin is stale
- * and needs a follow-up `claude plugin update`.
+ * Discriminated union describing how Claude Code registered a marketplace.
+ * Mirrors the two `source.source` values the real `claude` CLI writes into
+ * `~/.claude/plugins/known_marketplaces.json` (verified empirically):
+ *   - `github`: cloned from a GitHub repo, optionally pinned to a ref
+ *   - `directory`: registered from a local path (the `--source=local` path)
  */
-export function readRegisteredMarketplaceRef(marketplaceName: string): string | null {
+export type MarketplaceSource =
+  | { type: 'github'; repo: string; ref: string | null }
+  | { type: 'directory'; path: string };
+
+/**
+ * Read and normalize the source spec Claude Code has registered for the given
+ * marketplace, or null if the marketplace isn't registered or the on-disk
+ * shape is unrecognized. Unknown shapes are treated as null rather than
+ * throwing so a future Claude Code schema change degrades to "Marketplace: not
+ * registered" rather than crashing status.
+ */
+export function readRegisteredMarketplaceSource(marketplaceName: string): MarketplaceSource | null {
   const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
   if (!fs.existsSync(knownPath)) return null;
+  let raw: unknown;
   try {
-    const data = JSON.parse(fs.readFileSync(knownPath, 'utf8')) as Record<string, { source?: { ref?: string } }>;
-    return data[marketplaceName]?.source?.ref ?? null;
+    raw = JSON.parse(fs.readFileSync(knownPath, 'utf8'));
   } catch {
     return null;
   }
+  const entry = (raw as Record<string, { source?: Record<string, unknown> }>)[marketplaceName];
+  const source = entry?.source;
+  if (!source || typeof source !== 'object') return null;
+  if (source['source'] === 'github' && typeof source['repo'] === 'string') {
+    return {
+      type: 'github',
+      repo: source['repo'],
+      ref: typeof source['ref'] === 'string' ? source['ref'] : null,
+    };
+  }
+  if (source['source'] === 'directory' && typeof source['path'] === 'string') {
+    return { type: 'directory', path: source['path'] };
+  }
+  return null;
+}
+
+/**
+ * Convenience wrapper for the github-ref drift detector in `registerPlugin`.
+ * Returns null for directory sources (no version-tag concept applies).
+ */
+export function readRegisteredMarketplaceRef(marketplaceName: string): string | null {
+  const source = readRegisteredMarketplaceSource(marketplaceName);
+  return source?.type === 'github' ? source.ref : null;
 }
 
 /**

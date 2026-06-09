@@ -26,6 +26,21 @@ interface SettingsOverrides {
   wandb_api_key?: string | null;
 }
 
+function writeKnownMarketplace(home: string, source: Record<string, unknown>): void {
+  const dir = path.join(home, '.claude', 'plugins');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'known_marketplaces.json'),
+    JSON.stringify({
+      'weave-claude-code': {
+        source,
+        installLocation: path.join(dir, 'marketplaces', 'weave-claude-code'),
+        lastUpdated: '2026-06-09T00:00:00Z',
+      },
+    }),
+  );
+}
+
 function writeSettings(home: string, overrides: SettingsOverrides = {}): { socketPath: string; logFile: string } {
   const configDir = path.join(home, '.weave-claude-code');
   fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
@@ -141,7 +156,8 @@ suite('weave-claude-code status --json', () => {
     // Required top-level fields per the documented schema.
     for (const key of [
       'version', 'settings_file', 'cli_path', 'weave_project', 'weave_project_source',
-      'api_key_configured', 'daemon_socket', 'log_file', 'ready_to_trace', 'view_traces_url',
+      'api_key_configured', 'marketplace', 'daemon_socket', 'log_file', 'ready_to_trace',
+      'view_traces_url',
     ]) {
       assert.ok(key in parsed, `missing required field: ${key}`);
     }
@@ -185,5 +201,62 @@ suite('weave-claude-code status --json', () => {
 
     const r = await runStatus(home, ['--json']);
     assert.doesNotMatch(r.stdout, /SUPER-SECRET-KEY-DO-NOT-LEAK/, 'JSON status must never include the raw API key');
+  });
+});
+
+suite('weave-claude-code status — marketplace source', () => {
+  test('pretty: reports github source with repo and ref', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-github-pretty-'));
+    writeSettings(home);
+    writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
+
+    const r = await runStatus(home);
+    assert.match(r.stdout, /Marketplace:\s+github wandb\/weave-claude-code @ v0\.2\.7/);
+  });
+
+  test('pretty: reports directory source with path', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-local-pretty-'));
+    writeSettings(home);
+    writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
+
+    const r = await runStatus(home);
+    assert.match(r.stdout, /Marketplace:\s+directory \/opt\/weave-claude-code/);
+  });
+
+  test('pretty: reports "not registered" when known_marketplaces.json is absent', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-absent-pretty-'));
+    writeSettings(home);
+
+    const r = await runStatus(home);
+    assert.match(r.stdout, /Marketplace:.+not registered/);
+  });
+
+  test('json: github source shape', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-github-json-'));
+    writeSettings(home);
+    writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
+
+    const r = await runStatus(home, ['--json']);
+    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
+    assert.deepEqual(parsed.marketplace, { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
+  });
+
+  test('json: directory source shape', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-local-json-'));
+    writeSettings(home);
+    writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
+
+    const r = await runStatus(home, ['--json']);
+    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
+    assert.deepEqual(parsed.marketplace, { type: 'directory', path: '/opt/weave-claude-code' });
+  });
+
+  test('json: marketplace is null when not registered', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'mkt-absent-json-'));
+    writeSettings(home);
+
+    const r = await runStatus(home, ['--json']);
+    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
+    assert.equal(parsed.marketplace, null);
   });
 });

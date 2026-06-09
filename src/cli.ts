@@ -22,7 +22,9 @@ import {
   unregisterPlugin,
   loadSettings,
   saveSettings,
+  readRegisteredMarketplaceSource,
   type Settings,
+  type MarketplaceSource,
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
@@ -364,6 +366,12 @@ interface StatusReport {
   weave_project: string | null;
   weave_project_source: WeaveProjectSource;
   api_key_configured: boolean;
+  /**
+   * What Claude Code has registered for this plugin's marketplace. `null`
+   * means the marketplace isn't registered yet (run `weave-claude-code
+   * install`). See `MarketplaceSource` for the github vs directory shape.
+   */
+  marketplace: MarketplaceSource | null;
   daemon_socket: { path: string | null; state: SocketState | null };
   log_file: { path: string | null; size_bytes: number | null };
   ready_to_trace: boolean;
@@ -391,6 +399,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     weave_project: null,
     weave_project_source: WeaveProjectSource.NotSet,
     api_key_configured: false,
+    marketplace: readRegisteredMarketplaceSource(MARKETPLACE_NAME),
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
     ready_to_trace: false,
@@ -492,6 +501,16 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   } else {
     console.log('✗ W&B API key: not configured');
     console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
+  }
+
+  if (report.marketplace === null) {
+    console.log('✗ Marketplace: not registered');
+    console.log('  Run: weave-claude-code install');
+  } else if (report.marketplace.type === 'github') {
+    const refLabel = report.marketplace.ref ? ` @ ${report.marketplace.ref}` : '';
+    console.log(`✓ Marketplace: github ${report.marketplace.repo}${refLabel}`);
+  } else {
+    console.log(`✓ Marketplace: directory ${report.marketplace.path}`);
   }
 
   const { path: socketPath, state: socketState } = report.daemon_socket;
