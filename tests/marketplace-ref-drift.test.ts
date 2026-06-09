@@ -12,17 +12,12 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { MARKETPLACE_NAME } from '../src/setup.ts';
+import { readFakeCalls } from './helpers.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE_BIN_DIR = path.join(HERE, 'fixtures', 'fake-claude-bin');
 const PLUGIN_SPEC = `weave@${MARKETPLACE_NAME}`;
 const KNOWN_MARKETPLACES_REL = path.join('.claude', 'plugins', 'known_marketplaces.json');
-
-function readFakeCalls(home: string): string[] {
-  const p = path.join(home, '.claude', 'fake-claude-calls.log');
-  if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean);
-}
 
 function seedKnownMarketplace(home: string, ref: string): void {
   const dir = path.join(home, '.claude', 'plugins');

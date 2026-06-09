@@ -31,7 +31,7 @@ export interface ConfigResult {
  *
  * `GitHub` (default) hands Claude Code a `repo#ref` source spec and lets it
  * clone over git. `Local` points Claude Code at the npm-installed plugin tree
- * on disk so it never touches the network — required in CI/sandbox
+ * on disk so it never touches the network; required in CI/sandbox
  * environments without git/SSH access to GitHub.
  */
 export enum InstallSource {
@@ -95,7 +95,7 @@ export const MARKETPLACE_NAME = 'weave-claude-code';
 export const PLUGIN_NAME = 'weave';
 
 // The npm package name shipped to the registry (matches package.json#name).
-// Coincidentally equal to MARKETPLACE_NAME today but a distinct concept — the
+// Coincidentally equal to MARKETPLACE_NAME today but a distinct concept: the
 // marketplace name lives in .claude-plugin/marketplace.json, the npm package
 // name lives in package.json. Kept separate so renaming one does not silently
 // break the other.
@@ -161,7 +161,7 @@ export function findLocalPluginPath(): string | null {
  *   - `github`: cloned from a GitHub repo, optionally pinned to a ref
  *   - `directory`: registered from a local path (the `--source=local` path)
  */
-export type MarketplaceSource =
+export type PluginSource =
   | { type: 'github'; repo: string; ref: string | null }
   | { type: 'directory'; path: string };
 
@@ -169,10 +169,10 @@ export type MarketplaceSource =
  * Read and normalize the source spec Claude Code has registered for the given
  * marketplace, or null if the marketplace isn't registered or the on-disk
  * shape is unrecognized. Unknown shapes are treated as null rather than
- * throwing so a future Claude Code schema change degrades to "Marketplace: not
+ * throwing so a future Claude Code schema change degrades to "Source: not
  * registered" rather than crashing status.
  */
-export function readRegisteredMarketplaceSource(marketplaceName: string): MarketplaceSource | null {
+export function readRegisteredPluginSource(marketplaceName: string): PluginSource | null {
   const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
   if (!fs.existsSync(knownPath)) return null;
   let raw: unknown;
@@ -202,7 +202,7 @@ export function readRegisteredMarketplaceSource(marketplaceName: string): Market
  * Returns null for directory sources (no version-tag concept applies).
  */
 export function readRegisteredMarketplaceRef(marketplaceName: string): string | null {
-  const source = readRegisteredMarketplaceSource(marketplaceName);
+  const source = readRegisteredPluginSource(marketplaceName);
   return source?.type === 'github' ? source.ref : null;
 }
 
@@ -271,8 +271,8 @@ export function registerPlugin(
 
   const refAfter = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
   // Drift detection compares marketplace refs (version tags). Local sources
-  // have no version tag — npm is the version-of-record — so skip the check
-  // and let the user re-run `npm install -g weave-claude-code` to upgrade.
+  // have no version tag (npm is the version-of-record), so skip the check and
+  // let the user re-run `npm install -g weave-claude-code` to upgrade.
   const refDrifted = source !== InstallSource.Local && refBefore !== null && refBefore !== refAfter;
 
   // Install plugin at user scope

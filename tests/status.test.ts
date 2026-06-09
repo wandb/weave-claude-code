@@ -156,7 +156,7 @@ suite('weave-claude-code status --json', () => {
     // Required top-level fields per the documented schema.
     for (const key of [
       'version', 'settings_file', 'cli_path', 'weave_project', 'weave_project_source',
-      'api_key_configured', 'marketplace', 'daemon_socket', 'log_file', 'ready_to_trace',
+      'api_key_configured', 'plugin_source', 'daemon_socket', 'log_file', 'ready_to_trace',
       'view_traces_url',
     ]) {
       assert.ok(key in parsed, `missing required field: ${key}`);
@@ -204,59 +204,59 @@ suite('weave-claude-code status --json', () => {
   });
 });
 
-suite('weave-claude-code status — marketplace source', () => {
+suite('weave-claude-code status (plugin source)', () => {
   test('pretty: reports github source with repo and ref', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-github-pretty-'));
+    const home = fs.mkdtempSync(path.join(scratch, 'src-github-pretty-'));
     writeSettings(home);
     writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
 
     const r = await runStatus(home);
-    assert.match(r.stdout, /Marketplace:\s+github wandb\/weave-claude-code @ v0\.2\.7/);
+    assert.match(r.stdout, /Source:\s+github wandb\/weave-claude-code @ v0\.2\.7/);
   });
 
   test('pretty: reports directory source with path', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-local-pretty-'));
+    const home = fs.mkdtempSync(path.join(scratch, 'src-local-pretty-'));
     writeSettings(home);
     writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
 
     const r = await runStatus(home);
-    assert.match(r.stdout, /Marketplace:\s+directory \/opt\/weave-claude-code/);
+    assert.match(r.stdout, /Source:\s+directory \/opt\/weave-claude-code/);
   });
 
   test('pretty: reports "not registered" when known_marketplaces.json is absent', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-absent-pretty-'));
+    const home = fs.mkdtempSync(path.join(scratch, 'src-absent-pretty-'));
     writeSettings(home);
 
     const r = await runStatus(home);
-    assert.match(r.stdout, /Marketplace:.+not registered/);
+    assert.match(r.stdout, /Source:.+not registered/);
   });
 
   test('json: github source shape', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-github-json-'));
+    const home = fs.mkdtempSync(path.join(scratch, 'src-github-json-'));
     writeSettings(home);
     writeKnownMarketplace(home, { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
 
     const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
-    assert.deepEqual(parsed.marketplace, { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
+    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
+    assert.deepEqual(parsed.plugin_source, { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' });
   });
 
   test('json: directory source shape', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-local-json-'));
+    const home = fs.mkdtempSync(path.join(scratch, 'src-local-json-'));
     writeSettings(home);
     writeKnownMarketplace(home, { source: 'directory', path: '/opt/weave-claude-code' });
 
     const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
-    assert.deepEqual(parsed.marketplace, { type: 'directory', path: '/opt/weave-claude-code' });
+    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
+    assert.deepEqual(parsed.plugin_source, { type: 'directory', path: '/opt/weave-claude-code' });
   });
 
-  test('json: marketplace is null when not registered', async () => {
-    const home = fs.mkdtempSync(path.join(scratch, 'mkt-absent-json-'));
+  test('json: plugin_source is null when not registered', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'src-absent-json-'));
     writeSettings(home);
 
     const r = await runStatus(home, ['--json']);
-    const parsed = JSON.parse(r.stdout) as { marketplace: unknown };
-    assert.equal(parsed.marketplace, null);
+    const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
+    assert.equal(parsed.plugin_source, null);
   });
 });
