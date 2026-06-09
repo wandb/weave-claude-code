@@ -4,15 +4,22 @@
 // SPDX-PackageName: @wandb/weave-claude-code
 
 // Stand-in for the real weave-claude-code CLI, used by hook-handler integration
-// tests. Supports two subcommands:
-//   * `daemon` — bind WCP_SOCK_PATH, append every line received to WCP_REQUEST_LOG,
-//                stay alive until SIGTERM.
-//   * everything else — exit 0 silently. (Real CLI has install/config/etc.)
+// tests. Supports four subcommands:
+//   * `daemon`       : bind WCP_SOCK_PATH, append every line received to
+//                      WCP_REQUEST_LOG, stay alive until SIGTERM.
+//   * `probe-socket` : connect to --path; exit 0 if a listener accepts, 1 otherwise.
+//   * `send-event`   : read stdin, connect to --path, write payload, exit 0/1.
+//   * everything else: exit 0 silently.
 
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 
 const sub = process.argv[2];
+
+function getOptArg(name) {
+  const i = process.argv.indexOf(name);
+  return i === -1 ? undefined : process.argv[i + 1];
+}
 
 if (sub === 'daemon') {
   const sock = process.env.WCP_SOCK_PATH;
@@ -37,6 +44,39 @@ if (sub === 'daemon') {
   });
 
   process.on('SIGTERM', () => { try { fs.unlinkSync(sock); } catch { /* fine */ } process.exit(0); });
+} else if (sub === 'probe-socket') {
+  const sock = getOptArg('--path');
+  if (!sock) { process.exit(1); }
+  if (!fs.existsSync(sock)) { process.exit(1); }
+  const client = net.createConnection(sock);
+  const timer = setTimeout(() => { client.destroy(); process.exit(1); }, 250);
+  client.once('connect', () => { clearTimeout(timer); client.destroy(); process.exit(0); });
+  client.once('error', () => { clearTimeout(timer); process.exit(1); });
+} else if (sub === 'send-event') {
+  const sock = getOptArg('--path');
+  if (!sock) { process.exit(1); }
+  let payload = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (c) => { payload += c; });
+  process.stdin.on('end', () => {
+    if (process.env.WEAVE_PARENT_CALL_ID || process.env.WEAVE_TRACE_ID) {
+      try {
+        const o = JSON.parse(payload);
+        if (process.env.WEAVE_PARENT_CALL_ID) o.weave_parent_call_id = process.env.WEAVE_PARENT_CALL_ID;
+        if (process.env.WEAVE_TRACE_ID) o.weave_trace_id = process.env.WEAVE_TRACE_ID;
+        payload = JSON.stringify(o);
+      } catch (err) {
+        console.error(`send-event: ${err.message}`);
+        process.exit(1);
+      }
+    }
+    const client = net.createConnection(sock, () => {
+      client.write(payload);
+      client.end();
+    });
+    client.on('close', () => process.exit(0));
+    client.on('error', (err) => { console.error(`send-event: ${err.message}`); process.exit(1); });
+  });
 } else {
   process.exit(0);
 }

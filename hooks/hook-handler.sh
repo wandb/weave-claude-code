@@ -9,7 +9,6 @@
 #
 # Assumptions:
 #   - weave-claude-code is on PATH (installed globally via npm install -g)
-#   - nc (netcat) is available (ships with macOS; brew install netcat on Linux)
 #
 # Errors are written to ~/.weave-claude-code/logs/hook-errors.log.
 # The script always exits 0 so it never disrupts Claude Code.
@@ -28,11 +27,6 @@ mkdir -p "${CONFIG_DIR}/logs"
 
 if ! command -v weave-claude-code >/dev/null 2>&1; then
   echo "$(date -Iseconds) | ERROR | weave-claude-code not found in PATH. Run: npm install -g weave-claude-code" >> "${ERROR_LOG}"
-  exit 0
-fi
-
-if ! command -v nc >/dev/null 2>&1; then
-  echo "$(date -Iseconds) | ERROR | nc (netcat) not found. Install with: brew install netcat" >> "${ERROR_LOG}"
   exit 0
 fi
 
@@ -68,18 +62,12 @@ fi
 # The socket file alone is NOT proof that the daemon is alive. When the daemon
 # dies ungracefully (terminal SIGHUP, OOM, kill -9), its UNIX socket inode
 # remains on disk with no listener. `[ -S "$SOCKET_PATH" ]` returns true in
-# that state, but nc -U / connect() will then fail and silently drop every
-# event. Probe the socket instead.
+# that state, but connect() will then fail and silently drop every event.
+# Probe the socket instead via the `probe-socket` subcommand, which does a
+# real connect() attempt and exits 0 only when a listener accepts.
 
 is_daemon_alive() {
-  # `</dev/null nc -U -w1 sock` opens a UNIX-domain connection, writes nothing,
-  # and exits 0 iff connect() succeeded. The daemon's empty-payload short-
-  # circuit (src/daemon.ts handleConnection: `if (!raw) return`) means an empty
-  # connection is dropped silently — no log spam.
-  #
-  # We do NOT use `nc -z -U`: on macOS BSD nc (Darwin 25.x), `-z` for UNIX
-  # sockets returns 1 even against a live listener.
-  </dev/null nc -U -w1 "${SOCKET_PATH}" >/dev/null 2>&1
+  weave-claude-code probe-socket --path "${SOCKET_PATH}" >/dev/null 2>&1
 }
 
 if ! is_daemon_alive; then
@@ -104,22 +92,13 @@ EOF
 fi
 
 # ── forward event to daemon ───────────────────────────────────────────────────
+#
+# `send-event` reads stdin, optionally merges WEAVE_PARENT_CALL_ID and
+# WEAVE_TRACE_ID env vars into the payload, then writes to the socket. The
+# subcommand exits 1 on connect failure; we log that to ERROR_LOG but always
+# exit 0 so a hook failure never disrupts Claude Code.
 
-EVENT_PAYLOAD=$(cat)
-
-# If parent Weave context is available, merge it into the payload using
-if [ -n "${WEAVE_PARENT_CALL_ID:-}" ] || [ -n "${WEAVE_TRACE_ID:-}" ]; then
-  EVENT_PAYLOAD=$(printf '%s' "${EVENT_PAYLOAD}" | node -e "
-    let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
-      const o=JSON.parse(d);
-      if(process.env.WEAVE_PARENT_CALL_ID)o.weave_parent_call_id=process.env.WEAVE_PARENT_CALL_ID;
-      if(process.env.WEAVE_TRACE_ID)o.weave_trace_id=process.env.WEAVE_TRACE_ID;
-      process.stdout.write(JSON.stringify(o));
-    });
-  ")
-fi
-
-printf '%s' "${EVENT_PAYLOAD}" | nc -U -w1 "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
+weave-claude-code send-event --path "${SOCKET_PATH}" 2>> "${ERROR_LOG}" || {
   echo "$(date -Iseconds) | ERROR | Failed to send event to daemon" >> "${ERROR_LOG}"
 }
 

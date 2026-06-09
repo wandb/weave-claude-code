@@ -125,7 +125,7 @@ export WANDB_BASE_URL=https://your-instance.wandb.io
 
 1. Shut down the daemon:
    ```bash
-   printf '{"command":"shutdown"}' | nc -U -w1 ~/.weave-claude-code/daemon.sock
+   printf '{"command":"shutdown"}' | weave-claude-code send-event
    ```
 2. Point the plugin at your instance using either approach:
 
