@@ -253,6 +253,26 @@ export function readRegisteredMarketplaceRef(marketplaceName: string): string | 
  * refreshed marketplace. Final state is always "marketplace at current
  * MARKETPLACE_REF, plugin at the version that marketplace advertises."
  */
+/**
+ * Pick the marketplace argument `claude plugin marketplace add` should receive.
+ * Throws (with a message that names the fix) if `--source=local` was requested
+ * but the npm-installed tree isn't on disk.
+ */
+function resolveMarketplaceArg(source: InstallSource, logFile: string): string {
+  if (source !== InstallSource.Local) return MARKETPLACE_SOURCE;
+  const localPath = findLocalPluginPath();
+  if (!localPath) {
+    const msg = [
+      '--source=local requires weave-claude-code to be installed globally via npm,',
+      "but `npm root -g` did not yield a weave-claude-code/.claude-plugin/marketplace.json.",
+      'Run: npm install -g weave-claude-code',
+    ].join('\n');
+    appendToLog(logFile, 'ERROR', msg);
+    throw new Error(msg);
+  }
+  return localPath;
+}
+
 export function registerPlugin(
   logFile: string,
   source: InstallSource = InstallSource.GitHub,
@@ -269,22 +289,7 @@ export function registerPlugin(
     throw new Error(msg);
   }
 
-  let marketplaceArg: string;
-  if (source === InstallSource.Local) {
-    const localPath = findLocalPluginPath();
-    if (!localPath) {
-      const msg = [
-        '--source=local requires weave-claude-code to be installed globally via npm,',
-        "but `npm root -g` did not yield a weave-claude-code/.claude-plugin/marketplace.json.",
-        'Run: npm install -g weave-claude-code',
-      ].join('\n');
-      appendToLog(logFile, 'ERROR', msg);
-      throw new Error(msg);
-    }
-    marketplaceArg = localPath;
-  } else {
-    marketplaceArg = MARKETPLACE_SOURCE;
-  }
+  const marketplaceArg = resolveMarketplaceArg(source, logFile);
 
   const refBefore = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
 
