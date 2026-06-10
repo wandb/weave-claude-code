@@ -167,19 +167,27 @@ export type PluginSource =
   | { type: 'directory'; path: string; version: string | null };
 
 /**
+ * Read and parse a JSON file. Returns null if the file is missing or
+ * unparseable. Caller is responsible for shape validation on the returned
+ * value (typed as `unknown`).
+ */
+function readJsonFile(filePath: string): unknown | null {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read `<dir>/package.json#version`. Returns null if the file is missing,
  * unparseable, or lacks a string `version`. Used to surface the npm-installed
  * version for directory-source registrations.
  */
 function readPackageVersion(dir: string): string | null {
-  const pkgPath = path.join(dir, 'package.json');
-  if (!fs.existsSync(pkgPath)) return null;
-  try {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: unknown };
-    return typeof pkg.version === 'string' ? pkg.version : null;
-  } catch {
-    return null;
-  }
+  const pkg = readJsonFile(path.join(dir, 'package.json')) as { version?: unknown } | null;
+  return typeof pkg?.version === 'string' ? pkg.version : null;
 }
 
 /**
@@ -191,13 +199,8 @@ function readPackageVersion(dir: string): string | null {
  */
 export function readRegisteredPluginSource(marketplaceName: string): PluginSource | null {
   const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
-  if (!fs.existsSync(knownPath)) return null;
-  let raw: unknown;
-  try {
-    raw = JSON.parse(fs.readFileSync(knownPath, 'utf8'));
-  } catch {
-    return null;
-  }
+  const raw = readJsonFile(knownPath);
+  if (raw === null) return null;
   const entry = (raw as Record<string, { source?: Record<string, unknown> }>)[marketplaceName];
   const source = entry?.source;
   if (!source || typeof source !== 'object') return null;
