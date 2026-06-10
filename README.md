@@ -41,6 +41,15 @@ In non-interactive mode, the installer still creates config, registers the Claud
 - Warns and continues if either value is missing
 - Leaves environment-provided values in the environment rather than writing them into `settings.json`
 
+By default, `claude plugin marketplace add` clones `wandb/weave-claude-code` from GitHub. In CI or container sandboxes without git/SSH access to GitHub, pass `--source=local` to register the marketplace from the npm-installed tree on disk instead:
+
+```bash
+npm install -g weave-claude-code
+weave-claude-code install --non-interactive --source=local
+```
+
+`--source=local` requires the package to be installed globally via npm first (it reads from `$(npm root -g)/weave-claude-code`). Upgrades follow the npm cadence; the marketplace ref drift check is skipped for local sources.
+
 **3. Restart or launch Claude Code**
 
 If Claude Code is already running, reload plugins from inside the session:

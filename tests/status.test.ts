@@ -13,6 +13,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { writeKnownMarketplace } from './helpers.ts';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
 const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
@@ -141,7 +143,8 @@ suite('weave-claude-code status --json', () => {
     // Required top-level fields per the documented schema.
     for (const key of [
       'version', 'settings_file', 'cli_path', 'weave_project', 'weave_project_source',
-      'api_key_configured', 'daemon_socket', 'log_file', 'ready_to_trace', 'view_traces_url',
+      'api_key_configured', 'plugin_source', 'daemon_socket', 'log_file', 'ready_to_trace',
+      'view_traces_url',
     ]) {
       assert.ok(key in parsed, `missing required field: ${key}`);
     }
@@ -185,5 +188,88 @@ suite('weave-claude-code status --json', () => {
 
     const r = await runStatus(home, ['--json']);
     assert.doesNotMatch(r.stdout, /SUPER-SECRET-KEY-DO-NOT-LEAK/, 'JSON status must never include the raw API key');
+  });
+});
+
+// Parametrized: same flow (write settings + maybe seed known_marketplaces +
+// run status) varies only by source spec and expected output. Each case's
+// `setup` returns the seed for known_marketplaces.json plus its own pretty
+// and JSON expectations; directory cases create a real tmpdir so the
+// version-from-package.json path can run end-to-end.
+interface PluginSourceCase {
+  name: string;
+  setup: (scratchDir: string) => {
+    seed: Record<string, unknown> | null;
+    expectInPretty: string;
+    expectNotInPretty?: string;
+    expectJson: unknown;
+  };
+}
+
+const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
+  {
+    name: 'github source',
+    setup: () => ({
+      seed: { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+      expectInPretty: 'Source: github wandb/weave-claude-code @ v0.2.7',
+      expectJson: { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+    }),
+  },
+  {
+    name: 'directory source with version',
+    setup: (scratchDir) => {
+      const dir = fs.mkdtempSync(path.join(scratchDir, 'dir-with-ver-'));
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'weave-claude-code', version: '1.2.3' }),
+      );
+      return {
+        seed: { source: 'directory', path: dir },
+        expectInPretty: `Source: directory ${dir} @ v1.2.3`,
+        expectJson: { type: 'directory', path: dir, version: '1.2.3' },
+      };
+    },
+  },
+  {
+    name: 'directory source without readable version',
+    setup: (scratchDir) => {
+      const dir = fs.mkdtempSync(path.join(scratchDir, 'dir-no-ver-'));
+      // Intentionally no package.json; version should fall back to null.
+      return {
+        seed: { source: 'directory', path: dir },
+        expectInPretty: `Source: directory ${dir}`,
+        expectNotInPretty: `${dir} @`,
+        expectJson: { type: 'directory', path: dir, version: null },
+      };
+    },
+  },
+  {
+    name: 'not registered',
+    setup: () => ({
+      seed: null,
+      expectInPretty: 'Source: not registered',
+      expectJson: null,
+    }),
+  },
+];
+
+suite('weave-claude-code status (plugin source)', () => {
+  test('renders each source type in pretty and json', async () => {
+    for (const c of PLUGIN_SOURCE_CASES) {
+      const home = fs.mkdtempSync(path.join(scratch, `src-${c.name.replace(/\s+/g, '-')}-`));
+      writeSettings(home);
+      const { seed, expectInPretty, expectNotInPretty, expectJson } = c.setup(scratch);
+      if (seed) writeKnownMarketplace(home, seed);
+
+      const pretty = await runStatus(home);
+      assert.ok(pretty.stdout.includes(expectInPretty), `case "${c.name}" (pretty): expected "${expectInPretty}" in:\n${pretty.stdout}`);
+      if (expectNotInPretty) {
+        assert.ok(!pretty.stdout.includes(expectNotInPretty), `case "${c.name}" (pretty): did not expect "${expectNotInPretty}" in:\n${pretty.stdout}`);
+      }
+
+      const json = await runStatus(home, ['--json']);
+      const parsed = JSON.parse(json.stdout) as { plugin_source: unknown };
+      assert.deepEqual(parsed.plugin_source, expectJson, `case "${c.name}" (json)`);
+    }
   });
 });

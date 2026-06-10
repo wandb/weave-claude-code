@@ -13,6 +13,7 @@ import {
   MARKETPLACE_NAME,
   PLUGIN_NAME,
   VERSION,
+  InstallSource,
   MarketplaceStatus,
   PluginStatus,
   RemovalStatus,
@@ -21,7 +22,9 @@ import {
   unregisterPlugin,
   loadSettings,
   saveSettings,
+  readRegisteredPluginSource,
   type Settings,
+  type PluginSource,
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
@@ -50,10 +53,16 @@ Options:
   --version, -v      Print version
   --help, -h         Print this help message
   --non-interactive  Skip install prompts and rely on env/config values
+  --source=<src>     Where 'install' pulls the marketplace from:
+                       github (default) - clone wandb/weave-claude-code over git
+                       local            - register the npm-installed tree on disk
+                                          (requires 'npm install -g weave-claude-code';
+                                          use in CI/sandboxes without git/SSH access)
 
 Examples:
   weave-claude-code install
   weave-claude-code install --non-interactive
+  weave-claude-code install --non-interactive --source=local
   weave-claude-code config set weave_project my-entity/my-project
   weave-claude-code status
   weave-claude-code logs --tail 100
@@ -63,7 +72,11 @@ Examples:
 // install
 // ---------------------------------------------------------------------------
 
-async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void> {
+async function cmdInstall(
+  force: boolean,
+  nonInteractive: boolean,
+  source: InstallSource,
+): Promise<void> {
   let configResult;
   if (fs.existsSync(SETTINGS_FILE) && !force) {
     let settings: Settings;
@@ -98,7 +111,7 @@ async function cmdInstall(force: boolean, nonInteractive: boolean): Promise<void
 
   let pluginResult;
   try {
-    pluginResult = registerPlugin(configResult.logFile);
+    pluginResult = registerPlugin(configResult.logFile, source);
   } catch (err) {
     console.error(`✗ ${err}`);
     process.exit(1);
@@ -353,6 +366,12 @@ interface StatusReport {
   weave_project: string | null;
   weave_project_source: WeaveProjectSource;
   api_key_configured: boolean;
+  /**
+   * Where Claude Code is loading this plugin from. `null` means the
+   * marketplace isn't registered yet (run `weave-claude-code install`).
+   * See `PluginSource` for the github vs directory shape.
+   */
+  plugin_source: PluginSource | null;
   daemon_socket: { path: string | null; state: SocketState | null };
   log_file: { path: string | null; size_bytes: number | null };
   ready_to_trace: boolean;
@@ -380,6 +399,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     weave_project: null,
     weave_project_source: WeaveProjectSource.NotSet,
     api_key_configured: false,
+    plugin_source: readRegisteredPluginSource(MARKETPLACE_NAME),
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
     ready_to_trace: false,
@@ -481,6 +501,17 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   } else {
     console.log('✗ W&B API key: not configured');
     console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
+  }
+
+  if (report.plugin_source === null) {
+    console.log('✗ Source: not registered');
+    console.log('  Run: weave-claude-code install');
+  } else if (report.plugin_source.type === 'github') {
+    const refLabel = report.plugin_source.ref ? ` @ ${report.plugin_source.ref}` : '';
+    console.log(`✓ Source: github ${report.plugin_source.repo}${refLabel}`);
+  } else {
+    const versionLabel = report.plugin_source.version ? ` @ v${report.plugin_source.version}` : '';
+    console.log(`✓ Source: directory ${report.plugin_source.path}${versionLabel}`);
   }
 
   const { path: socketPath, state: socketState } = report.daemon_socket;
@@ -664,7 +695,8 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'install') {
-    await cmdInstall(args.includes('--force'), args.includes('--non-interactive'));
+    const source = args.includes('--source=local') ? InstallSource.Local : InstallSource.GitHub;
+    await cmdInstall(args.includes('--force'), args.includes('--non-interactive'), source);
     return;
   }
 
