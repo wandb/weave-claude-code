@@ -197,6 +197,23 @@ function readPackageVersion(dir: string): string | null {
  * throwing so a future Claude Code schema change degrades to "Source: not
  * registered" rather than crashing status.
  */
+/**
+ * Shape of a github-source entry inside known_marketplaces.json. `ref` is
+ * optional because pre-v0.2 marketplace registrations didn't pin to a tag.
+ */
+type RawGithubSource = { source: 'github'; repo: string; ref?: string };
+type RawDirectorySource = { source: 'directory'; path: string };
+
+function isRawGithubSource(s: Record<string, unknown>): s is RawGithubSource {
+  return s['source'] === 'github'
+    && typeof s['repo'] === 'string'
+    && (s['ref'] === undefined || typeof s['ref'] === 'string');
+}
+
+function isRawDirectorySource(s: Record<string, unknown>): s is RawDirectorySource {
+  return s['source'] === 'directory' && typeof s['path'] === 'string';
+}
+
 export function readRegisteredPluginSource(marketplaceName: string): PluginSource | null {
   const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
   const raw = readJsonFile(knownPath);
@@ -204,19 +221,11 @@ export function readRegisteredPluginSource(marketplaceName: string): PluginSourc
   const entry = (raw as Record<string, { source?: Record<string, unknown> }>)[marketplaceName];
   const source = entry?.source;
   if (!source || typeof source !== 'object') return null;
-  if (source['source'] === 'github' && typeof source['repo'] === 'string') {
-    return {
-      type: 'github',
-      repo: source['repo'],
-      ref: typeof source['ref'] === 'string' ? source['ref'] : null,
-    };
+  if (isRawGithubSource(source)) {
+    return { type: 'github', repo: source.repo, ref: source.ref ?? null };
   }
-  if (source['source'] === 'directory' && typeof source['path'] === 'string') {
-    return {
-      type: 'directory',
-      path: source['path'],
-      version: readPackageVersion(source['path']),
-    };
+  if (isRawDirectorySource(source)) {
+    return { type: 'directory', path: source.path, version: readPackageVersion(source.path) };
   }
   return null;
 }
