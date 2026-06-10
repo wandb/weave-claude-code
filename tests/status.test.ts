@@ -192,32 +192,64 @@ suite('weave-claude-code status --json', () => {
 });
 
 // Parametrized: same flow (write settings + maybe seed known_marketplaces +
-// run status) varies only by source spec and expected output. Splitting into
-// per-case `test()` calls was identical setup with one assertion swapped, so
-// this is one test per output mode with a case table inside.
-const PLUGIN_SOURCE_CASES: ReadonlyArray<{
+// run status) varies only by source spec and expected output. Each case's
+// `setup` returns the seed for known_marketplaces.json plus its own pretty
+// and JSON expectations; directory cases create a real tmpdir so the
+// version-from-package.json path can run end-to-end.
+interface PluginSourceCase {
   name: string;
-  seed: Record<string, unknown> | null;
-  prettyPattern: RegExp;
-  jsonValue: unknown;
-}> = [
+  setup: (scratchDir: string) => {
+    seed: Record<string, unknown> | null;
+    expectInPretty: string;
+    expectNotInPretty?: string;
+    expectJson: unknown;
+  };
+}
+
+const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
   {
     name: 'github source',
-    seed: { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
-    prettyPattern: /Source:\s+github wandb\/weave-claude-code @ v0\.2\.7/,
-    jsonValue: { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+    setup: () => ({
+      seed: { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+      expectInPretty: 'Source: github wandb/weave-claude-code @ v0.2.7',
+      expectJson: { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
+    }),
   },
   {
-    name: 'directory source',
-    seed: { source: 'directory', path: '/opt/weave-claude-code' },
-    prettyPattern: /Source:\s+directory \/opt\/weave-claude-code/,
-    jsonValue: { type: 'directory', path: '/opt/weave-claude-code' },
+    name: 'directory source with version',
+    setup: (scratchDir) => {
+      const dir = fs.mkdtempSync(path.join(scratchDir, 'dir-with-ver-'));
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'weave-claude-code', version: '1.2.3' }),
+      );
+      return {
+        seed: { source: 'directory', path: dir },
+        expectInPretty: `Source: directory ${dir} @ v1.2.3`,
+        expectJson: { type: 'directory', path: dir, version: '1.2.3' },
+      };
+    },
+  },
+  {
+    name: 'directory source without readable version',
+    setup: (scratchDir) => {
+      const dir = fs.mkdtempSync(path.join(scratchDir, 'dir-no-ver-'));
+      // Intentionally no package.json; version should fall back to null.
+      return {
+        seed: { source: 'directory', path: dir },
+        expectInPretty: `Source: directory ${dir}`,
+        expectNotInPretty: `${dir} @`,
+        expectJson: { type: 'directory', path: dir, version: null },
+      };
+    },
   },
   {
     name: 'not registered',
-    seed: null,
-    prettyPattern: /Source:.+not registered/,
-    jsonValue: null,
+    setup: () => ({
+      seed: null,
+      expectInPretty: 'Source: not registered',
+      expectJson: null,
+    }),
   },
 ];
 
@@ -226,10 +258,14 @@ suite('weave-claude-code status (plugin source)', () => {
     for (const c of PLUGIN_SOURCE_CASES) {
       const home = fs.mkdtempSync(path.join(scratch, `src-pretty-${c.name.replace(/\s+/g, '-')}-`));
       writeSettings(home);
-      if (c.seed) writeKnownMarketplace(home, c.seed);
+      const { seed, expectInPretty, expectNotInPretty } = c.setup(scratch);
+      if (seed) writeKnownMarketplace(home, seed);
 
       const r = await runStatus(home);
-      assert.match(r.stdout, c.prettyPattern, `case "${c.name}": stdout=${r.stdout}`);
+      assert.ok(r.stdout.includes(expectInPretty), `case "${c.name}": expected "${expectInPretty}" in:\n${r.stdout}`);
+      if (expectNotInPretty) {
+        assert.ok(!r.stdout.includes(expectNotInPretty), `case "${c.name}": did not expect "${expectNotInPretty}" in:\n${r.stdout}`);
+      }
     }
   });
 
@@ -237,11 +273,12 @@ suite('weave-claude-code status (plugin source)', () => {
     for (const c of PLUGIN_SOURCE_CASES) {
       const home = fs.mkdtempSync(path.join(scratch, `src-json-${c.name.replace(/\s+/g, '-')}-`));
       writeSettings(home);
-      if (c.seed) writeKnownMarketplace(home, c.seed);
+      const { seed, expectJson } = c.setup(scratch);
+      if (seed) writeKnownMarketplace(home, seed);
 
       const r = await runStatus(home, ['--json']);
       const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
-      assert.deepEqual(parsed.plugin_source, c.jsonValue, `case "${c.name}"`);
+      assert.deepEqual(parsed.plugin_source, expectJson, `case "${c.name}"`);
     }
   });
 });

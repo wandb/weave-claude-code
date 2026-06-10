@@ -159,11 +159,30 @@ export function findLocalPluginPath(): string | null {
  * Mirrors the two `source.source` values the real `claude` CLI writes into
  * `~/.claude/plugins/known_marketplaces.json` (verified empirically):
  *   - `github`: cloned from a GitHub repo, optionally pinned to a ref
- *   - `directory`: registered from a local path (the `--source=local` path)
+ *   - `directory`: registered from a local path (the `--source=local` path).
+ *     `version` is read from `<path>/package.json#version` for npm-installed
+ *     trees; `null` when the path has no parseable package.json (e.g. a
+ *     hand-rolled directory marketplace).
  */
 export type PluginSource =
   | { type: 'github'; repo: string; ref: string | null }
-  | { type: 'directory'; path: string };
+  | { type: 'directory'; path: string; version: string | null };
+
+/**
+ * Read `<dir>/package.json#version`. Returns null if the file is missing,
+ * unparseable, or lacks a string `version`. Used to surface the npm-installed
+ * version for directory-source registrations.
+ */
+function readPackageVersion(dir: string): string | null {
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return null;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Read and normalize the source spec Claude Code has registered for the given
@@ -192,7 +211,11 @@ export function readRegisteredPluginSource(marketplaceName: string): PluginSourc
     };
   }
   if (source['source'] === 'directory' && typeof source['path'] === 'string') {
-    return { type: 'directory', path: source['path'] };
+    return {
+      type: 'directory',
+      path: source['path'],
+      version: readPackageVersion(source['path']),
+    };
   }
   return null;
 }

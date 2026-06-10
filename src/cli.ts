@@ -510,7 +510,8 @@ function printPrettyStatus(snap: StatusSnapshot): void {
     const refLabel = report.plugin_source.ref ? ` @ ${report.plugin_source.ref}` : '';
     console.log(`✓ Source: github ${report.plugin_source.repo}${refLabel}`);
   } else {
-    console.log(`✓ Source: directory ${report.plugin_source.path}`);
+    const versionLabel = report.plugin_source.version ? ` @ v${report.plugin_source.version}` : '';
+    console.log(`✓ Source: directory ${report.plugin_source.path}${versionLabel}`);
   }
 
   const { path: socketPath, state: socketState } = report.daemon_socket;
