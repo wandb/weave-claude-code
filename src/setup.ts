@@ -145,9 +145,7 @@ export function createConfig(configDir: string): ConfigResult {
 export function findLocalPluginPath(): string | null {
   const result = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' });
   if (result.status !== 0) return null;
-  const root = result.stdout.trim();
-  if (!root) return null;
-  const candidate = path.join(root, NPM_PACKAGE_NAME);
+  const candidate = path.join(result.stdout.trim(), NPM_PACKAGE_NAME);
   if (!fs.existsSync(path.join(candidate, '.claude-plugin', 'marketplace.json'))) {
     return null;
   }

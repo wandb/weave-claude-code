@@ -62,31 +62,28 @@ afterEach(() => {
   fs.rmSync(tmpNpmPrefix, { recursive: true, force: true });
 });
 
-suite('findLocalPluginPath', () => {
-  test('returns the npm-installed plugin tree when marketplace.json present', async () => {
-    const { findLocalPluginPath } = await import('../src/setup.ts');
-    const pkgDir = seedLocalPluginTree(tmpNpmPrefix);
-
-    assert.equal(findLocalPluginPath(), pkgDir);
-  });
-
-  test('returns null when no weave-claude-code is npm-installed globally', async () => {
+suite('install --source=local', () => {
+  test('findLocalPluginPath: returns the seeded tree, null otherwise', async () => {
+    // Incremental setup: start with no install, then a half-install, then a
+    // full install. Each step asserts that findLocalPluginPath reflects the
+    // current on-disk state.
     const { findLocalPluginPath } = await import('../src/setup.ts');
 
-    assert.equal(findLocalPluginPath(), null);
+    assert.equal(findLocalPluginPath(), null, 'no install: expected null');
+
+    const dir = path.join(tmpNpmPrefix, 'lib', 'node_modules', 'weave-claude-code');
+    fs.mkdirSync(dir, { recursive: true });
+    assert.equal(findLocalPluginPath(), null, 'dir without marketplace.json: expected null');
+
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.claude-plugin', 'marketplace.json'),
+      JSON.stringify({ name: MARKETPLACE_NAME, plugins: [] }),
+    );
+    assert.equal(findLocalPluginPath(), dir, 'seeded: expected the seeded path');
   });
 
-  test('returns null when weave-claude-code exists but marketplace.json is missing', async () => {
-    const { findLocalPluginPath } = await import('../src/setup.ts');
-    const pkgDir = path.join(tmpNpmPrefix, 'lib', 'node_modules', 'weave-claude-code');
-    fs.mkdirSync(pkgDir, { recursive: true });
-
-    assert.equal(findLocalPluginPath(), null);
-  });
-});
-
-suite('registerPlugin with InstallSource.Local', () => {
-  test('registers from the local path, installs the plugin, and skips the drift-update', async () => {
+  test('registerPlugin(Local): registers from the local path, installs the plugin, skips drift-update', async () => {
     // Local source bypasses github cloning entirely: marketplace is registered
     // from the npm-installed directory, plugin installs as normal, and the
     // drift-detection update never fires (npm is the version-of-record, so the
@@ -106,7 +103,7 @@ suite('registerPlugin with InstallSource.Local', () => {
     assert.equal(result.pluginUpdated, false);
   });
 
-  test('throws with a helpful error when no local plugin tree is found', async () => {
+  test('registerPlugin(Local): throws with a helpful error when no local plugin tree is found', async () => {
     const { registerPlugin, InstallSource } = await import('../src/setup.ts');
 
     assert.throws(
@@ -114,10 +111,8 @@ suite('registerPlugin with InstallSource.Local', () => {
       /npm install -g weave-claude-code/,
     );
   });
-});
 
-suite('registerPlugin default source (backward compatibility)', () => {
-  test('omitting source still uses the github marketplace ref', async () => {
+  test('registerPlugin(): default source falls back to the github marketplace ref', async () => {
     const { registerPlugin, MARKETPLACE_SOURCE } = await import('../src/setup.ts');
 
     registerPlugin(path.join(tmpHome, 'log.txt'));
@@ -125,9 +120,6 @@ suite('registerPlugin default source (backward compatibility)', () => {
     const calls = readFakeCalls(tmpHome);
     const addCall = calls.find((c) => c.startsWith('plugin marketplace add'));
     assert.ok(addCall);
-    assert.ok(
-      addCall.includes(MARKETPLACE_SOURCE),
-      `expected github source ${MARKETPLACE_SOURCE}, got: ${addCall}`,
-    );
+    assert.ok(addCall.includes(MARKETPLACE_SOURCE), `expected github source ${MARKETPLACE_SOURCE}, got: ${addCall}`);
   });
 });

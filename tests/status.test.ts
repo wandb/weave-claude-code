@@ -254,31 +254,22 @@ const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
 ];
 
 suite('weave-claude-code status (plugin source)', () => {
-  test('pretty: renders each source type', async () => {
+  test('renders each source type in pretty and json', async () => {
     for (const c of PLUGIN_SOURCE_CASES) {
-      const home = fs.mkdtempSync(path.join(scratch, `src-pretty-${c.name.replace(/\s+/g, '-')}-`));
+      const home = fs.mkdtempSync(path.join(scratch, `src-${c.name.replace(/\s+/g, '-')}-`));
       writeSettings(home);
-      const { seed, expectInPretty, expectNotInPretty } = c.setup(scratch);
+      const { seed, expectInPretty, expectNotInPretty, expectJson } = c.setup(scratch);
       if (seed) writeKnownMarketplace(home, seed);
 
-      const r = await runStatus(home);
-      assert.ok(r.stdout.includes(expectInPretty), `case "${c.name}": expected "${expectInPretty}" in:\n${r.stdout}`);
+      const pretty = await runStatus(home);
+      assert.ok(pretty.stdout.includes(expectInPretty), `case "${c.name}" (pretty): expected "${expectInPretty}" in:\n${pretty.stdout}`);
       if (expectNotInPretty) {
-        assert.ok(!r.stdout.includes(expectNotInPretty), `case "${c.name}": did not expect "${expectNotInPretty}" in:\n${r.stdout}`);
+        assert.ok(!pretty.stdout.includes(expectNotInPretty), `case "${c.name}" (pretty): did not expect "${expectNotInPretty}" in:\n${pretty.stdout}`);
       }
-    }
-  });
 
-  test('json: emits the documented shape for each source type', async () => {
-    for (const c of PLUGIN_SOURCE_CASES) {
-      const home = fs.mkdtempSync(path.join(scratch, `src-json-${c.name.replace(/\s+/g, '-')}-`));
-      writeSettings(home);
-      const { seed, expectJson } = c.setup(scratch);
-      if (seed) writeKnownMarketplace(home, seed);
-
-      const r = await runStatus(home, ['--json']);
-      const parsed = JSON.parse(r.stdout) as { plugin_source: unknown };
-      assert.deepEqual(parsed.plugin_source, expectJson, `case "${c.name}"`);
+      const json = await runStatus(home, ['--json']);
+      const parsed = JSON.parse(json.stdout) as { plugin_source: unknown };
+      assert.deepEqual(parsed.plugin_source, expectJson, `case "${c.name}" (json)`);
     }
   });
 });
