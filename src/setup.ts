@@ -99,7 +99,7 @@ export const PLUGIN_NAME = 'weave';
 // marketplace name lives in .claude-plugin/marketplace.json, the npm package
 // name lives in package.json. Kept separate so renaming one does not silently
 // break the other.
-export const NPM_PACKAGE_NAME = 'weave-claude-code';
+const NPM_PACKAGE_NAME = 'weave-claude-code';
 
 /**
  * Create (or recreate) the config directory, log directory, and settings.json.
