@@ -246,6 +246,11 @@ interface SessionState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
+// Absolute ceiling for holding the daemon open past the normal inactivity
+// timeout while cross-session team work is in flight (see checkInactivity).
+// Bounds the case where a teammate crashes and never emits TeammateIdle, so an
+// unemitted entry can't pin the daemon forever.
+const TEAM_INFLIGHT_MAX_MS = 60 * 60 * 1_000;   // 60 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
@@ -323,6 +328,9 @@ export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
   private lastActivity = Date.now();
+  /** Inactivity shutdown threshold. Overridable via WEAVE_INACTIVITY_MS (ms) for
+   *  testing and for ops (e.g. raising it for long-running agent-teams work). */
+  private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private provider: NodeTracerProvider | null = null;
@@ -401,7 +409,10 @@ export class GlobalDaemon {
       try { if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath); } catch { /* nothing more we can do */ }
     });
 
-    setInterval(() => this.checkInactivity(), 60_000).unref();
+    // Check at most every 60s, but more frequently when the timeout is short
+    // (env-overridden for tests) so a low WEAVE_INACTIVITY_MS is honored promptly.
+    const checkEveryMs = Math.min(60_000, Math.max(500, Math.floor(this.inactivityMs / 4)));
+    setInterval(() => this.checkInactivity(), checkEveryMs).unref();
   }
 
   // ── tracer initialization ───────────────────────────────────────────────
@@ -1426,10 +1437,30 @@ export class GlobalDaemon {
   // ── lifecycle ─────────────────────────────────────────────────────────────
 
   private checkInactivity(): void {
-    if (Date.now() - this.lastActivity > INACTIVITY_TIMEOUT_MS) {
-      this.log('INFO', 'Inactivity timeout — shutting down');
-      void this.shutdown('inactivity');
+    const idle = Date.now() - this.lastActivity;
+    if (idle <= this.inactivityMs) return;
+    // Do NOT shut down while cross-session team correlation is in flight: a
+    // shutdown wipes the in-memory teamMembers map and breaks nesting for every
+    // still-open specialist span. Agent-teams runs have quiet windows (engineer
+    // think-time; gaps between spawn and first teammate report) that would
+    // otherwise trip the 10-min timeout mid-triage. Hold open until the team
+    // work drains, bounded by TEAM_INFLIGHT_MAX_MS so a crashed teammate that
+    // never emits TeammateIdle can't pin the daemon indefinitely.
+    if (idle < TEAM_INFLIGHT_MAX_MS && this.hasUnemittedTeamMembers()) {
+      this.log('DEBUG', 'Inactivity timeout reached but team correlation in flight — staying up');
+      return;
     }
+    this.log('INFO', 'Inactivity timeout — shutting down');
+    void this.shutdown('inactivity');
+  }
+
+  /** True if any registered team member still awaits its TeammateIdle. Used to
+   *  keep the daemon alive across an agent-teams run's quiet windows. */
+  private hasUnemittedTeamMembers(): boolean {
+    for (const queue of this.teamMembers.values()) {
+      if (queue.some(m => !m.emitted)) return true;
+    }
+    return false;
   }
 
   private async shutdown(reason: string): Promise<void> {

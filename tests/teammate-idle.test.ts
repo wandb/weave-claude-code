@@ -594,6 +594,69 @@ test('Cross-session: re-spawn of same team::name nests BOTH (FIFO queue, no over
   }
 });
 
+test('Inactivity guard: daemon stays up past timeout while team correlation is in flight', async () => {
+  // Regression for the daemon-restart-wipes-map failure: an agent-teams run has
+  // quiet windows after spawn (waiting on specialists). The daemon must NOT hit
+  // its inactivity timeout while team members are unemitted, or the restart wipes
+  // teamMembers and breaks nesting. Uses WEAVE_INACTIVITY_MS to make it fast.
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-inacttest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  const coordinatorSessionId = 'inact-coord-001';
+  const teamName = 'triage-inact';
+  const teammateName = 'cks-specialist';
+
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
+    weave_project: 'test/inact', wandb_api_key: 'fake-key', daemon_socket: socketPath, log_file: logPath, debug: true,
+  }));
+  const coordDir = path.join(home, '.claude', 'projects', 'test', coordinatorSessionId);
+  fs.mkdirSync(coordDir, { recursive: true });
+  const coordinatorPath = path.join(coordDir, `${coordinatorSessionId}.jsonl`);
+  fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  // 800ms inactivity timeout so the test runs in seconds (vs the 10-min default).
+  const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home, WEAVE_INACTIVITY_MS: '800' }, stdio: 'ignore',
+  });
+  const sendEvent = (payload: object): Promise<void> => new Promise((resolve, reject) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', reject);
+    s.on('connect', () => { s.end(JSON.stringify(payload)); });
+    s.on('close', () => resolve());
+  });
+  const isAlive = (): Promise<boolean> => new Promise((resolve) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', () => resolve(false));
+    s.on('connect', () => { s.destroy(); resolve(true); });
+  });
+  const waitForSocket = (): Promise<void> => new Promise((resolve) => {
+    const poll = setInterval(() => { if (fs.existsSync(socketPath)) { clearInterval(poll); resolve(); } }, 50);
+  });
+  const readLog = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+
+  try {
+    await waitForSocket();
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: coordinatorSessionId, transcript_path: coordinatorPath });
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordinatorSessionId, transcript_path: coordinatorPath, prompt: '/triage supp-inact' });
+    // Register a team member (unemitted), then go quiet — NO TeammateIdle.
+    await sendEvent({ hook_event_name: 'PreToolUse', session_id: coordinatorSessionId, tool_use_id: 'toolu_inact_1',
+      tool_name: 'Agent', tool_input: { prompt: 'x', subagent_type: teammateName, team_name: teamName, name: teammateName } });
+
+    // Wait well past the 800ms timeout (multiple ~500ms check intervals) with no activity.
+    await new Promise(r => setTimeout(r, 2600));
+
+    assert.equal(await isAlive(), true, 'daemon must stay UP past the inactivity timeout while a team member is unemitted');
+    assert.match(readLog(), /team correlation in flight — staying up/, 'should log that it stayed up for in-flight team work');
+  } finally {
+    daemon.kill();
+    await new Promise<void>(resolve => daemon.once('exit', () => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('Cross-session: duplicate TeammateIdle does not double-emit', async () => {
   const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-duptest-'));
   const configDir = path.join(home, '.weave-claude-code');
