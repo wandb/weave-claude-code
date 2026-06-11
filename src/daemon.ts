@@ -185,6 +185,33 @@ interface SubagentTracker {
    *  Suppresses span closure at SubagentStop so TeammateIdle can close it
    *  with full all-turns content. */
   pendingTeammateIdle?: boolean;
+  /** Set when this Agent tool spawn carried a `team_name` (agent-teams model).
+   *  The teammate runs in its OWN session, so its TeammateIdle fires under a
+   *  different session_id and the per-session lookup misses. The invoke_agent
+   *  span is registered in GlobalDaemon.teamMembers and closed there (at the
+   *  teammate's TeammateIdle), NOT at the coordinator's PostToolUse(Agent). */
+  teamName?: string;
+}
+
+/** Cross-session team correlation. In agent-teams (TeamCreate) a teammate is an
+ *  independent Claude session whose TeammateIdle fires under the teammate's own
+ *  session_id, not the coordinator's — so the per-session SubagentTracking
+ *  lookup misses. The coordinator's PreToolUse(Agent, team_name) is the one
+ *  reliable anchor; we record its invoke_agent span here keyed by
+ *  `${team_name}::${name}`.
+ *
+ *  Entries are stored as a FIFO queue per key (not a single value) because the
+ *  SAME `${team}::${name}` can be spawned more than once in a run — e.g. the
+ *  TARS triage flow re-spawns a specialist (Sonnet→Opus) for deeper work. Each
+ *  spawn pushes its own TeamMember; each teammate's TeammateIdle consumes the
+ *  oldest not-yet-emitted entry (FIFO), so re-spawns never overwrite a live span
+ *  (which would leak it and mis-attribute the first teammate's transcript). This
+ *  mirrors SubagentTracking.findPendingTeammateIdle for the per-session path. */
+interface TeamMember {
+  invokeAgentSpan: Span;
+  conversationId: string;
+  coordinatorTranscriptPath: string;
+  emitted: boolean;
 }
 
 interface SessionState {
@@ -219,6 +246,11 @@ interface SessionState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
+// Absolute ceiling for holding the daemon open past the normal inactivity
+// timeout while cross-session team work is in flight (see checkInactivity).
+// Bounds the case where a teammate crashes and never emits TeammateIdle, so an
+// unemitted entry can't pin the daemon forever.
+const TEAM_INFLIGHT_MAX_MS = 60 * 60 * 1_000;   // 60 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
@@ -296,10 +328,18 @@ export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
   private lastActivity = Date.now();
+  /** Inactivity shutdown threshold. Overridable via WEAVE_INACTIVITY_MS (ms) for
+   *  testing and for ops (e.g. raising it for long-running agent-teams work). */
+  private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   private provider: NodeTracerProvider | null = null;
   private tracer: Tracer | null = null;
+  /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
+   *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. The
+   *  value is a FIFO queue: a re-spawned `${team}::${name}` appends rather than
+   *  overwriting, so two live spans for the same name never collide. */
+  private teamMembers = new Map<string, TeamMember[]>();
 
   constructor(
     private readonly socketPath: string,
@@ -326,8 +366,21 @@ export class GlobalDaemon {
       this.log('INFO', 'No weave_project / API key configured — tracing disabled');
     }
 
-    // Remove any stale socket left by a previous crash
+    // Herd prevention: probe the socket before removing it. Concurrent hook
+    // invocations can race the probe→spawn window and each start a daemon. If
+    // a live listener already owns the socket, yield — otherwise the late spawn
+    // would unlink the winner's socket and split the in-memory teamMembers map
+    // across processes, breaking cross-session nesting.
     if (fs.existsSync(this.socketPath)) {
+      const alive = await new Promise<boolean>((resolve) => {
+        const probe = net.createConnection(this.socketPath);
+        probe.once('connect', () => { probe.destroy(); resolve(true); });
+        probe.once('error', () => resolve(false));
+      });
+      if (alive) {
+        this.log('INFO', 'Another daemon already owns the socket — exiting to avoid a herd');
+        process.exit(0);
+      }
       fs.unlinkSync(this.socketPath);
     }
 
@@ -356,7 +409,10 @@ export class GlobalDaemon {
       try { if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath); } catch { /* nothing more we can do */ }
     });
 
-    setInterval(() => this.checkInactivity(), 60_000).unref();
+    // Check at most every 60s, but more frequently when the timeout is short
+    // (env-overridden for tests) so a low WEAVE_INACTIVITY_MS is honored promptly.
+    const checkEveryMs = Math.min(60_000, Math.max(500, Math.floor(this.inactivityMs / 4)));
+    setInterval(() => this.checkInactivity(), checkEveryMs).unref();
   }
 
   // ── tracer initialization ───────────────────────────────────────────────
@@ -722,13 +778,36 @@ export class GlobalDaemon {
         spawningToolCallId: toolUseId,
         displayName: toolDisplayName(toolName, toolInput),
       });
+      // Agent-teams: when the Agent tool carries a `team_name`, the teammate
+      // runs as its own session and TeammateIdle fires under the teammate's
+      // session_id. Register the invoke_agent span in the cross-session team
+      // map so TeammateIdle can find it regardless of which session fires it.
+      const teamName = typeof toolInput['team_name'] === 'string' ? (toolInput['team_name'] as string) : undefined;
+      const memberName = (typeof toolInput['name'] === 'string' && toolInput['name']) ? (toolInput['name'] as string) : subagentType;
       session.subagents.add({
         toolUseId,
         subagentType,
         detectedAt: new Date(),
         invokeAgentSpan,
         promptHash: hashPrompt(prompt),
+        teamName,
       });
+      if (teamName) {
+        // Append to the per-key FIFO queue (do NOT overwrite): the same
+        // `${team}::${name}` may be spawned again later in the run (e.g. TARS
+        // re-spawns a specialist Sonnet→Opus). Overwriting would orphan the
+        // first, still-open span and mis-route its teammate's transcript.
+        const key = `${teamName}::${memberName}`;
+        const queue = this.teamMembers.get(key) ?? [];
+        queue.push({
+          invokeAgentSpan,
+          conversationId: session.conversationId,
+          coordinatorTranscriptPath: session.transcript.resolvedPath,
+          emitted: false,
+        });
+        this.teamMembers.set(key, queue);
+        this.log('INFO', `Team member registered: ${key} (cross-session nesting, queue depth ${queue.length})`);
+      }
       return;
     }
 
@@ -784,8 +863,15 @@ export class GlobalDaemon {
     // final assistant text as `gen_ai.output.messages`.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
     if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
-      session.subagents.remove(subagentTracker);
+      if (subagentTracker.teamName) {
+        // Agent-teams: the Agent tool returns immediately (teammate runs async
+        // in its own session). Do NOT close the invoke_agent span — it would
+        // end empty before the teammate works. The team map owns it now.
+        session.subagents.remove(subagentTracker);
+      } else {
+        this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+        session.subagents.remove(subagentTracker);
+      }
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
       session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
@@ -820,8 +906,16 @@ export class GlobalDaemon {
     // attached as children.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
     if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
-      session.subagents.remove(subagentTracker);
+      if (subagentTracker.teamName) {
+        // Agent-teams: the team map owns this span (closed at the teammate's
+        // TeammateIdle, cross-session). Closing it here would end it early and
+        // then double-end when TeammateIdle fires. Mirror handlePostToolUse:
+        // just drop the per-session tracker; the queue entry lives on.
+        session.subagents.remove(subagentTracker);
+      } else {
+        this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+        session.subagents.remove(subagentTracker);
+      }
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
       session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
@@ -1024,12 +1118,20 @@ export class GlobalDaemon {
   }
 
   private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
+    if (!this.tracer) return;
+    // FAIL-OPEN on a missing session: in the agent-teams model this hook fires
+    // under the TEAMMATE's session_id, which may not be registered with this
+    // daemon (only the coordinator is). `session` is therefore OPTIONAL for the
+    // cross-session team path and only REQUIRED for the per-session fallback.
+    // Do NOT early-return on a missing session — that would silently drop
+    // cross-session nesting, the whole point of this handler.
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
 
     // TeammateIdle payload (actual schema, confirmed from live TARS triage):
-    //   session_id    — coordinator's session UUID
-    //   teammate_name — agent name, e.g. "cks-specialist"
+    //   session_id    — the teammate's session UUID (NOT the coordinator's)
+    //   teammate_name — agent name, e.g. "cks-specialist". INVARIANT: must equal
+    //                   the `name` the coordinator passed to the Agent tool (in
+    //                   TARS, name === subagent_type), else the lookup misses.
     //   team_name     — team name, e.g. "triage-supp-25017"
     //   transcript_path — CC sets this to the coordinator's transcript (not the
     //                     teammate's), so we ignore it and use the path stored
@@ -1040,9 +1142,48 @@ export class GlobalDaemon {
     const agentType = (payload['teammate_name'] as string | undefined) ?? 'teammate';
     const teamName = (payload['team_name'] as string | undefined) ?? '?';
 
-    // Find the orphan tracker created at SubagentStart for this teammate.
-    // SubagentStop has already fired but left the invoke_agent span open
-    // specifically so TeammateIdle can close it with full all-turns content.
+    // ── Cross-session team path (agent-teams / TeamCreate model) ─────────
+    // The coordinator's PreToolUse(Agent, team_name) registered the invoke_agent
+    // span in teamMembers under `${team_name}::${name}` (a FIFO queue). Consume
+    // the OLDEST not-yet-emitted entry, so re-spawns of the same name match in
+    // dispatch order instead of overwriting each other.
+    const key = `${teamName}::${agentType}`;
+    const queue = this.teamMembers.get(key);
+    if (queue && queue.length) {
+      const member = queue.find(m => !m.emitted);
+      if (!member) {
+        // All queued spans for this key already emitted — duplicate (repeat)
+        // TeammateIdle. Expected; nothing to do.
+        this.log('DEBUG', `TeammateIdle: ${key} all ${queue.length} entries already emitted — skipping duplicate idle`);
+        return;
+      }
+      member.emitted = true;
+      const idleTranscript = session?.transcript.resolvedPath ?? (payload['transcript_path'] as string | undefined);
+      const teammateTranscriptPath = this.resolveTeammateTranscript(member.coordinatorTranscriptPath, agentType, idleTranscript);
+      this.emitTeammateTranscript(member.invokeAgentSpan, member.conversationId, teammateTranscriptPath);
+      // Remove the consumed entry; drop the key once its queue drains.
+      const idx = queue.indexOf(member);
+      if (idx >= 0) queue.splice(idx, 1);
+      if (!queue.length) this.teamMembers.delete(key);
+      this.log('INFO', `TeammateIdle: traced ${agentType} team=${teamName} (cross-session) transcript=${teammateTranscriptPath ?? '(none)'} (queue depth now ${queue.length})`);
+      return;
+    }
+
+    // No team entry for this key. If OTHER team keys ARE registered, this most
+    // likely means the teammate_name ≠ Agent.name invariant was violated — log
+    // it loudly (not silently) so it is debuggable, then try the per-session path.
+    if (this.teamMembers.size > 0) {
+      this.log('INFO', `TeammateIdle: no team entry for ${key} (registered: ${[...this.teamMembers.keys()].join(', ')}) — check teammate_name === Agent.name`);
+    }
+
+    // ── Per-session path (individual Agent calls without team_name) ──────
+    // Requires the firing session to be known to this daemon. Find the orphan
+    // tracker created at SubagentStart; SubagentStop left its invoke_agent span
+    // open specifically so we can close it here with full all-turns content.
+    if (!session) {
+      this.log('DEBUG', `TeammateIdle: session ${sessionId} unknown and no team entry for ${key} — skipping`);
+      return;
+    }
     const tracker = session.subagents.findPendingTeammateIdle(agentType);
 
     if (!tracker?.invokeAgentSpan) {
@@ -1097,6 +1238,78 @@ export class GlobalDaemon {
     session.subagents.remove(tracker);
 
     this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath ?? '(no transcript)'}`);
+  }
+
+  /** Resolve a teammate's OWN transcript. TeammateIdle.session_id is unreliable
+   *  (sometimes the teammate's, sometimes the coordinator's), so the idle
+   *  session's transcript may be the coordinator's. The authoritative source is
+   *  `<coordinator-session-dir>/subagents/agent-<id>.jsonl` paired with a sibling
+   *  `agent-<id>.meta.json` carrying `{"agentType": <name>}`. Match by
+   *  agentType === teammateName; pick the most-recently-modified if re-spawned. */
+  private resolveTeammateTranscript(
+    coordinatorTranscriptPath: string,
+    teammateName: string,
+    idleTranscriptPath: string | undefined,
+  ): string | undefined {
+    try {
+      const projectDir = path.dirname(coordinatorTranscriptPath);
+      const sessionDirName = path.basename(coordinatorTranscriptPath, '.jsonl');
+      const subagentsDir = path.join(projectDir, sessionDirName, 'subagents');
+      if (fs.existsSync(subagentsDir)) {
+        let best: { p: string; mtime: number } | undefined;
+        for (const meta of fs.readdirSync(subagentsDir).filter(f => f.endsWith('.meta.json'))) {
+          try {
+            const info = JSON.parse(fs.readFileSync(path.join(subagentsDir, meta), 'utf8')) as { agentType?: string };
+            if (info?.agentType !== teammateName) continue;
+            const transcript = path.join(subagentsDir, meta.replace(/\.meta\.json$/, '.jsonl'));
+            if (!fs.existsSync(transcript)) continue;
+            const mtime = fs.statSync(transcript).mtimeMs;
+            if (!best || mtime > best.mtime) best = { p: transcript, mtime };
+          } catch { /* skip malformed meta */ }
+        }
+        if (best) return best.p;
+      }
+    } catch (err) {
+      this.log('DEBUG', `resolveTeammateTranscript(${teammateName}): ${err}`);
+    }
+    return idleTranscriptPath;
+  }
+
+  /** Parse a teammate's transcript and emit its chat spans under the given
+   *  invoke_agent span, then end it. Used by the cross-session team path. */
+  private emitTeammateTranscript(
+    invokeAgentSpan: Span,
+    conversationId: string,
+    transcriptPath: string | undefined,
+  ): void {
+    let model: string | undefined;
+    let lastAssistantText: string | undefined;
+    let t: TranscriptFile | undefined;
+    try {
+      if (!transcriptPath) throw new Error('no teammate transcript path');
+      t = new TranscriptFile(transcriptPath);
+      const parsed = parseSessionFd(t.getFd());
+      if (parsed && this.tracer) {
+        for (const turn of parsed.turns) {
+          emitChatSpansFromAssistantCalls(this.tracer, invokeAgentSpan, conversationId, turn.assistantCalls());
+        }
+        const lastTurn = parsed.turns[parsed.turns.length - 1];
+        model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
+      }
+    } catch (err) {
+      this.log('DEBUG', `emitTeammateTranscript: could not parse ${transcriptPath}: ${err}`);
+    } finally {
+      t?.close();
+    }
+    if (model) invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+    if (lastAssistantText) {
+      invokeAgentSpan.setAttribute(
+        ATTR.OUTPUT_MESSAGES,
+        JSON.stringify([{ role: 'assistant', content: lastAssistantText }]),
+      );
+    }
+    invokeAgentSpan.end();
   }
 
   private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
@@ -1224,10 +1437,30 @@ export class GlobalDaemon {
   // ── lifecycle ─────────────────────────────────────────────────────────────
 
   private checkInactivity(): void {
-    if (Date.now() - this.lastActivity > INACTIVITY_TIMEOUT_MS) {
-      this.log('INFO', 'Inactivity timeout — shutting down');
-      void this.shutdown('inactivity');
+    const idle = Date.now() - this.lastActivity;
+    if (idle <= this.inactivityMs) return;
+    // Do NOT shut down while cross-session team correlation is in flight: a
+    // shutdown wipes the in-memory teamMembers map and breaks nesting for every
+    // still-open specialist span. Agent-teams runs have quiet windows (engineer
+    // think-time; gaps between spawn and first teammate report) that would
+    // otherwise trip the 10-min timeout mid-triage. Hold open until the team
+    // work drains, bounded by TEAM_INFLIGHT_MAX_MS so a crashed teammate that
+    // never emits TeammateIdle can't pin the daemon indefinitely.
+    if (idle < TEAM_INFLIGHT_MAX_MS && this.hasUnemittedTeamMembers()) {
+      this.log('DEBUG', 'Inactivity timeout reached but team correlation in flight — staying up');
+      return;
     }
+    this.log('INFO', 'Inactivity timeout — shutting down');
+    void this.shutdown('inactivity');
+  }
+
+  /** True if any registered team member still awaits its TeammateIdle. Used to
+   *  keep the daemon alive across an agent-teams run's quiet windows. */
+  private hasUnemittedTeamMembers(): boolean {
+    for (const queue of this.teamMembers.values()) {
+      if (queue.some(m => !m.emitted)) return true;
+    }
+    return false;
   }
 
   private async shutdown(reason: string): Promise<void> {
@@ -1235,6 +1468,15 @@ export class GlobalDaemon {
     this.running = false;
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
+    // Backstop: close any queued team-member invoke_agent spans whose teammate
+    // never emitted a TeammateIdle (e.g. teammate crashed, or daemon exits
+    // mid-triage) so they flush as ended spans instead of leaking.
+    for (const [, queue] of this.teamMembers) {
+      for (const m of queue) {
+        if (!m.emitted) { try { m.invokeAgentSpan.end(); } catch { /* best effort */ } }
+      }
+    }
+    this.teamMembers.clear();
     if (this.provider) {
       try {
         await this.provider.shutdown();
