@@ -28,6 +28,7 @@ import {
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
+import { AGENT_NAME_CLAUDE_CODE } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -217,6 +218,20 @@ function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
 }
 
+/**
+ * Resolve the effective top-level agent name and where it came from. Mirrors
+ * the env-over-settings precedence used for `weave_project`, with the
+ * hardcoded `AGENT_NAME_CLAUDE_CODE` as the final fallback. Shared by
+ * `config show` and `config get` so both report the same value.
+ */
+function resolveAgentName(settings: Settings): { value: string; source: string } {
+  const fromEnv = process.env['WEAVE_AGENT_NAME']?.trim();
+  if (fromEnv) return { value: fromEnv, source: 'WEAVE_AGENT_NAME env var' };
+  const fromSettings = settings.agent_name?.trim();
+  if (fromSettings) return { value: fromSettings, source: 'settings.json' };
+  return { value: AGENT_NAME_CLAUDE_CODE, source: 'default' };
+}
+
 async function cmdConfig(args: string[]): Promise<void> {
   const action = args[0];
 
@@ -249,6 +264,8 @@ async function cmdConfig(args: string[]): Promise<void> {
     console.log(`  daemon_socket: ${settings.daemon_socket}`);
     console.log(`  weave_project: ${effectiveProject ?? '(not set)'} [${projectSource}]`);
     console.log(`  wandb_api_key: ${apiKeyDisplay}`);
+    const agentName = resolveAgentName(settings);
+    console.log(`  agent_name:    ${agentName.value} [${agentName.source}]`);
     console.log(`  debug:         ${!!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug} ${process.env['WEAVE_CLAUDE_DEBUG'] ? '[WEAVE_CLAUDE_DEBUG env var]' : ''}`);
     console.log(`  installed_at:  ${settings.installed_at}`);
     console.log(`  version:       ${settings.version}`);
@@ -267,6 +284,13 @@ async function cmdConfig(args: string[]): Promise<void> {
     } catch (err) {
       console.error(`✗ ${err}`);
       process.exit(1);
+    }
+    // agent_name resolves via env/default and may be absent from settings
+    // files written before the field existed, so handle it before the generic
+    // `undefined` → unknown-key check below.
+    if (key === 'agent_name') {
+      console.log(resolveAgentName(settings).value);
+      return;
     }
     const value = (settings as unknown as Record<string, unknown>)[key];
     if (value === undefined) {
@@ -293,7 +317,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const writableKeys = ['weave_project', 'wandb_api_key', 'daemon_socket', 'debug'];
+    const writableKeys = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug'];
     if (!writableKeys.includes(key)) {
       console.error(`Cannot set '${key}'. Writable keys: ${writableKeys.join(', ')}`);
       process.exit(1);
@@ -301,6 +325,13 @@ async function cmdConfig(args: string[]): Promise<void> {
 
     if (key === 'weave_project' && !value.includes('/')) {
       console.error(`Invalid format for weave_project: '${value}'\nExpected: entity/project (e.g. my-entity/my-project)`);
+      process.exit(1);
+    }
+
+    // An empty/whitespace agent_name would emit a blank `invoke_agent ` span
+    // name; reject it rather than silently falling back to the default.
+    if (key === 'agent_name' && !value.trim()) {
+      console.error(`Invalid value for agent_name: must not be empty`);
       process.exit(1);
     }
 
@@ -317,7 +348,10 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const coerced = key === 'debug' ? value === 'true' : value;
+    const coerced =
+      key === 'debug' ? value === 'true'
+      : key === 'agent_name' ? value.trim()
+      : value;
     (settings as unknown as Record<string, unknown>)[key] = coerced;
     saveSettings(settings);
     const displayValue = key === 'wandb_api_key' && typeof coerced === 'string'

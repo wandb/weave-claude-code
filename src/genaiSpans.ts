@@ -93,6 +93,12 @@ export const ATTR = {
   EVT_PERMISSION_SUGGESTIONS: 'weave.permission.suggestions',
 } as const;
 
+/**
+ * Default name for the top-level agent: the value shown in Weave's Agents
+ * view and stamped as `gen_ai.agent.name` on every turn span. Users can
+ * override it (settings `agent_name` / `WEAVE_AGENT_NAME`); this is the
+ * fallback when neither is set.
+ */
 export const AGENT_NAME_CLAUDE_CODE = 'claude-code';
 
 export const OP = {
@@ -156,6 +162,10 @@ export interface TurnSpanArgs {
   cwd: string;
   source: string;
   pluginVersion: string;
+  /** Top-level agent name; becomes the second word of the span name and is
+   *  stamped as `gen_ai.agent.name`. Defaults to `AGENT_NAME_CLAUDE_CODE`;
+   *  the daemon resolves any user override before calling. */
+  agentName: string;
   requestModel?: string;
   displayName?: string;
 }
@@ -169,7 +179,7 @@ export interface TurnSpanArgs {
 export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   const attrs: Record<string, string | number> = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
-    [ATTR.AGENT_NAME]: AGENT_NAME_CLAUDE_CODE,
+    [ATTR.AGENT_NAME]: args.agentName,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
     [ATTR.CONVERSATION_ID]: args.conversationId,
     [ATTR.WEAVE_SESSION_ID]: args.sessionId,
@@ -184,7 +194,7 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
 
   // No parent context — turn spans are roots, one trace per turn.
   return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${AGENT_NAME_CLAUDE_CODE}`,
+    `${OP.INVOKE_AGENT} ${args.agentName}`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
   );
 }

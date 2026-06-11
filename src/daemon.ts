@@ -348,6 +348,7 @@ export class GlobalDaemon {
     private readonly apiKey: string | null,
     private readonly baseUrl: string,
     private readonly debugEnabled: boolean,
+    private readonly agentName: string,
   ) {}
 
   async start(): Promise<void> {
@@ -432,7 +433,7 @@ export class GlobalDaemon {
     }
 
     const resource = resourceFromAttributes({
-      'service.name': AGENT_NAME_CLAUDE_CODE,
+      'service.name': this.agentName,
       'service.version': VERSION,
       'wandb.entity': entity,
       'wandb.project': project,
@@ -719,6 +720,7 @@ export class GlobalDaemon {
       cwd: session.cwd,
       source: session.source,
       pluginVersion: VERSION,
+      agentName: this.agentName,
       requestModel: session.initialRequestModel,
       displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
     });
@@ -1568,6 +1570,12 @@ export async function runDaemon(): Promise<void> {
   const weaveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   const apiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
   const baseUrl = (process.env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
+  // `||` (not `??`) so an empty/whitespace env var or setting falls through to
+  // the default rather than producing a blank `invoke_agent ` span name.
+  const agentName =
+    process.env['WEAVE_AGENT_NAME']?.trim() ||
+    settings.agent_name?.trim() ||
+    AGENT_NAME_CLAUDE_CODE;
 
   if (!weaveProject || !apiKey) {
     const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
@@ -1579,7 +1587,7 @@ export async function runDaemon(): Promise<void> {
   process.env['WANDB_API_KEY'] = apiKey;
 
   const debugEnabled = !!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true;
-  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debugEnabled);
+  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debugEnabled, agentName);
 
   try {
     await daemon.start();

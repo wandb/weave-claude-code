@@ -107,6 +107,9 @@ weave-claude-code config set weave_project my-entity/my-project
 
 # Set your W&B API key
 weave-claude-code config set wandb_api_key <your-api-key>
+
+# (Optional) Customize the agent name shown in Weave's Agents view (default: claude-code)
+weave-claude-code config set agent_name my-team-bot
 ```
 
 You can also set these via environment variables — they take precedence over the settings file:
@@ -114,6 +117,7 @@ You can also set these via environment variables — they take precedence over t
 ```bash
 export WEAVE_PROJECT=my-entity/my-project
 export WANDB_API_KEY=<your-api-key>
+export WEAVE_AGENT_NAME=my-team-bot
 ```
 
 This is especially useful with `weave-claude-code install --non-interactive`, where the installer checks these variables instead of prompting.
