@@ -29,6 +29,10 @@ import {
   startTurnSpan,
   startToolSpan,
   startInvokeAgentSpan,
+  startChatSpan,
+  finalizeChatSpan,
+  emitAssistantTextSpan,
+  emitThinkingSpan,
   emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
@@ -37,6 +41,7 @@ import {
   promptSnippet,
   jsonStr,
 } from './genaiSpans.js';
+import type { AssistantCallDetail } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -67,6 +72,21 @@ interface PendingToolCall {
   permissionRequested?: boolean;
 }
 
+/** Tracks the chat span currently open for a single assistant API call. Tool
+ *  spans for that call parent here so the trace tree shows the model's
+ *  interleaved text → tool_use → text order. Held on SessionState (main
+ *  agent) and SubagentTracker (subagents). */
+interface ActiveChatSpan {
+  /** Anthropic `message.id` of the assistant message this chat span
+   *  represents. Stable across PreToolUse hooks for the same API call. */
+  messageId: string;
+  span: Span;
+  /** Index into the assistant message's content blocks. Blocks before this
+   *  have already been emitted as assistant_text / thinking children; the
+   *  next PreToolUse picks up from here. */
+  nextBlockIdx: number;
+}
+
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
@@ -80,6 +100,52 @@ function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean)
  *  the subagent's SubagentStart by matching transcript content. */
 function hashPrompt(prompt: string): string {
   return createHash('sha256').update(prompt, 'utf8').digest('hex');
+}
+
+/** Stable identity for an assistant API call within a turn. Anthropic returns
+ *  a `message.id` on every response; that's the primary key. When it's
+ *  missing (legacy transcripts), fall back to the index, which is stable
+ *  within a single parse + turn. */
+function chatMessageKey(call: AssistantCallDetail, callIdx: number): string {
+  return call.responseId ?? `idx:${callIdx}`;
+}
+
+function findCallByMessageKey(
+  calls: AssistantCallDetail[],
+  key: string,
+): AssistantCallDetail | undefined {
+  for (let i = 0; i < calls.length; i++) {
+    if (chatMessageKey(calls[i], i) === key) return calls[i];
+  }
+  return undefined;
+}
+
+/** Search for a `tool_use` block with matching id across assistant calls in a
+ *  turn. Returns the call index plus the block index inside that call's
+ *  content, or undefined if the tool_use isn't found (transcript not flushed
+ *  yet, or unknown id). */
+function locateToolUseInCalls(
+  calls: AssistantCallDetail[],
+  toolUseId: string,
+): { callIdx: number; blockIdx: number } | undefined {
+  for (let ci = 0; ci < calls.length; ci++) {
+    const blocks = calls[ci].contentBlocks;
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const b = blocks[bi] as Record<string, unknown> | undefined;
+      if (b && typeof b === 'object' && b['type'] === 'tool_use' && b['id'] === toolUseId) {
+        return { callIdx: ci, blockIdx: bi };
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseIsoOrNow(ts: string | undefined): Date {
+  if (ts) {
+    const d = new Date(ts);
+    if (Number.isFinite(d.getTime())) return d;
+  }
+  return new Date();
 }
 
 /**
@@ -208,6 +274,16 @@ interface SessionState {
 
   pendingToolCalls: Map<string, PendingToolCall>;
   subagents: SubagentTracking;
+
+  /** Chat span currently open for an in-progress assistant API call. Tool
+   *  spans from PreToolUse parent here; finalized at Stop or on transition
+   *  to the next API call. Cleared at Stop. */
+  activeChatSpan?: ActiveChatSpan;
+  /** Message ids of assistant calls in the current turn for which a chat
+   *  span has been opened (open or already finalized). Stop uses this to
+   *  identify calls that need a chat span emitted from scratch (calls with
+   *  no tool_use blocks never triggered PreToolUse). Reset per turn. */
+  emittedChatSpanMessageIds: Set<string>;
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
@@ -554,6 +630,7 @@ export class GlobalDaemon {
       toolCounts: {},
       pendingToolCalls: new Map(),
       subagents: new SubagentTracking(),
+      emittedChatSpanMessageIds: new Set(),
     });
 
     const resumed = conversationId !== sessionId;
@@ -655,6 +732,7 @@ export class GlobalDaemon {
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
+    session.emittedChatSpanMessageIds.clear();
     const turnSpan = startTurnSpan(this.tracer, {
       sessionId: session.sessionId,
       conversationId: session.conversationId,
@@ -711,10 +789,22 @@ export class GlobalDaemon {
     // `promptHash` lets SubagentStart correlate this tracker to the right
     // subagent deterministically by reading the subagent transcript's line 1
     // (the firing prompt) and matching by sha256 + subagent_type.
+    // For the main agent, advance the chat-span machine: locate the assistant
+    // message containing this tool_use, emit any text/thinking blocks that
+    // precede it as children of the chat span, and use that chat span as the
+    // parent of the tool span below. Subagents keep flat parenting under the
+    // invoke_agent span (subagent chat spans are emitted at SubagentStop /
+    // TeammateIdle, where the full transcript is available).
+    let toolParent: Span = parentSpan;
+    if (!agentId) {
+      const advanced = this.advanceMainAgentChatSpan(session, toolUseId);
+      if (advanced) toolParent = advanced;
+    }
+
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
-      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
+      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, toolParent, {
         agentType: subagentType,
         conversationId: session.conversationId,
         pluginVersion: VERSION,
@@ -732,13 +822,142 @@ export class GlobalDaemon {
       return;
     }
 
-    const toolSpan = startToolSpan(this.tracer, parentSpan, {
+    const toolSpan = startToolSpan(this.tracer, toolParent, {
       toolName,
       toolUseId,
       toolInput,
       displayName: toolDisplayName(toolName, toolInput),
     });
     session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
+  }
+
+  /**
+   * Walk the chat-span state machine for the main agent in response to a
+   * PreToolUse. Reads the transcript to find the assistant message containing
+   * `toolUseId`; opens a new chat span if this is a new API call, finalizing
+   * the previous one with usage data; emits any text/thinking blocks between
+   * the last position and the just-found tool_use as children of the chat
+   * span. Returns the chat span to parent the tool span under, or `undefined`
+   * if the transcript can't be located / parsed (caller falls back to the
+   * turn span).
+   */
+  private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
+    if (!this.tracer || !session.currentTurnSpan) return undefined;
+
+    let fd: number;
+    try {
+      fd = session.transcript.getFd();
+    } catch {
+      return undefined;
+    }
+    const parsed = parseSessionFd(fd);
+    if (!parsed) return undefined;
+    const lastTurn = parsed.turns[parsed.turns.length - 1];
+    if (!lastTurn) return undefined;
+    const calls = lastTurn.assistantCalls();
+    const located = locateToolUseInCalls(calls, toolUseId);
+    if (!located) {
+      // Transcript writer hasn't flushed the assistant message yet, or the
+      // tool_use lives in an earlier turn (shouldn't happen — PreToolUse
+      // always belongs to the current turn). Fall back to the turn span.
+      return undefined;
+    }
+    const { callIdx, blockIdx } = located;
+    const call = calls[callIdx];
+    const messageId = chatMessageKey(call, callIdx);
+
+    // Transition: close out the previous chat span (if any) with its full
+    // content. Finalizes with the previous call's usage data, which is now
+    // available in the same parsed transcript.
+    if (session.activeChatSpan && session.activeChatSpan.messageId !== messageId) {
+      this.finalizeActiveChatSpan(session, calls);
+    }
+
+    if (!session.activeChatSpan) {
+      const startedAt = parseIsoOrNow(call.prevTimestamp ?? call.timestamp);
+      const span = startChatSpan(this.tracer, session.currentTurnSpan, {
+        conversationId: session.conversationId,
+        model: call.model,
+        startedAt,
+      });
+      session.activeChatSpan = { messageId, span, nextBlockIdx: 0 };
+      session.emittedChatSpanMessageIds.add(messageId);
+    }
+
+    this.emitContentBlocksBefore(
+      session.activeChatSpan.span,
+      call.contentBlocks,
+      session.activeChatSpan.nextBlockIdx,
+      blockIdx,
+      session.conversationId,
+    );
+    session.activeChatSpan.nextBlockIdx = blockIdx + 1;
+    return session.activeChatSpan.span;
+  }
+
+  /**
+   * Finalize `session.activeChatSpan` using the matching assistant call's
+   * usage data from `calls`, after first emitting any trailing text/thinking
+   * blocks that come after the last tool_use in that message. Clears
+   * `session.activeChatSpan` when done.
+   */
+  private finalizeActiveChatSpan(session: SessionState, calls: AssistantCallDetail[]): void {
+    const active = session.activeChatSpan;
+    if (!active) return;
+    const call = findCallByMessageKey(calls, active.messageId);
+    if (call) {
+      this.emitContentBlocksBefore(
+        active.span,
+        call.contentBlocks,
+        active.nextBlockIdx,
+        call.contentBlocks.length,
+        session.conversationId,
+      );
+      finalizeChatSpan(active.span, {
+        usage: call.usage,
+        reasoningTokens: call.reasoningTokens,
+        responseId: call.responseId,
+        finishReasons: call.finishReason ? [call.finishReason] : undefined,
+        model: call.model,
+        outputMessages: call.contentBlocks.length
+          ? [{ role: 'assistant', parts: call.contentBlocks }]
+          : undefined,
+        endedAt: parseIsoOrNow(call.timestamp),
+      });
+    } else {
+      // Call disappeared from the transcript (shouldn't happen). End the span
+      // without final attrs rather than leak it.
+      active.span.end();
+    }
+    session.activeChatSpan = undefined;
+  }
+
+  /** Emit `assistant_text` / `thinking` spans for each text/thinking block
+   *  in `blocks[start..end)`. Side-effect only; caller manages `nextBlockIdx`. */
+  private emitContentBlocksBefore(
+    parent: Span,
+    blocks: unknown[],
+    start: number,
+    end: number,
+    conversationId: string,
+  ): void {
+    if (!this.tracer) return;
+    for (let i = start; i < end; i++) {
+      const block = blocks[i] as Record<string, unknown> | undefined;
+      if (!block || typeof block !== 'object') continue;
+      const type = block['type'];
+      if (type === 'text') {
+        const text = block['text'];
+        if (typeof text === 'string' && text.trim()) {
+          emitAssistantTextSpan(this.tracer, parent, { conversationId, text });
+        }
+      } else if (type === 'thinking') {
+        const text = block['thinking'];
+        if (typeof text === 'string' && text.trim()) {
+          emitThinkingSpan(this.tracer, parent, { conversationId, text });
+        }
+      }
+    }
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -1139,14 +1358,46 @@ export class GlobalDaemon {
       `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Emit one chat span per LLM call within this turn
+    // Finalize the chat-span state machine for this turn.
+    //   - The active chat span (open during PreToolUse) gets its trailing
+    //     text/thinking children plus its usage attrs, then ends.
+    //   - Assistant calls that never triggered a PreToolUse (final text-only
+    //     message, or any other tool-less call) get a fresh chat span emitted
+    //     here with their full content as children.
     if (currentTurn) {
-      emitChatSpansFromAssistantCalls(
-        this.tracer,
-        session.currentTurnSpan,
-        session.conversationId,
-        currentTurn.assistantCalls(),
-      );
+      const calls = currentTurn.assistantCalls();
+      if (session.activeChatSpan) {
+        this.finalizeActiveChatSpan(session, calls);
+      }
+      for (let i = 0; i < calls.length; i++) {
+        const call = calls[i];
+        const key = chatMessageKey(call, i);
+        if (session.emittedChatSpanMessageIds.has(key)) continue;
+        const span = startChatSpan(this.tracer, session.currentTurnSpan, {
+          conversationId: session.conversationId,
+          model: call.model,
+          startedAt: parseIsoOrNow(call.prevTimestamp ?? call.timestamp),
+        });
+        this.emitContentBlocksBefore(
+          span,
+          call.contentBlocks,
+          0,
+          call.contentBlocks.length,
+          session.conversationId,
+        );
+        finalizeChatSpan(span, {
+          usage: call.usage,
+          reasoningTokens: call.reasoningTokens,
+          responseId: call.responseId,
+          finishReasons: call.finishReason ? [call.finishReason] : undefined,
+          model: call.model,
+          outputMessages: call.contentBlocks.length
+            ? [{ role: 'assistant', parts: call.contentBlocks }]
+            : undefined,
+          endedAt: parseIsoOrNow(call.timestamp),
+        });
+        session.emittedChatSpanMessageIds.add(key);
+      }
     }
 
     const parsedTexts = currentTurn?.textBlocks() ?? [];
@@ -1193,6 +1444,14 @@ export class GlobalDaemon {
       pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
       pending.span.end();
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
+    }
+
+    // Close any chat span left open mid-turn (Stop never fired).
+    if (session.activeChatSpan) {
+      session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.activeChatSpan.span.end();
+      session.activeChatSpan = undefined;
+      this.log('DEBUG', `Closed orphaned chat span`);
     }
 
     // Close the current turn if still open
