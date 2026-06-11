@@ -497,6 +497,103 @@ test('Cross-session: TeammateIdle from teammate session finds coordinator team m
   }
 });
 
+test('Cross-session: re-spawn of same team::name nests BOTH (FIFO queue, no overwrite)', async () => {
+  // Regression for the re-spawn bug: TARS re-spawns a specialist (Sonnet→Opus)
+  // within one run. A second PreToolUse(Agent) for the same `${team}::${name}`
+  // must APPEND to a FIFO queue, not overwrite the first still-open span (which
+  // would leak it and mis-attribute the first teammate's transcript).
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-respawntest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  const coordinatorSessionId = 'respawn-coord-001';
+  const teamName = 'triage-respawn';
+  const teammateName = 'cks-specialist';
+  const tm1 = 'respawn-tm-001';
+  const tm2 = 'respawn-tm-002';
+
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
+    weave_project: 'test/respawn', wandb_api_key: 'fake-key', daemon_socket: socketPath, log_file: logPath, debug: true,
+  }));
+
+  const coordDir = path.join(home, '.claude', 'projects', 'test', coordinatorSessionId);
+  const subagentsDir = path.join(coordDir, 'subagents');
+  fs.mkdirSync(subagentsDir, { recursive: true });
+  const coordinatorPath = path.join(coordDir, `${coordinatorSessionId}.jsonl`);
+  fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  const mkTeammate = (agentId: string, sid: string, text: string): string => {
+    fs.writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), [
+      JSON.stringify({ type: 'agent-setting', agentSetting: teammateName, sessionId: sid }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: `msg-${agentId}`,
+        usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        stop_reason: 'end_turn', content: [{ type: 'text', text }] } }),
+    ].join('\n') + '\n');
+    fs.writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`), JSON.stringify({ agentType: teammateName }));
+    const tdir = path.join(home, '.claude', 'projects', 'test', sid);
+    fs.mkdirSync(tdir, { recursive: true });
+    const tp = path.join(tdir, `${sid}.jsonl`);
+    fs.writeFileSync(tp, JSON.stringify({ type: 'system', content: [] }) + '\n');
+    return tp;
+  };
+  const tp1 = mkTeammate('respawn-a1', tm1, 'first cks investigation');
+  const tp2 = mkTeammate('respawn-a2', tm2, 'second cks investigation');
+
+  const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home }, stdio: 'ignore',
+  });
+  const sendEvent = (payload: object): Promise<void> => new Promise((resolve, reject) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', reject);
+    s.on('connect', () => { s.end(JSON.stringify(payload)); });
+    s.on('close', () => resolve());
+  });
+  const waitForSocket = (): Promise<void> => new Promise((resolve) => {
+    const poll = setInterval(() => { if (fs.existsSync(socketPath)) { clearInterval(poll); resolve(); } }, 50);
+  });
+  const readLog = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+
+  try {
+    await waitForSocket();
+    await new Promise(r => setTimeout(r, 200));
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: coordinatorSessionId, transcript_path: coordinatorPath });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordinatorSessionId, transcript_path: coordinatorPath, prompt: '/triage supp-respawn' });
+    await new Promise(r => setTimeout(r, 100));
+
+    // FIRST spawn of cks-specialist
+    await sendEvent({ hook_event_name: 'PreToolUse', session_id: coordinatorSessionId, tool_use_id: 'toolu_r1',
+      tool_name: 'Agent', tool_input: { prompt: 'first', subagent_type: teammateName, team_name: teamName, name: teammateName } });
+    await new Promise(r => setTimeout(r, 80));
+    // SECOND spawn of the SAME team::name (the re-spawn) BEFORE the first idles
+    await sendEvent({ hook_event_name: 'PreToolUse', session_id: coordinatorSessionId, tool_use_id: 'toolu_r2',
+      tool_name: 'Agent', tool_input: { prompt: 'second', subagent_type: teammateName, team_name: teamName, name: teammateName } });
+    await new Promise(r => setTimeout(r, 120));
+
+    let log = readLog();
+    assert.match(log, /queue depth 2/, 'second spawn of same key should APPEND to FIFO queue (depth 2), not overwrite');
+
+    // both teammate sessions start, then both idle
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: tm1, transcript_path: tp1 });
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: tm2, transcript_path: tp2 });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'TeammateIdle', session_id: tm1, transcript_path: tp1, teammate_name: teammateName, team_name: teamName });
+    await new Promise(r => setTimeout(r, 200));
+    await sendEvent({ hook_event_name: 'TeammateIdle', session_id: tm2, transcript_path: tp2, teammate_name: teammateName, team_name: teamName });
+    await new Promise(r => setTimeout(r, 400));
+
+    log = readLog();
+    const traced = log.match(/TeammateIdle: traced cks-specialist team=triage-respawn \(cross-session\)/g) ?? [];
+    assert.equal(traced.length, 2, `BOTH re-spawned teammates should nest (no overwrite/leak) — got ${traced.length}`);
+  } finally {
+    daemon.kill();
+    await new Promise<void>(resolve => daemon.once('exit', () => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('Cross-session: duplicate TeammateIdle does not double-emit', async () => {
   const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-duptest-'));
   const configDir = path.join(home, '.weave-claude-code');

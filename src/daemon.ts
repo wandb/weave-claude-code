@@ -198,7 +198,15 @@ interface SubagentTracker {
  *  session_id, not the coordinator's — so the per-session SubagentTracking
  *  lookup misses. The coordinator's PreToolUse(Agent, team_name) is the one
  *  reliable anchor; we record its invoke_agent span here keyed by
- *  `${team_name}::${name}` so TeammateIdle can find it cross-session. */
+ *  `${team_name}::${name}`.
+ *
+ *  Entries are stored as a FIFO queue per key (not a single value) because the
+ *  SAME `${team}::${name}` can be spawned more than once in a run — e.g. the
+ *  TARS triage flow re-spawns a specialist (Sonnet→Opus) for deeper work. Each
+ *  spawn pushes its own TeamMember; each teammate's TeammateIdle consumes the
+ *  oldest not-yet-emitted entry (FIFO), so re-spawns never overwrite a live span
+ *  (which would leak it and mis-attribute the first teammate's transcript). This
+ *  mirrors SubagentTracking.findPendingTeammateIdle for the per-session path. */
 interface TeamMember {
   invokeAgentSpan: Span;
   conversationId: string;
@@ -320,8 +328,10 @@ export class GlobalDaemon {
   private provider: NodeTracerProvider | null = null;
   private tracer: Tracer | null = null;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
-   *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. */
-  private teamMembers = new Map<string, TeamMember>();
+   *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. The
+   *  value is a FIFO queue: a re-spawned `${team}::${name}` appends rather than
+   *  overwriting, so two live spans for the same name never collide. */
+  private teamMembers = new Map<string, TeamMember[]>();
 
   constructor(
     private readonly socketPath: string,
@@ -772,13 +782,20 @@ export class GlobalDaemon {
         teamName,
       });
       if (teamName) {
-        this.teamMembers.set(`${teamName}::${memberName}`, {
+        // Append to the per-key FIFO queue (do NOT overwrite): the same
+        // `${team}::${name}` may be spawned again later in the run (e.g. TARS
+        // re-spawns a specialist Sonnet→Opus). Overwriting would orphan the
+        // first, still-open span and mis-route its teammate's transcript.
+        const key = `${teamName}::${memberName}`;
+        const queue = this.teamMembers.get(key) ?? [];
+        queue.push({
           invokeAgentSpan,
           conversationId: session.conversationId,
           coordinatorTranscriptPath: session.transcript.resolvedPath,
           emitted: false,
         });
-        this.log('INFO', `Team member registered: ${teamName}::${memberName} (cross-session nesting)`);
+        this.teamMembers.set(key, queue);
+        this.log('INFO', `Team member registered: ${key} (cross-session nesting, queue depth ${queue.length})`);
       }
       return;
     }
@@ -878,8 +895,16 @@ export class GlobalDaemon {
     // attached as children.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
     if (subagentTracker?.invokeAgentSpan) {
-      this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
-      session.subagents.remove(subagentTracker);
+      if (subagentTracker.teamName) {
+        // Agent-teams: the team map owns this span (closed at the teammate's
+        // TeammateIdle, cross-session). Closing it here would end it early and
+        // then double-end when TeammateIdle fires. Mirror handlePostToolUse:
+        // just drop the per-session tracker; the queue entry lives on.
+        session.subagents.remove(subagentTracker);
+      } else {
+        this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+        session.subagents.remove(subagentTracker);
+      }
       session.totalToolCalls += 1;
       session.turnToolCalls += 1;
       session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
@@ -1082,12 +1107,20 @@ export class GlobalDaemon {
   }
 
   private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
+    if (!this.tracer) return;
+    // FAIL-OPEN on a missing session: in the agent-teams model this hook fires
+    // under the TEAMMATE's session_id, which may not be registered with this
+    // daemon (only the coordinator is). `session` is therefore OPTIONAL for the
+    // cross-session team path and only REQUIRED for the per-session fallback.
+    // Do NOT early-return on a missing session — that would silently drop
+    // cross-session nesting, the whole point of this handler.
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
 
     // TeammateIdle payload (actual schema, confirmed from live TARS triage):
-    //   session_id    — coordinator's session UUID
-    //   teammate_name — agent name, e.g. "cks-specialist"
+    //   session_id    — the teammate's session UUID (NOT the coordinator's)
+    //   teammate_name — agent name, e.g. "cks-specialist". INVARIANT: must equal
+    //                   the `name` the coordinator passed to the Agent tool (in
+    //                   TARS, name === subagent_type), else the lookup misses.
     //   team_name     — team name, e.g. "triage-supp-25017"
     //   transcript_path — CC sets this to the coordinator's transcript (not the
     //                     teammate's), so we ignore it and use the path stored
@@ -1099,30 +1132,47 @@ export class GlobalDaemon {
     const teamName = (payload['team_name'] as string | undefined) ?? '?';
 
     // ── Cross-session team path (agent-teams / TeamCreate model) ─────────
-    // In agent-teams the teammate is its OWN session, so this TeammateIdle
-    // fires under the TEAMMATE's session_id, NOT the coordinator's. The
-    // per-session orphan lookup below therefore misses. But the coordinator's
-    // PreToolUse(Agent, team_name) already created the invoke_agent span and
-    // registered it in teamMembers under `${team_name}::${name}`.
-    const member = this.teamMembers.get(`${teamName}::${agentType}`);
-    if (member) {
-      if (member.emitted) {
-        this.log('DEBUG', `TeammateIdle: ${teamName}::${agentType} already emitted — skipping duplicate idle`);
+    // The coordinator's PreToolUse(Agent, team_name) registered the invoke_agent
+    // span in teamMembers under `${team_name}::${name}` (a FIFO queue). Consume
+    // the OLDEST not-yet-emitted entry, so re-spawns of the same name match in
+    // dispatch order instead of overwriting each other.
+    const key = `${teamName}::${agentType}`;
+    const queue = this.teamMembers.get(key);
+    if (queue && queue.length) {
+      const member = queue.find(m => !m.emitted);
+      if (!member) {
+        // All queued spans for this key already emitted — duplicate (repeat)
+        // TeammateIdle. Expected; nothing to do.
+        this.log('DEBUG', `TeammateIdle: ${key} all ${queue.length} entries already emitted — skipping duplicate idle`);
         return;
       }
       member.emitted = true;
-      const idleTranscript = session.transcript.resolvedPath ?? (payload['transcript_path'] as string | undefined);
+      const idleTranscript = session?.transcript.resolvedPath ?? (payload['transcript_path'] as string | undefined);
       const teammateTranscriptPath = this.resolveTeammateTranscript(member.coordinatorTranscriptPath, agentType, idleTranscript);
       this.emitTeammateTranscript(member.invokeAgentSpan, member.conversationId, teammateTranscriptPath);
-      this.teamMembers.delete(`${teamName}::${agentType}`);
-      this.log('INFO', `TeammateIdle: traced ${agentType} team=${teamName} (cross-session) transcript=${teammateTranscriptPath ?? '(none)'}`);
+      // Remove the consumed entry; drop the key once its queue drains.
+      const idx = queue.indexOf(member);
+      if (idx >= 0) queue.splice(idx, 1);
+      if (!queue.length) this.teamMembers.delete(key);
+      this.log('INFO', `TeammateIdle: traced ${agentType} team=${teamName} (cross-session) transcript=${teammateTranscriptPath ?? '(none)'} (queue depth now ${queue.length})`);
       return;
     }
 
+    // No team entry for this key. If OTHER team keys ARE registered, this most
+    // likely means the teammate_name ≠ Agent.name invariant was violated — log
+    // it loudly (not silently) so it is debuggable, then try the per-session path.
+    if (this.teamMembers.size > 0) {
+      this.log('INFO', `TeammateIdle: no team entry for ${key} (registered: ${[...this.teamMembers.keys()].join(', ')}) — check teammate_name === Agent.name`);
+    }
+
     // ── Per-session path (individual Agent calls without team_name) ──────
-    // Find the orphan tracker created at SubagentStart for this teammate.
-    // SubagentStop has already fired but left the invoke_agent span open
-    // specifically so TeammateIdle can close it with full all-turns content.
+    // Requires the firing session to be known to this daemon. Find the orphan
+    // tracker created at SubagentStart; SubagentStop left its invoke_agent span
+    // open specifically so we can close it here with full all-turns content.
+    if (!session) {
+      this.log('DEBUG', `TeammateIdle: session ${sessionId} unknown and no team entry for ${key} — skipping`);
+      return;
+    }
     const tracker = session.subagents.findPendingTeammateIdle(agentType);
 
     if (!tracker?.invokeAgentSpan) {
@@ -1387,10 +1437,13 @@ export class GlobalDaemon {
     this.running = false;
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
-    // Close any team-member invoke_agent spans whose teammate never emitted a
-    // TeammateIdle (e.g. teammate crashed, or daemon exits mid-triage).
-    for (const [, m] of this.teamMembers) {
-      if (!m.emitted) { try { m.invokeAgentSpan.end(); } catch { /* best effort */ } }
+    // Backstop: close any queued team-member invoke_agent spans whose teammate
+    // never emitted a TeammateIdle (e.g. teammate crashed, or daemon exits
+    // mid-triage) so they flush as ended spans instead of leaking.
+    for (const [, queue] of this.teamMembers) {
+      for (const m of queue) {
+        if (!m.emitted) { try { m.invokeAgentSpan.end(); } catch { /* best effort */ } }
+      }
     }
     this.teamMembers.clear();
     if (this.provider) {
