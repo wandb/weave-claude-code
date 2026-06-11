@@ -355,3 +355,246 @@ test('TeammateIdle: full TARS sequence — SubagentStart → SubagentStop → Te
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// ── cross-session: agent-teams (TeamCreate) model ───────────────────────────
+//
+// In agent-teams, the teammate is an independent Claude session. SubagentStart
+// does NOT fire for teammates. The sequence is:
+//   1. Coordinator: PreToolUse(Agent, team_name) → creates tracker + team member
+//   2. Teammate: SessionStart (new session_id)
+//   3. Teammate: TeammateIdle (from teammate's session, NOT coordinator's)
+// The cross-session team registry bridges coordinator → teammate.
+
+test('Cross-session: TeammateIdle from teammate session finds coordinator team member', async () => {
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-crosstest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  const coordinatorSessionId = 'cross-coord-001';
+  const teammateSessionId = 'cross-teammate-001';
+  const teamName = 'triage-crosstest';
+  const teammateName = 'cks-specialist';
+
+  // Coordinator transcript dir with subagents/ for transcript resolution
+  const coordinatorTranscriptDir = path.join(home, '.claude', 'projects', 'test', coordinatorSessionId);
+  const subagentsDir = path.join(coordinatorTranscriptDir, 'subagents');
+  const agentId = 'agent-cross-abc123';
+  const agentTranscriptPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  const agentMetaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
+
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.mkdirSync(subagentsDir, { recursive: true });
+
+  fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
+    weave_project: 'test/crosstest',
+    wandb_api_key: 'fake-key-for-crosstest',
+    daemon_socket: socketPath,
+    log_file: logPath,
+    debug: true,
+  }));
+
+  // Teammate transcript (the specialist's own investigation)
+  fs.writeFileSync(agentTranscriptPath, [
+    JSON.stringify({ type: 'agent-setting', agentSetting: teammateName, sessionId: teammateSessionId }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Investigate CKS health' }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: 'msg-cross-1',
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      stop_reason: 'end_turn', content: [{ type: 'text', text: 'CKS cluster is healthy.' }] } }),
+  ].join('\n') + '\n');
+
+  // Meta file for transcript resolution (resolveTeammateTranscript reads this)
+  fs.writeFileSync(agentMetaPath, JSON.stringify({ agentType: teammateName }));
+
+  // Coordinator and teammate transcript files
+  const coordinatorPath = path.join(coordinatorTranscriptDir, `${coordinatorSessionId}.jsonl`);
+  fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  const teammateTranscriptDir = path.join(home, '.claude', 'projects', 'test', teammateSessionId);
+  fs.mkdirSync(teammateTranscriptDir, { recursive: true });
+  const teammatePath = path.join(teammateTranscriptDir, `${teammateSessionId}.jsonl`);
+  fs.writeFileSync(teammatePath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home },
+    stdio: 'ignore',
+  });
+
+  const sendEvent = (payload: object): Promise<void> => new Promise((resolve, reject) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', reject);
+    s.on('connect', () => { s.end(JSON.stringify(payload)); });
+    s.on('close', () => resolve());
+  });
+
+  const waitForSocket = (): Promise<void> => new Promise((resolve) => {
+    const poll = setInterval(() => {
+      if (fs.existsSync(socketPath)) { clearInterval(poll); resolve(); }
+    }, 50);
+  });
+
+  const readLog = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+
+  try {
+    await waitForSocket();
+    await new Promise(r => setTimeout(r, 200));
+
+    // Step 1: Coordinator starts and submits prompt
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: coordinatorSessionId, transcript_path: coordinatorPath });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordinatorSessionId, transcript_path: coordinatorPath, prompt: '/triage supp-crosstest' });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 2: PreToolUse(Agent, team_name) in coordinator session
+    await sendEvent({
+      hook_event_name: 'PreToolUse',
+      session_id: coordinatorSessionId,
+      tool_use_id: 'toolu_cross_001',
+      tool_name: 'Agent',
+      tool_input: {
+        prompt: 'Investigate CKS health',
+        subagent_type: teammateName,
+        team_name: teamName,
+        name: teammateName,
+      },
+    });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Verify team member was registered
+    let log = readLog();
+    assert.match(log, /Team member registered/, 'coordinator PreToolUse should register team member');
+
+    // Step 3: PostToolUse(Agent) — should NOT close the span (team mode)
+    await sendEvent({
+      hook_event_name: 'PostToolUse',
+      session_id: coordinatorSessionId,
+      tool_use_id: 'toolu_cross_001',
+      tool_name: 'Agent',
+      tool_response: 'Agent dispatched',
+    });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 4: Teammate session starts (DIFFERENT session_id)
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: teammateSessionId, transcript_path: teammatePath });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Step 5: TeammateIdle fires from TEAMMATE's session (the cross-session case)
+    await sendEvent({
+      hook_event_name: 'TeammateIdle',
+      session_id: teammateSessionId,
+      transcript_path: teammatePath,
+      teammate_name: teammateName,
+      team_name: teamName,
+    });
+    await new Promise(r => setTimeout(r, 400));
+
+    log = readLog();
+    assert.match(log, /TeammateIdle: traced cks-specialist team=triage-crosstest \(cross-session\)/, 'should trace via cross-session path');
+    assert.doesNotMatch(log, /no pending tracker for cks-specialist/, 'should NOT fall through to per-session path');
+  } finally {
+    daemon.kill();
+    await new Promise<void>(resolve => daemon.once('exit', () => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cross-session: duplicate TeammateIdle does not double-emit', async () => {
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-duptest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  const coordinatorSessionId = 'dup-coord-001';
+  const teammateSessionId = 'dup-teammate-001';
+
+  const coordinatorTranscriptDir = path.join(home, '.claude', 'projects', 'test', coordinatorSessionId);
+  const subagentsDir = path.join(coordinatorTranscriptDir, 'subagents');
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.mkdirSync(subagentsDir, { recursive: true });
+
+  fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify({
+    weave_project: 'test/duptest',
+    wandb_api_key: 'fake-key-for-duptest',
+    daemon_socket: socketPath,
+    log_file: logPath,
+    debug: true,
+  }));
+
+  const agentId = 'agent-dup-xyz';
+  const agentTranscriptPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  fs.writeFileSync(agentTranscriptPath, [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Check storage' }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-8', id: 'msg-dup',
+      usage: { input_tokens: 50, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      stop_reason: 'end_turn', content: [{ type: 'text', text: 'Storage OK.' }] } }),
+  ].join('\n') + '\n');
+  fs.writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`), JSON.stringify({ agentType: 'storage-specialist' }));
+
+  const coordinatorPath = path.join(coordinatorTranscriptDir, `${coordinatorSessionId}.jsonl`);
+  fs.writeFileSync(coordinatorPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+  const teammateTranscriptDir = path.join(home, '.claude', 'projects', 'test', teammateSessionId);
+  fs.mkdirSync(teammateTranscriptDir, { recursive: true });
+  const teammatePath = path.join(teammateTranscriptDir, `${teammateSessionId}.jsonl`);
+  fs.writeFileSync(teammatePath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  const daemon = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home },
+    stdio: 'ignore',
+  });
+  const sendEvent = (payload: object): Promise<void> => new Promise((resolve, reject) => {
+    const s = net.createConnection(socketPath);
+    s.on('error', reject);
+    s.on('connect', () => { s.end(JSON.stringify(payload)); });
+    s.on('close', () => resolve());
+  });
+  const waitForSocket = (): Promise<void> => new Promise((resolve) => {
+    const poll = setInterval(() => {
+      if (fs.existsSync(socketPath)) { clearInterval(poll); resolve(); }
+    }, 50);
+  });
+  const readLog = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+
+  try {
+    await waitForSocket();
+    await new Promise(r => setTimeout(r, 200));
+
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: coordinatorSessionId, transcript_path: coordinatorPath });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordinatorSessionId, transcript_path: coordinatorPath, prompt: '/triage' });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({
+      hook_event_name: 'PreToolUse', session_id: coordinatorSessionId,
+      tool_use_id: 'toolu_dup_001', tool_name: 'Agent',
+      tool_input: { prompt: 'Check storage', subagent_type: 'storage-specialist', team_name: 'triage-duptest', name: 'storage-specialist' },
+    });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'PostToolUse', session_id: coordinatorSessionId, tool_use_id: 'toolu_dup_001', tool_name: 'Agent', tool_response: 'dispatched' });
+    await new Promise(r => setTimeout(r, 100));
+    await sendEvent({ hook_event_name: 'SessionStart', session_id: teammateSessionId, transcript_path: teammatePath });
+    await new Promise(r => setTimeout(r, 100));
+
+    // First TeammateIdle — should trace
+    await sendEvent({
+      hook_event_name: 'TeammateIdle', session_id: teammateSessionId, transcript_path: teammatePath,
+      teammate_name: 'storage-specialist', team_name: 'triage-duptest',
+    });
+    await new Promise(r => setTimeout(r, 300));
+
+    // Second TeammateIdle (duplicate) — should skip
+    await sendEvent({
+      hook_event_name: 'TeammateIdle', session_id: teammateSessionId, transcript_path: teammatePath,
+      teammate_name: 'storage-specialist', team_name: 'triage-duptest',
+    });
+    await new Promise(r => setTimeout(r, 300));
+
+    const log = readLog();
+    const traceMatches = log.match(/TeammateIdle: traced storage-specialist/g) ?? [];
+    assert.equal(traceMatches.length, 1, 'should trace exactly once, not twice');
+
+    // The second one should either hit "already emitted" or "no pending tracker" — not trace again
+    const skipOrFallthrough = log.includes('already emitted') || log.includes('no pending tracker');
+    assert.ok(skipOrFallthrough, 'duplicate idle should be skipped');
+  } finally {
+    daemon.kill();
+    await new Promise<void>(resolve => daemon.once('exit', () => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
