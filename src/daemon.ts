@@ -1824,6 +1824,16 @@ export class GlobalDaemon {
       this.log('DEBUG', 'Inactivity timeout reached but team correlation in flight — staying up');
       return;
     }
+    // Also hold open while ordinary work is in flight: an open turn span, a
+    // pending tool call, or a tracked subagent. A long-running tool or turn
+    // (longer than the timeout, with no other session active) would otherwise
+    // trip the timeout mid-flight — dropping the still-open spans and forcing
+    // the resumed work onto a fresh, amnesiac daemon. Same TEAM_INFLIGHT_MAX_MS
+    // ceiling so a stuck session can't pin the daemon indefinitely.
+    if (idle < TEAM_INFLIGHT_MAX_MS && this.hasInFlightWork()) {
+      this.log('DEBUG', 'Inactivity timeout reached but work in flight — staying up');
+      return;
+    }
     this.log('INFO', 'Inactivity timeout — shutting down');
     void this.shutdown('inactivity');
   }
@@ -1833,6 +1843,18 @@ export class GlobalDaemon {
   private hasUnemittedTeamMembers(): boolean {
     for (const queue of this.teamMembers.values()) {
       if (queue.some(m => !m.emitted)) return true;
+    }
+    return false;
+  }
+
+  /** True if any session has work in flight: an open turn span, a pending tool
+   *  call, or a tracked subagent. Keeps the daemon alive across the inactivity
+   *  timeout so in-flight work isn't cut off mid-flight (see checkInactivity). */
+  private hasInFlightWork(): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.currentTurnSpan) return true;
+      if (s.pendingToolCalls.size > 0) return true;
+      if (s.subagents.size() > 0) return true;
     }
     return false;
   }
