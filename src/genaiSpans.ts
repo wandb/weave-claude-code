@@ -105,6 +105,7 @@ export const OP = {
   INVOKE_AGENT: 'invoke_agent',
   CHAT: 'chat',
   EXECUTE_TOOL: 'execute_tool',
+  ASSISTANT_TEXT: 'assistant_text',
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -297,14 +298,86 @@ export interface ChatSpanArgs {
 
 /**
  * Emit a chat span as a child of `parentSpan`. The span is started AND ended
- * inside this helper because chat spans are constructed from transcript data
- * after the fact — we never have an "open chat span" to track between calls.
+ * inside this helper. Used by code paths that construct the chat span from
+ * transcript data after the fact (SubagentStop, TeammateIdle). For the main
+ * agent path — where the chat span parents the assistant_text / execute_tool
+ * spans that occur during the API call — use `startChatSpan` /
+ * `finalizeChatSpan` instead.
  */
 export function emitChatSpan(
   tracer: Tracer,
   parentSpan: Span,
   args: ChatSpanArgs,
 ): void {
+  const span = startChatSpan(tracer, parentSpan, {
+    conversationId: args.conversationId,
+    model: args.model,
+    startedAt: args.startedAt,
+  });
+  finalizeChatSpan(span, {
+    usage: args.usage,
+    reasoningTokens: args.reasoningTokens,
+    responseId: args.responseId,
+    finishReasons: args.finishReasons,
+    inputMessages: args.inputMessages,
+    outputMessages: args.outputMessages,
+    endedAt: args.endedAt,
+  });
+}
+
+export interface StartChatSpanArgs {
+  conversationId: string;
+  model?: string;
+  startedAt: TimeInput;
+}
+
+/**
+ * Start a chat span (open). Caller is responsible for emitting any child
+ * spans and calling `finalizeChatSpan` with the usage data and end time.
+ *
+ * `model` is optional at open time — Anthropic returns it in the response, so
+ * it may not be known until the assistant message is parsed. When omitted,
+ * the span name uses a placeholder; `finalizeChatSpan` overwrites the name
+ * with the actual model once it's known.
+ */
+export function startChatSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: StartChatSpanArgs,
+): Span {
+  const attrs: Record<string, string | number | boolean | string[]> = {
+    [ATTR.OPERATION_NAME]: OP.CHAT,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+    [ATTR.OUTPUT_TYPE]: 'text',
+  };
+  if (args.model) {
+    attrs[ATTR.REQUEST_MODEL] = args.model;
+    const provider = providerFromModel(args.model);
+    if (provider) attrs[ATTR.PROVIDER_NAME] = provider;
+  }
+  const name = args.model ? `${OP.CHAT} ${args.model}` : OP.CHAT;
+  return tracer.startSpan(
+    name,
+    { kind: SpanKind.CLIENT, attributes: attrs, startTime: args.startedAt },
+    ctxWithParent(parentSpan),
+  );
+}
+
+export interface FinalizeChatSpanArgs {
+  usage: UsageSummary;
+  reasoningTokens?: number;
+  responseId?: string;
+  finishReasons?: string[];
+  inputMessages?: unknown;
+  outputMessages?: unknown;
+  /** If set and the span was opened without a model, attaches the model
+   *  attribute and updates the span name. */
+  model?: string;
+  endedAt?: TimeInput;
+}
+
+/** Stamp usage / response attrs on an open chat span and end it. */
+export function finalizeChatSpan(span: Span, args: FinalizeChatSpanArgs): void {
   // OTel `input_tokens` is the total prompt; Anthropic splits it into three
   // disjoint fields (uncached + cache_read + cache_creation), so sum them.
   // https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
@@ -313,44 +386,71 @@ export function emitChatSpan(
     + (args.usage.cache_read_input_tokens ?? 0)
     + (args.usage.cache_creation_input_tokens ?? 0);
 
-  const attrs: Record<string, string | number | boolean | string[]> = {
-    [ATTR.OPERATION_NAME]: OP.CHAT,
-    [ATTR.REQUEST_MODEL]: args.model,
-    [ATTR.CONVERSATION_ID]: args.conversationId,
-    [ATTR.USAGE_INPUT_TOKENS]: totalInputTokens,
-    [ATTR.USAGE_OUTPUT_TOKENS]: args.usage.output_tokens,
-    [ATTR.OUTPUT_TYPE]: 'text',
-  };
-  const provider = providerFromModel(args.model);
-  if (provider) attrs[ATTR.PROVIDER_NAME] = provider;
+  span.setAttribute(ATTR.USAGE_INPUT_TOKENS, totalInputTokens);
+  span.setAttribute(ATTR.USAGE_OUTPUT_TOKENS, args.usage.output_tokens);
   if (args.usage.cache_read_input_tokens !== undefined) {
-    attrs[ATTR.USAGE_CACHE_READ_INPUT_TOKENS] = args.usage.cache_read_input_tokens;
+    span.setAttribute(ATTR.USAGE_CACHE_READ_INPUT_TOKENS, args.usage.cache_read_input_tokens);
   }
   if (args.usage.cache_creation_input_tokens !== undefined) {
-    attrs[ATTR.USAGE_CACHE_CREATION_INPUT_TOKENS] = args.usage.cache_creation_input_tokens;
+    span.setAttribute(ATTR.USAGE_CACHE_CREATION_INPUT_TOKENS, args.usage.cache_creation_input_tokens);
   }
   if (args.reasoningTokens !== undefined && args.reasoningTokens > 0) {
-    attrs[ATTR.USAGE_REASONING_TOKENS] = args.reasoningTokens;
+    span.setAttribute(ATTR.USAGE_REASONING_TOKENS, args.reasoningTokens);
   }
   if (args.responseId) {
-    attrs[ATTR.RESPONSE_ID] = args.responseId;
+    span.setAttribute(ATTR.RESPONSE_ID, args.responseId);
   }
   if (args.finishReasons?.length) {
-    attrs[ATTR.RESPONSE_FINISH_REASONS] = args.finishReasons;
+    span.setAttribute(ATTR.RESPONSE_FINISH_REASONS, args.finishReasons);
   }
   if (args.inputMessages !== undefined) {
-    attrs[ATTR.INPUT_MESSAGES] = jsonStr(args.inputMessages);
+    span.setAttribute(ATTR.INPUT_MESSAGES, jsonStr(args.inputMessages));
   }
   if (args.outputMessages !== undefined) {
-    attrs[ATTR.OUTPUT_MESSAGES] = jsonStr(args.outputMessages);
+    span.setAttribute(ATTR.OUTPUT_MESSAGES, jsonStr(args.outputMessages));
   }
+  if (args.model) {
+    span.setAttribute(ATTR.REQUEST_MODEL, args.model);
+    const provider = providerFromModel(args.model);
+    if (provider) span.setAttribute(ATTR.PROVIDER_NAME, provider);
+    span.updateName(`${OP.CHAT} ${args.model}`);
+  }
+  span.end(args.endedAt);
+}
 
+export interface AssistantTextSpanArgs {
+  conversationId: string;
+  text: string;
+  startedAt?: TimeInput;
+  endedAt?: TimeInput;
+}
+
+/**
+ * Emit a span representing one text content block from an assistant message.
+ * Renders in the trace tree between sibling `execute_tool` spans so the
+ * model's natural interleave (say something → call tool → say something →
+ * call tool) is visible. Carries the text on `gen_ai.output.messages` so
+ * Weave's UI shows the content; no token attributes — tokens live on the
+ * parent chat span.
+ */
+export function emitAssistantTextSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: AssistantTextSpanArgs,
+): void {
+  const attrs: Record<string, string> = {
+    [ATTR.OPERATION_NAME]: OP.ASSISTANT_TEXT,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+    [ATTR.OUTPUT_MESSAGES]: jsonStr([
+      { role: 'assistant', parts: [{ type: 'text', content: args.text }] },
+    ]),
+  };
   const span = tracer.startSpan(
-    `${OP.CHAT} ${args.model}`,
-    { kind: SpanKind.CLIENT, attributes: attrs, startTime: args.startedAt },
+    OP.ASSISTANT_TEXT,
+    { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
     ctxWithParent(parentSpan),
   );
-  span.end(args.endedAt);
+  span.end(args.endedAt ?? args.startedAt);
 }
 
 /**
