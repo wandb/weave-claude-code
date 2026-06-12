@@ -99,7 +99,7 @@ export const ATTR = {
  * override it (settings `agent_name` / `WEAVE_AGENT_NAME`); this is the
  * fallback when neither is set.
  */
-export const AGENT_NAME_CLAUDE_CODE = 'claude-code';
+export const DEFAULT_AGENT_NAME = 'claude-code';
 
 export const OP = {
   INVOKE_AGENT: 'invoke_agent',
@@ -163,7 +163,7 @@ export interface TurnSpanArgs {
   source: string;
   pluginVersion: string;
   /** Top-level agent name; becomes the second word of the span name and is
-   *  stamped as `gen_ai.agent.name`. Defaults to `AGENT_NAME_CLAUDE_CODE`;
+   *  stamped as `gen_ai.agent.name`. Defaults to `DEFAULT_AGENT_NAME`;
    *  the daemon resolves any user override before calling. */
   agentName: string;
   requestModel?: string;

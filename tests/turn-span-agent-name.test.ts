@@ -15,7 +15,7 @@ import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
 } from '@opentelemetry/sdk-trace-base';
-import { startTurnSpan, ATTR, AGENT_NAME_CLAUDE_CODE } from '../src/genaiSpans.ts';
+import { startTurnSpan, ATTR, DEFAULT_AGENT_NAME } from '../src/genaiSpans.ts';
 
 function setupTracer(): { tracer: ReturnType<BasicTracerProvider['getTracer']>; exporter: InMemorySpanExporter; provider: BasicTracerProvider } {
   const exporter = new InMemorySpanExporter();
@@ -43,12 +43,12 @@ test('startTurnSpan: agentName drives the span name and gen_ai.agent.name', asyn
   const { tracer, exporter, provider } = setupTracer();
 
   // A custom name and the default both flow through identically.
-  for (const name of ['my-custom-agent', AGENT_NAME_CLAUDE_CODE]) {
+  for (const name of ['my-custom-agent', DEFAULT_AGENT_NAME]) {
     startTurnSpan(tracer, baseArgs(name)).end();
   }
   await provider.forceFlush();
 
-  for (const name of ['my-custom-agent', AGENT_NAME_CLAUDE_CODE]) {
+  for (const name of ['my-custom-agent', DEFAULT_AGENT_NAME]) {
     const span = exporter.getFinishedSpans().find(s => s.name === `invoke_agent ${name}`);
     assert.ok(span, `span name must embed the agent name "${name}"`);
     assert.equal(span.attributes[ATTR.AGENT_NAME], name);

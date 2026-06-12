@@ -28,7 +28,7 @@ import {
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
-import { AGENT_NAME_CLAUDE_CODE } from './genaiSpans.js';
+import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -230,7 +230,7 @@ enum AgentNameSource {
 /**
  * Resolve the effective top-level agent name and where it came from. Mirrors
  * the env-over-settings precedence used for `weave_project`, with the
- * hardcoded `AGENT_NAME_CLAUDE_CODE` as the final fallback. Shared by
+ * hardcoded `DEFAULT_AGENT_NAME` as the final fallback. Shared by
  * `config show` and `config get` so both report the same value.
  */
 function resolveAgentName(settings: Settings): { value: string; source: AgentNameSource } {
@@ -238,7 +238,7 @@ function resolveAgentName(settings: Settings): { value: string; source: AgentNam
   if (fromEnv) return { value: fromEnv, source: AgentNameSource.EnvVar };
   const fromSettings = settings.agent_name?.trim();
   if (fromSettings) return { value: fromSettings, source: AgentNameSource.Settings };
-  return { value: AGENT_NAME_CLAUDE_CODE, source: AgentNameSource.Default };
+  return { value: DEFAULT_AGENT_NAME, source: AgentNameSource.Default };
 }
 
 async function cmdConfig(args: string[]): Promise<void> {

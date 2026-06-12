@@ -16,7 +16,7 @@ export interface Settings {
   weave_project: string | null;
   wandb_api_key: string | null;
   /** Overrides the name shown in Weave's Agents view (the top-level agent).
-   *  null falls back to `AGENT_NAME_CLAUDE_CODE` ('claude-code'). Settings
+   *  null falls back to `DEFAULT_AGENT_NAME` ('claude-code'). Settings
    *  written before this field existed read as undefined, which the daemon
    *  treats identically to null. */
   agent_name: string | null;

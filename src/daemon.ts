@@ -24,7 +24,7 @@ import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
-  AGENT_NAME_CLAUDE_CODE,
+  DEFAULT_AGENT_NAME,
   CompactionAttrs,
   startTurnSpan,
   startToolSpan,
@@ -1577,7 +1577,7 @@ export async function runDaemon(): Promise<void> {
   const agentName =
     process.env['WEAVE_AGENT_NAME']?.trim() ||
     settings.agent_name?.trim() ||
-    AGENT_NAME_CLAUDE_CODE;
+    DEFAULT_AGENT_NAME;
 
   if (!weaveProject || !apiKey) {
     const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
