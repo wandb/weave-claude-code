@@ -106,6 +106,7 @@ export const OP = {
   CHAT: 'chat',
   EXECUTE_TOOL: 'execute_tool',
   ASSISTANT_TEXT: 'assistant_text',
+  THINKING: 'thinking',
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -300,8 +301,8 @@ export interface ChatSpanArgs {
  * Emit a chat span as a child of `parentSpan`. The span is started AND ended
  * inside this helper. Used by code paths that construct the chat span from
  * transcript data after the fact (SubagentStop, TeammateIdle). For the main
- * agent path — where the chat span parents the assistant_text / execute_tool
- * spans that occur during the API call — use `startChatSpan` /
+ * agent path — where the chat span parents the assistant_text / thinking /
+ * execute_tool spans that occur during the API call — use `startChatSpan` /
  * `finalizeChatSpan` instead.
  */
 export function emitChatSpan(
@@ -447,6 +448,39 @@ export function emitAssistantTextSpan(
   };
   const span = tracer.startSpan(
     OP.ASSISTANT_TEXT,
+    { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
+    ctxWithParent(parentSpan),
+  );
+  span.end(args.endedAt ?? args.startedAt);
+}
+
+export interface ThinkingSpanArgs {
+  conversationId: string;
+  text: string;
+  startedAt?: TimeInput;
+  endedAt?: TimeInput;
+}
+
+/**
+ * Emit a span representing one thinking content block. Like
+ * `emitAssistantTextSpan` but for `{type: 'thinking'}` blocks — Claude's
+ * private reasoning surfaced in its content stream. Kept distinct so callers
+ * can hide thinking spans in the UI without hiding ordinary assistant text.
+ */
+export function emitThinkingSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: ThinkingSpanArgs,
+): void {
+  const attrs: Record<string, string> = {
+    [ATTR.OPERATION_NAME]: OP.THINKING,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+    [ATTR.OUTPUT_MESSAGES]: jsonStr([
+      { role: 'assistant', parts: [{ type: 'thinking', content: args.text }] },
+    ]),
+  };
+  const span = tracer.startSpan(
+    OP.THINKING,
     { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
     ctxWithParent(parentSpan),
   );
