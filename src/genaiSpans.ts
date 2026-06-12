@@ -105,14 +105,15 @@ export const DEFAULT_AGENT_NAME = 'claude-code';
 // `execute_tool` are well-known values from the OTel GenAI semantic conventions
 // (https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/registry/attributes/gen-ai.md#gen-ai-operation-name);
 // the spec mandates the well-known value whenever one applies. `assistant_text`
-// has no well-known equivalent, so it's a spec-permitted custom value: the
-// model's natural-language output, emitted as a `chat` child so it interleaves
-// with sibling `execute_tool` spans.
+// and `thinking` have no well-known equivalent, so they're spec-permitted custom
+// values — the model's natural-language output and its private reasoning, each
+// emitted as a `chat` child so they interleave with sibling `execute_tool` spans.
 export const OP = {
   INVOKE_AGENT: 'invoke_agent',
   CHAT: 'chat',
   EXECUTE_TOOL: 'execute_tool',
   ASSISTANT_TEXT: 'assistant_text',
+  THINKING: 'thinking',
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -307,8 +308,8 @@ export interface ChatSpanArgs {
  * Emit a chat span as a child of `parentSpan`. The span is started AND ended
  * inside this helper. Used by code paths that construct the chat span from
  * transcript data after the fact (SubagentStop, TeammateIdle). For the main
- * agent path — where the chat span parents the assistant_text / execute_tool
- * spans that occur during the API call — use `startChatSpan` /
+ * agent path — where the chat span parents the assistant_text / thinking /
+ * execute_tool spans that occur during the API call — use `startChatSpan` /
  * `finalizeChatSpan` instead.
  */
 export function emitChatSpan(
@@ -454,6 +455,39 @@ export function emitAssistantTextSpan(
   };
   const span = tracer.startSpan(
     OP.ASSISTANT_TEXT,
+    { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
+    ctxWithParent(parentSpan),
+  );
+  span.end(args.endedAt ?? args.startedAt);
+}
+
+export interface ThinkingSpanArgs {
+  conversationId: string;
+  text: string;
+  startedAt?: TimeInput;
+  endedAt?: TimeInput;
+}
+
+/**
+ * Emit a span representing one thinking content block. Like
+ * `emitAssistantTextSpan` but for `{type: 'thinking'}` blocks — Claude's
+ * private reasoning surfaced in its content stream. Kept distinct so callers
+ * can hide thinking spans in the UI without hiding ordinary assistant text.
+ */
+export function emitThinkingSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: ThinkingSpanArgs,
+): void {
+  const attrs: Record<string, string> = {
+    [ATTR.OPERATION_NAME]: OP.THINKING,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+    [ATTR.OUTPUT_MESSAGES]: jsonStr([
+      { role: 'assistant', parts: [{ type: 'thinking', content: args.text }] },
+    ]),
+  };
+  const span = tracer.startSpan(
+    OP.THINKING,
     { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
     ctxWithParent(parentSpan),
   );

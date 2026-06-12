@@ -5,19 +5,19 @@
 // Regression test for the main-agent chat-span reconstruction.
 //
 // Claude Code writes a single assistant API response as MULTIPLE transcript
-// lines, one per content block (text / tool_use), all sharing one
+// lines, one per content block (thinking / text / tool_use), all sharing one
 // `message.id`, and the parser maps each line to its own AssistantCallDetail.
 // An earlier version walked `blockIdx` within a single call's contentBlocks,
 // assuming all blocks lived together; against real (split) transcripts that
-// emitted nothing for the text blocks (they were dropped) and lumped any
-// surviving text at the end with emission-time timestamps.
+// emitted nothing for the text/thinking blocks (they were dropped) and lumped
+// any surviving text at the end with emission-time timestamps.
 //
 // This drives the actual reconstruction (GlobalDaemon.emitChatSpanForResponse,
 // reached the same way the Stop handler reaches it) against a realistic
-// split-line transcript and asserts: text is NOT dropped, each block lands on
-// a span stamped with its transcript timestamp (so it sorts into order among
-// the live tool spans), and the duplicated per-line usage is counted once per
-// response.
+// split-line transcript and asserts: text/thinking are NOT dropped, each lands
+// on a span stamped with its transcript timestamp (so it sorts into order
+// among the live tool spans), and the duplicated per-line usage is counted
+// once per response.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -76,12 +76,13 @@ function makeDaemon(tracer: ReturnType<typeof setupTracer>['tracer']): GlobalDae
   return d;
 }
 
-test('reconstruction: split text/tool_use lines interleave, text not dropped, usage counted once', async () => {
+test('reconstruction: split thinking/text/tool_use lines interleave, none dropped, usage counted once', async () => {
   // One turn:
-  //   response msgA: text, tool_use  (2 split lines, shared id)
+  //   response msgA: thinking, text, tool_use  (3 split lines, shared id)
   //   response msgB: text-only (no tool_use)
   const file = writeTranscript([
     userText('2026-01-01T00:00:00.000Z', 'do the thing'),
+    aLine('msgA', '2026-01-01T00:00:01.000Z', { type: 'thinking', thinking: 'let me think' }),
     aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }),
     aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'),
     aLine('msgB', '2026-01-01T00:00:10.000Z', { type: 'text', text: 'all done' }, 'end_turn'),
@@ -93,7 +94,7 @@ test('reconstruction: split text/tool_use lines interleave, text not dropped, us
     assert.ok(parsed);
     const calls = parsed.turns[parsed.turns.length - 1].assistantCalls();
     // Sanity: the parser really does split one response across lines.
-    assert.equal(calls.filter(c => c.responseId === 'msgA').length, 2, 'msgA is 2 split lines');
+    assert.equal(calls.filter(c => c.responseId === 'msgA').length, 3, 'msgA is 3 split lines');
 
     const daemon = makeDaemon(tracer);
     const turn = tracer.startSpan('invoke_agent claude-code');
@@ -124,16 +125,16 @@ test('reconstruction: split text/tool_use lines interleave, text not dropped, us
         .sort((a, b) => hrToNs(a.startTime) - hrToNs(b.startTime));
 
     const aChildren = childrenOf(chatA);
-    // The text block is NOT dropped (the regression: text sharing a message id
-    // with a tool_use used to be emitted into the void).
+    // thinking + text are NOT dropped, and appear in transcript order.
     assert.deepEqual(
       aChildren.map(s => s.attributes[ATTR.OPERATION_NAME]),
-      [OP.ASSISTANT_TEXT],
-      'assistant_text present',
+      [OP.THINKING, OP.ASSISTANT_TEXT],
+      'thinking then text, both present (the dropped-text regression)',
     );
-    // Stamped with its transcript line timestamp (so it sorts before the
-    // tool_use of the same response, whose live span starts later).
-    assert.equal(isoOf(aChildren[0].startTime), '2026-01-01T00:00:02.000Z');
+    // Each child is stamped with its transcript line timestamp (so it sorts
+    // before the tool_use of the same response, whose live span starts later).
+    assert.equal(isoOf(aChildren[0].startTime), '2026-01-01T00:00:01.000Z');
+    assert.equal(isoOf(aChildren[1].startTime), '2026-01-01T00:00:02.000Z');
 
     // Usage counted ONCE for the response (not 3x for the 3 split lines).
     assert.equal(chatA.attributes[ATTR.USAGE_OUTPUT_TOKENS], 1508);
