@@ -39,24 +39,18 @@ function baseArgs(agentName: string) {
   };
 }
 
-test('startTurnSpan: custom agentName drives span name and gen_ai.agent.name', async () => {
+test('startTurnSpan: agentName drives the span name and gen_ai.agent.name', async () => {
   const { tracer, exporter, provider } = setupTracer();
 
-  startTurnSpan(tracer, baseArgs('my-custom-agent')).end();
+  // A custom name and the default both flow through identically.
+  for (const name of ['my-custom-agent', AGENT_NAME_CLAUDE_CODE]) {
+    startTurnSpan(tracer, baseArgs(name)).end();
+  }
   await provider.forceFlush();
 
-  const span = exporter.getFinishedSpans().find(s => s.name === 'invoke_agent my-custom-agent');
-  assert.ok(span, 'span name must embed the custom agent name');
-  assert.equal(span.attributes[ATTR.AGENT_NAME], 'my-custom-agent');
-});
-
-test('startTurnSpan: default agent name still works', async () => {
-  const { tracer, exporter, provider } = setupTracer();
-
-  startTurnSpan(tracer, baseArgs(AGENT_NAME_CLAUDE_CODE)).end();
-  await provider.forceFlush();
-
-  const span = exporter.getFinishedSpans().find(s => s.name === 'invoke_agent claude-code');
-  assert.ok(span);
-  assert.equal(span.attributes[ATTR.AGENT_NAME], 'claude-code');
+  for (const name of ['my-custom-agent', AGENT_NAME_CLAUDE_CODE]) {
+    const span = exporter.getFinishedSpans().find(s => s.name === `invoke_agent ${name}`);
+    assert.ok(span, `span name must embed the agent name "${name}"`);
+    assert.equal(span.attributes[ATTR.AGENT_NAME], name);
+  }
 });

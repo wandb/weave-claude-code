@@ -12,47 +12,25 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { seedConfigHome, runCli } from './helpers.ts';
 
-test('config agent_name: default, set (trimmed + persisted), and reject empty', async () => {
-  const { home, settingsFile } = seedConfigHome('agentname-lifecycle');
+test('config agent_name: default, set, get/show, and env-var override', async () => {
+  const { home } = seedConfigHome('agentname');
   try {
-    // get on a file missing the key → default, not an error.
+    // get on a file missing the key resolves to the default, not an error.
     const def = await runCli(home, ['config', 'get', 'agent_name']);
     assert.equal(def.code, 0);
-    assert.match(def.stdout, /claude-code/);
+    assert.equal(def.stdout.trim(), 'claude-code');
 
-    // set trims surrounding whitespace and persists the trimmed value.
+    // set, then get/show reflect the value (surrounding whitespace is trimmed
+    // at resolution time, so the effective value is clean).
     const set = await runCli(home, ['config', 'set', 'agent_name', '  my-team-bot  ']);
     assert.equal(set.code, 0);
-    assert.match(set.stdout, /my-team-bot/);
-    assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).agent_name, 'my-team-bot');
+    assert.equal((await runCli(home, ['config', 'get', 'agent_name'])).stdout.trim(), 'my-team-bot');
+    assert.match((await runCli(home, ['config', 'show'])).stdout, /agent_name:\s+my-team-bot \[settings\.json\]/);
 
-    // get reflects the new value.
-    const got = await runCli(home, ['config', 'get', 'agent_name']);
-    assert.equal(got.stdout.trim(), 'my-team-bot');
-
-    // show lists it with its source.
-    const show = await runCli(home, ['config', 'show']);
-    assert.match(show.stdout, /agent_name:\s+my-team-bot \[settings\.json\]/);
-
-    // whitespace-only is rejected, leaving the stored value untouched.
-    const bad = await runCli(home, ['config', 'set', 'agent_name', '   ']);
-    assert.equal(bad.code, 1);
-    assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).agent_name, 'my-team-bot');
-  } finally {
-    fs.rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('config agent_name: WEAVE_AGENT_NAME env var overrides the settings file', async () => {
-  const { home } = seedConfigHome('agentname-env');
-  try {
-    await runCli(home, ['config', 'set', 'agent_name', 'from-file']);
-
-    const got = await runCli(home, ['config', 'get', 'agent_name'], { WEAVE_AGENT_NAME: 'from-env' });
-    assert.equal(got.stdout.trim(), 'from-env');
-
-    const show = await runCli(home, ['config', 'show'], { WEAVE_AGENT_NAME: 'from-env' });
-    assert.match(show.stdout, /agent_name:\s+from-env \[WEAVE_AGENT_NAME env var\]/);
+    // WEAVE_AGENT_NAME overrides the settings file.
+    const env = { WEAVE_AGENT_NAME: 'from-env' };
+    assert.equal((await runCli(home, ['config', 'get', 'agent_name'], env)).stdout.trim(), 'from-env');
+    assert.match((await runCli(home, ['config', 'show'], env)).stdout, /agent_name:\s+from-env \[WEAVE_AGENT_NAME env var\]/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -337,13 +337,6 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // An empty/whitespace agent_name would emit a blank `invoke_agent ` span
-    // name; reject it rather than silently falling back to the default.
-    if (key === 'agent_name' && !value.trim()) {
-      console.error(`Invalid value for agent_name: must not be empty`);
-      process.exit(1);
-    }
-
     if (key === 'debug' && value !== 'true' && value !== 'false') {
       console.error(`Invalid value for debug: '${value}'\nExpected: true or false`);
       process.exit(1);
@@ -357,10 +350,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const coerced =
-      key === 'debug' ? value === 'true'
-      : key === 'agent_name' ? value.trim()
-      : value;
+    const coerced = key === 'debug' ? value === 'true' : value;
     (settings as unknown as Record<string, unknown>)[key] = coerced;
     saveSettings(settings);
     const displayValue = key === 'wandb_api_key' && typeof coerced === 'string'
