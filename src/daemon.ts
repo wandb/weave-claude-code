@@ -32,6 +32,7 @@ import {
   startChatSpan,
   finalizeChatSpan,
   emitAssistantTextSpan,
+  emitThinkingSpan,
   emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
@@ -74,7 +75,7 @@ interface PendingToolCall {
 /** Tracks the chat span currently open for a single assistant API response.
  *  Tool spans for that response parent here so the trace tree shows the
  *  model's interleaved text → tool_use → text order. The response's
- *  text children are emitted when the span is finalized (at the next
+ *  text/thinking children are emitted when the span is finalized (at the next
  *  response transition or at Stop), once all its split transcript lines are
  *  present. */
 interface ActiveChatSpan {
@@ -851,9 +852,9 @@ export class GlobalDaemon {
     // (the firing prompt) and matching by sha256 + subagent_type.
     // For the main agent, advance the chat-span machine: find the assistant
     // response containing this tool_use, ensure its chat span is open, and
-    // parent the tool span under it. (The response's text children are emitted
-    // when the chat span is finalized, not here.) Subagents keep flat parenting
-    // under the invoke_agent span (subagent chat spans are emitted at
+    // parent the tool span under it. (The response's text/thinking children are
+    // emitted when the chat span is finalized, not here.) Subagents keep flat
+    // parenting under the invoke_agent span (subagent chat spans are emitted at
     // SubagentStop / TeammateIdle, where the full transcript is available).
     let toolParent: Span = parentSpan;
     if (!agentId) {
@@ -981,7 +982,7 @@ export class GlobalDaemon {
 
   /**
    * Emit a complete chat span for one assistant API response `key`. Emits each
-   * of the response's split transcript lines' text blocks as children
+   * of the response's split transcript lines' text/thinking blocks as children
    * stamped with that line's timestamp, so they sort into transcript order
    * among the sibling `execute_tool` spans, which carry live PreToolUse times
    * on the same wall clock. Usage is taken once from the response (the split
@@ -1030,9 +1031,9 @@ export class GlobalDaemon {
     session.emittedChatSpanResponseKeys.add(key);
   }
 
-  /** Emit `assistant_text` spans for the text blocks in `blocks`, each stamped
-   *  at `ts`. tool_use blocks are skipped; they render as their own live
-   *  `execute_tool` spans. */
+  /** Emit `assistant_text` / `thinking` spans for the text/thinking blocks in
+   *  `blocks`, each stamped at `ts`. tool_use blocks are skipped; they render
+   *  as their own live `execute_tool` spans. */
   private emitContentBlocks(
     parent: Span,
     blocks: unknown[],
@@ -1047,6 +1048,11 @@ export class GlobalDaemon {
         const text = block['text'];
         if (typeof text === 'string' && text.trim()) {
           emitAssistantTextSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
+        }
+      } else if (block['type'] === 'thinking') {
+        const text = block['thinking'];
+        if (typeof text === 'string' && text.trim()) {
+          emitThinkingSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
         }
       }
     }
@@ -1586,7 +1592,7 @@ export class GlobalDaemon {
 
     // Finalize the chat-span state machine for this turn.
     //   - The active chat span (open during PreToolUse) gets its trailing
-    //     text children plus its usage attrs, then ends.
+    //     text/thinking children plus its usage attrs, then ends.
     //   - Assistant calls that never triggered a PreToolUse (final text-only
     //     message, or any other tool-less call) get a fresh chat span emitted
     //     here with their full content as children.
