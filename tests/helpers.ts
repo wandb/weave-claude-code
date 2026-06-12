@@ -7,8 +7,10 @@
 // (install-source-local.test.ts) needed the same helper.
 
 import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { MARKETPLACE_NAME } from '../src/setup.ts';
@@ -90,4 +92,109 @@ export function writeKnownMarketplace(home: string, source: Record<string, unkno
       },
     }),
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daemon integration harness
+//
+// Spawns the real daemon (via tsx) in a throwaway $HOME, talks to it over its
+// UNIX socket, and reads its debug log. WANDB_BASE_URL points at a refused port
+// so the OTel exporter never reaches real wandb.ai. Used by the daemon-lifecycle
+// tests (session reconstruction, in-flight idle hold, startup race).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Poll `pred` until it returns true or `timeoutMs` elapses. Resolves to the
+ *  final value of `pred` (true if the condition was met, false on timeout). */
+export async function waitUntil(pred: () => boolean, timeoutMs = 3000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (pred()) return true;
+    await delay(25);
+  }
+  return pred();
+}
+
+export interface TestDaemon {
+  home: string;
+  socketPath: string;
+  logPath: string;
+  proc: ChildProcess;
+  /** Open a connection, write one JSON payload, resolve when the socket closes. */
+  send(payload: object): Promise<void>;
+  readLog(): string;
+  /** Resolve true once the log matches `re`, false on timeout. */
+  waitForLog(re: RegExp, timeoutMs?: number): Promise<boolean>;
+  /** Resolve true once the daemon process has exited, false on timeout. */
+  waitForExit(timeoutMs?: number): Promise<boolean>;
+  hasExited(): boolean;
+  /** Kill the daemon (if alive) and remove its throwaway home. */
+  stop(): Promise<void>;
+}
+
+/**
+ * Start a daemon in a throwaway home and wait until its socket is accepting.
+ * `opts.settings` is merged into the generated settings.json; `opts.env` into
+ * the daemon's environment (e.g. WEAVE_INACTIVITY_MS).
+ */
+export async function startTestDaemon(
+  opts: { settings?: Record<string, unknown>; env?: Record<string, string> } = {},
+): Promise<TestDaemon> {
+  const home = fs.mkdtempSync(path.join(os.homedir(), '.weave-daemontest-'));
+  const configDir = path.join(home, '.weave-claude-code');
+  const socketPath = path.join(configDir, 'daemon.sock');
+  const logPath = path.join(configDir, 'logs', 'daemon.log');
+  fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'settings.json'),
+    JSON.stringify({
+      weave_project: 'test/test',
+      wandb_api_key: 'fake-key-for-test',
+      daemon_socket: socketPath,
+      log_file: logPath,
+      debug: true,
+      ...opts.settings,
+    }),
+  );
+
+  const proc = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
+    env: { ...process.env, HOME: home, WANDB_BASE_URL: 'http://127.0.0.1:1', ...opts.env },
+    stdio: 'ignore',
+  });
+  let exited = false;
+  proc.once('exit', () => { exited = true; });
+
+  const readLog = (): string => (fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '');
+  const send = (payload: object): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const s = net.createConnection(socketPath);
+      s.on('error', reject);
+      s.on('connect', () => s.end(JSON.stringify(payload)));
+      s.on('close', () => resolve());
+    });
+
+  await waitUntil(() => fs.existsSync(socketPath), 5000);
+  await delay(150); // let listen() settle before the first send
+
+  return {
+    home,
+    socketPath,
+    logPath,
+    proc,
+    send,
+    readLog,
+    waitForLog: (re, timeoutMs = 3000) => waitUntil(() => re.test(readLog()), timeoutMs),
+    waitForExit: (timeoutMs = 3000) => waitUntil(() => exited, timeoutMs),
+    hasExited: () => exited,
+    stop: async () => {
+      if (!exited) {
+        try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+        await waitUntil(() => exited, 2000);
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    },
+  };
 }
