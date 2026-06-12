@@ -367,32 +367,10 @@ export class GlobalDaemon {
       this.log('INFO', 'No weave_project / API key configured — tracing disabled');
     }
 
-    // Herd prevention: probe the socket before removing it. Concurrent hook
-    // invocations can race the probe→spawn window and each start a daemon. If
-    // a live listener already owns the socket, yield — otherwise the late spawn
-    // would unlink the winner's socket and split the in-memory teamMembers map
-    // across processes, breaking cross-session nesting.
-    if (fs.existsSync(this.socketPath)) {
-      const alive = await new Promise<boolean>((resolve) => {
-        const probe = net.createConnection(this.socketPath);
-        probe.once('connect', () => { probe.destroy(); resolve(true); });
-        probe.once('error', () => resolve(false));
-      });
-      if (alive) {
-        this.log('INFO', 'Another daemon already owns the socket — exiting to avoid a herd');
-        process.exit(0);
-      }
-      fs.unlinkSync(this.socketPath);
-    }
-
-    // Restrict socket to owner-only access
-    const prevUmask = process.umask(0o077);
-    this.server = net.createServer((socket) => this.handleConnection(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.listen(this.socketPath, resolve);
-      this.server!.once('error', reject);
-    });
-    process.umask(prevUmask);
+    // Bind the socket, yielding cleanly if another daemon already owns it.
+    // Concurrent hook invocations can each cold-start a daemon, but only one
+    // can bind; the rest yield. See bindSocketWithHerdProtection.
+    await this.bindSocketWithHerdProtection();
 
     this.running = true;
     this.log('INFO', `Daemon started — socket: ${this.socketPath}`);
@@ -414,6 +392,70 @@ export class GlobalDaemon {
     // (env-overridden for tests) so a low WEAVE_INACTIVITY_MS is honored promptly.
     const checkEveryMs = Math.min(60_000, Math.max(500, Math.floor(this.inactivityMs / 4)));
     setInterval(() => this.checkInactivity(), checkEveryMs).unref();
+  }
+
+  /** Probe whether a live daemon is accepting connections on the socket. Uses a
+   *  real connect() attempt — the inode existing is not proof of a listener
+   *  (an ungraceful exit leaves a stale inode behind). */
+  private socketHasLiveListener(): Promise<boolean> {
+    if (!fs.existsSync(this.socketPath)) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const probe = net.createConnection(this.socketPath);
+      probe.once('connect', () => { probe.destroy(); resolve(true); });
+      probe.once('error', () => { probe.destroy(); resolve(false); });
+    });
+  }
+
+  /** Create a fresh server and listen once, resolving on success and rejecting
+   *  on the first listen error. A new server per attempt — one that errored on
+   *  listen cannot be reused. Socket is owner-only (umask 0o077). */
+  private listenOnce(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const prevUmask = process.umask(0o077);
+      const server = net.createServer((socket) => this.handleConnection(socket));
+      const onError = (err: Error) => { process.umask(prevUmask); reject(err); };
+      server.once('error', onError);
+      server.listen(this.socketPath, () => {
+        process.umask(prevUmask);
+        server.removeListener('error', onError);
+        this.server = server;
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Bind the daemon socket, tolerant of a herd of concurrent starts. Tries to
+   * listen; on EADDRINUSE/EEXIST it RE-PROBES the socket rather than blindly
+   * unlinking it:
+   *   - a LIVE listener means another daemon won the race → yield (exit 0);
+   *   - a STALE inode (ungraceful prior exit) is safe to remove → unlink, retry.
+   * Only a confirmed-stale socket is ever unlinked, so a late starter can never
+   * delete the winner's live socket (which would split the teamMembers map
+   * across two daemons and break cross-session nesting).
+   *
+   * Replaces the old existsSync→probe→unlink→listen sequence, which raced: two
+   * daemons that both saw no socket reached listen() together and the loser
+   * crashed with EEXIST/EADDRINUSE (exit 1) instead of yielding.
+   */
+  private async bindSocketWithHerdProtection(): Promise<void> {
+    const MAX_RECLAIM_ATTEMPTS = 5;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.listenOnce();
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EADDRINUSE' && code !== 'EEXIST') throw err;
+        if (await this.socketHasLiveListener()) {
+          this.log('INFO', 'Another daemon already owns the socket — exiting to avoid a herd');
+          process.exit(0);
+        }
+        // Stale inode from an ungraceful exit — reclaim it and retry.
+        if (attempt >= MAX_RECLAIM_ATTEMPTS) throw err;
+        try { fs.unlinkSync(this.socketPath); } catch { /* already cleaned; retry */ }
+      }
+    }
   }
 
   // ── tracer initialization ───────────────────────────────────────────────
