@@ -218,18 +218,27 @@ function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
 }
 
+/** Where the effective agent name came from. Parallels `WeaveProjectSource` /
+ *  `ApiKeySource`; has no `NotSet` member because agent_name always resolves
+ *  to the built-in default. */
+enum AgentNameSource {
+  EnvVar = 'WEAVE_AGENT_NAME env var',
+  Settings = 'settings.json',
+  Default = 'default',
+}
+
 /**
  * Resolve the effective top-level agent name and where it came from. Mirrors
  * the env-over-settings precedence used for `weave_project`, with the
  * hardcoded `AGENT_NAME_CLAUDE_CODE` as the final fallback. Shared by
  * `config show` and `config get` so both report the same value.
  */
-function resolveAgentName(settings: Settings): { value: string; source: string } {
+function resolveAgentName(settings: Settings): { value: string; source: AgentNameSource } {
   const fromEnv = process.env['WEAVE_AGENT_NAME']?.trim();
-  if (fromEnv) return { value: fromEnv, source: 'WEAVE_AGENT_NAME env var' };
+  if (fromEnv) return { value: fromEnv, source: AgentNameSource.EnvVar };
   const fromSettings = settings.agent_name?.trim();
-  if (fromSettings) return { value: fromSettings, source: 'settings.json' };
-  return { value: AGENT_NAME_CLAUDE_CODE, source: 'default' };
+  if (fromSettings) return { value: fromSettings, source: AgentNameSource.Settings };
+  return { value: AGENT_NAME_CLAUDE_CODE, source: AgentNameSource.Default };
 }
 
 async function cmdConfig(args: string[]): Promise<void> {

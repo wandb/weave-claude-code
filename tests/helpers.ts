@@ -8,8 +8,56 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { MARKETPLACE_NAME } from '../src/setup.ts';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..');
+const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
+
+/**
+ * Create a throwaway $HOME with a minimal `settings.json` for exercising
+ * `config` subcommands. The seed deliberately omits `agent_name` so tests can
+ * verify resolution on settings files written before that field existed.
+ */
+export function seedConfigHome(label: string): { home: string; settingsFile: string } {
+  const home = fs.mkdtempSync(`/tmp/wcp-${label}-`);
+  const dir = path.join(home, '.weave-claude-code');
+  fs.mkdirSync(path.join(dir, 'logs'), { recursive: true });
+  const settingsFile = path.join(dir, 'settings.json');
+  fs.writeFileSync(settingsFile, JSON.stringify({
+    log_file: path.join(dir, 'logs', 'daemon.log'),
+    daemon_socket: path.join(dir, 'daemon.sock'),
+    weave_project: null,
+    wandb_api_key: null,
+    debug: false,
+    installed_at: '2026-01-01T00:00:00Z',
+    version: '0.0.0-test',
+  }));
+  return { home, settingsFile };
+}
+
+/**
+ * Run the CLI (via tsx) against a throwaway $HOME, capturing stdout and exit
+ * code. Inherited credential/agent env vars are stripped so tests start from a
+ * clean slate; `extraEnv` is applied last so a test can opt back into one.
+ */
+export function runCli(home: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ stdout: string; code: number | null }> {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env, HOME: home };
+    delete env.WANDB_API_KEY;
+    delete env.WEAVE_PROJECT;
+    delete env.WEAVE_AGENT_NAME;
+    Object.assign(env, extraEnv);
+    const child = spawn(process.execPath, ['--import', 'tsx', CLI, ...args], { cwd: REPO_ROOT, env });
+    let stdout = '';
+    child.stdout.on('data', (b) => { stdout += b.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve({ stdout, code }));
+  });
+}
 
 /**
  * Read the call log written by the fake `claude` CLI fixture

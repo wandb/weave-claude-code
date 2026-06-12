@@ -433,6 +433,8 @@ export class GlobalDaemon {
     }
 
     const resource = resourceFromAttributes({
+      // service.name has always mirrored the agent name; keep that coupling
+      // so a custom agent_name renames the OTel service too.
       'service.name': this.agentName,
       'service.version': VERSION,
       'wandb.entity': entity,
