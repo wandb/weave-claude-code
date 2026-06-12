@@ -29,6 +29,10 @@ import {
   startTurnSpan,
   startToolSpan,
   startInvokeAgentSpan,
+  startChatSpan,
+  finalizeChatSpan,
+  emitAssistantTextSpan,
+  emitThinkingSpan,
   emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
@@ -37,6 +41,7 @@ import {
   promptSnippet,
   jsonStr,
 } from './genaiSpans.js';
+import type { AssistantCallDetail } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -67,6 +72,19 @@ interface PendingToolCall {
   permissionRequested?: boolean;
 }
 
+/** Tracks the chat span currently open for a single assistant API response.
+ *  Tool spans for that response parent here so the trace tree shows the
+ *  model's interleaved text → tool_use → text order. The response's
+ *  text/thinking children are emitted when the span is finalized (at the next
+ *  response transition or at Stop), once all its split transcript lines are
+ *  present. */
+interface ActiveChatSpan {
+  /** Response key (Anthropic `message.id`, or index fallback) this chat span
+   *  represents; see `chatMessageKey`. */
+  responseKey: string;
+  span: Span;
+}
+
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
@@ -80,6 +98,55 @@ function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean)
  *  the subagent's SubagentStart by matching transcript content. */
 function hashPrompt(prompt: string): string {
   return createHash('sha256').update(prompt, 'utf8').digest('hex');
+}
+
+/** Stable identity for an assistant API call within a turn. Anthropic returns
+ *  a `message.id` on every response; that's the primary key. When it's
+ *  missing (legacy transcripts), fall back to the index, which is stable
+ *  within a single parse + turn. */
+function chatMessageKey(call: AssistantCallDetail, callIdx: number): string {
+  return call.responseId ?? `idx:${callIdx}`;
+}
+
+/** All calls belonging to one assistant API response, in transcript order.
+ *  Claude Code splits a single response's thinking / text / tool_use blocks
+ *  across separate transcript lines that share a `message.id`; the parser maps
+ *  each line to its own `AssistantCallDetail`, so this regroups them by key. */
+function callsForResponseKey(
+  calls: AssistantCallDetail[],
+  key: string,
+): AssistantCallDetail[] {
+  const group: AssistantCallDetail[] = [];
+  for (let i = 0; i < calls.length; i++) {
+    if (chatMessageKey(calls[i], i) === key) group.push(calls[i]);
+  }
+  return group;
+}
+
+/** Find the response key of the assistant call whose content contains a
+ *  `tool_use` block with `toolUseId`, or undefined if not found (transcript
+ *  not flushed yet, or unknown id). */
+function findToolUseResponseKey(
+  calls: AssistantCallDetail[],
+  toolUseId: string,
+): string | undefined {
+  for (let ci = 0; ci < calls.length; ci++) {
+    for (const raw of calls[ci].contentBlocks) {
+      const b = raw as Record<string, unknown> | undefined;
+      if (b && typeof b === 'object' && b['type'] === 'tool_use' && b['id'] === toolUseId) {
+        return chatMessageKey(calls[ci], ci);
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseIsoOrNow(ts: string | undefined): Date {
+  if (ts) {
+    const d = new Date(ts);
+    if (Number.isFinite(d.getTime())) return d;
+  }
+  return new Date();
 }
 
 /**
@@ -235,6 +302,16 @@ interface SessionState {
 
   pendingToolCalls: Map<string, PendingToolCall>;
   subagents: SubagentTracking;
+
+  /** Chat span currently open for an in-progress assistant API call. Tool
+   *  spans from PreToolUse parent here; finalized at Stop or on transition
+   *  to the next API call. Cleared at Stop. */
+  activeChatSpan?: ActiveChatSpan;
+  /** Message ids of assistant calls in the current turn for which a chat
+   *  span has been opened (open or already finalized). Stop uses this to
+   *  identify calls that need a chat span emitted from scratch (calls with
+   *  no tool_use blocks never triggered PreToolUse). Reset per turn. */
+  emittedChatSpanMessageIds: Set<string>;
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
@@ -610,6 +687,7 @@ export class GlobalDaemon {
       toolCounts: {},
       pendingToolCalls: new Map(),
       subagents: new SubagentTracking(),
+      emittedChatSpanMessageIds: new Set(),
     });
 
     const resumed = conversationId !== sessionId;
@@ -711,6 +789,7 @@ export class GlobalDaemon {
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
+    session.emittedChatSpanMessageIds.clear();
     const turnSpan = startTurnSpan(this.tracer, {
       sessionId: session.sessionId,
       conversationId: session.conversationId,
@@ -767,10 +846,22 @@ export class GlobalDaemon {
     // `promptHash` lets SubagentStart correlate this tracker to the right
     // subagent deterministically by reading the subagent transcript's line 1
     // (the firing prompt) and matching by sha256 + subagent_type.
+    // For the main agent, advance the chat-span machine: locate the assistant
+    // message containing this tool_use, emit any text/thinking blocks that
+    // precede it as children of the chat span, and use that chat span as the
+    // parent of the tool span below. Subagents keep flat parenting under the
+    // invoke_agent span (subagent chat spans are emitted at SubagentStop /
+    // TeammateIdle, where the full transcript is available).
+    let toolParent: Span = parentSpan;
+    if (!agentId) {
+      const advanced = this.advanceMainAgentChatSpan(session, toolUseId);
+      if (advanced) toolParent = advanced;
+    }
+
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
-      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, parentSpan, {
+      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, toolParent, {
         agentType: subagentType,
         conversationId: session.conversationId,
         pluginVersion: VERSION,
@@ -811,13 +902,156 @@ export class GlobalDaemon {
       return;
     }
 
-    const toolSpan = startToolSpan(this.tracer, parentSpan, {
+    const toolSpan = startToolSpan(this.tracer, toolParent, {
       toolName,
       toolUseId,
       toolInput,
       displayName: toolDisplayName(toolName, toolInput),
     });
     session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
+  }
+
+  /**
+   * Open (or reuse) the chat span for the assistant API response that produced
+   * `toolUseId`, so the tool span can parent under it. Reads the transcript to
+   * find which response the tool_use belongs to; on a transition to a new
+   * response, finalizes the previous chat span first. Returns the chat span,
+   * or `undefined` if the transcript can't be located / parsed yet (caller
+   * falls back to the turn span).
+   *
+   * Text/thinking children are NOT emitted here; they're emitted when the
+   * chat span is finalized (next transition or Stop), once all of the
+   * response's split transcript lines are present and can be stamped with
+   * their real timestamps. (Claude Code writes each content block as its own
+   * transcript line sharing a `message.id`; at PreToolUse the trailing lines
+   * may not be flushed yet.)
+   */
+  private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
+    if (!this.tracer || !session.currentTurnSpan) return undefined;
+
+    let fd: number;
+    try {
+      fd = session.transcript.getFd();
+    } catch {
+      return undefined;
+    }
+    const parsed = parseSessionFd(fd);
+    if (!parsed) return undefined;
+    const lastTurn = parsed.turns[parsed.turns.length - 1];
+    if (!lastTurn) return undefined;
+    const calls = lastTurn.assistantCalls();
+    const key = findToolUseResponseKey(calls, toolUseId);
+    if (!key) {
+      // Transcript writer hasn't flushed the assistant message yet. Fall back
+      // to the turn span.
+      return undefined;
+    }
+
+    // Transition to a new API response: finalize the previous chat span first.
+    if (session.activeChatSpan && session.activeChatSpan.responseKey !== key) {
+      this.finalizeActiveChatSpan(session, calls);
+    }
+
+    if (!session.activeChatSpan) {
+      const group = callsForResponseKey(calls, key);
+      const first = group[0];
+      const span = startChatSpan(this.tracer, session.currentTurnSpan, {
+        conversationId: session.conversationId,
+        model: group.map(c => c.model).find(Boolean),
+        startedAt: parseIsoOrNow(first?.prevTimestamp ?? first?.timestamp),
+      });
+      session.activeChatSpan = { responseKey: key, span };
+      session.emittedChatSpanMessageIds.add(key);
+    }
+
+    return session.activeChatSpan.span;
+  }
+
+  /** Finalize `session.activeChatSpan` from the current transcript and clear it. */
+  private finalizeActiveChatSpan(session: SessionState, calls: AssistantCallDetail[]): void {
+    const active = session.activeChatSpan;
+    if (!active) return;
+    this.emitChatSpanForResponse(session, calls, active.responseKey, active.span);
+    session.activeChatSpan = undefined;
+  }
+
+  /**
+   * Emit a complete chat span for one assistant API response `key`. Emits each
+   * of the response's split transcript lines' text/thinking blocks as children
+   * stamped with that line's timestamp, so they sort into transcript order
+   * among the sibling `execute_tool` spans, which carry live PreToolUse times
+   * on the same wall clock. Usage is taken once from the response (the split
+   * lines duplicate the message usage, so it must not be summed), then the span
+   * is ended. Reuses `existingSpan` when the span was already opened during
+   * PreToolUse; otherwise opens a fresh one under the turn span.
+   */
+  private emitChatSpanForResponse(
+    session: SessionState,
+    calls: AssistantCallDetail[],
+    key: string,
+    existingSpan?: Span,
+  ): void {
+    if (!this.tracer || !session.currentTurnSpan) return;
+    const group = callsForResponseKey(calls, key);
+    if (group.length === 0) {
+      existingSpan?.end();
+      return;
+    }
+
+    const model = group.map(c => c.model).find(Boolean);
+    const span = existingSpan ?? startChatSpan(this.tracer, session.currentTurnSpan, {
+      conversationId: session.conversationId,
+      model,
+      startedAt: parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp),
+    });
+
+    for (const call of group) {
+      this.emitContentBlocks(span, call.contentBlocks, parseIsoOrNow(call.timestamp), session.conversationId);
+    }
+
+    // Usage is identical across the response's split lines (each carries the
+    // full message usage), so take it from the last line, which also carries
+    // the stop_reason, rather than summing.
+    const last = group[group.length - 1];
+    const finishReason = group.map(c => c.finishReason).find(Boolean);
+    const parts = group.flatMap(c => c.contentBlocks);
+    finalizeChatSpan(span, {
+      usage: last.usage,
+      reasoningTokens: last.reasoningTokens,
+      responseId: last.responseId,
+      finishReasons: finishReason ? [finishReason] : undefined,
+      model,
+      outputMessages: parts.length ? [{ role: 'assistant', parts }] : undefined,
+      endedAt: parseIsoOrNow(last.timestamp),
+    });
+    session.emittedChatSpanMessageIds.add(key);
+  }
+
+  /** Emit `assistant_text` / `thinking` spans for the text/thinking blocks in
+   *  `blocks`, each stamped at `ts`. tool_use blocks are skipped; they render
+   *  as their own live `execute_tool` spans. */
+  private emitContentBlocks(
+    parent: Span,
+    blocks: unknown[],
+    ts: Date,
+    conversationId: string,
+  ): void {
+    if (!this.tracer) return;
+    for (const raw of blocks) {
+      const block = raw as Record<string, unknown> | undefined;
+      if (!block || typeof block !== 'object') continue;
+      if (block['type'] === 'text') {
+        const text = block['text'];
+        if (typeof text === 'string' && text.trim()) {
+          emitAssistantTextSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
+        }
+      } else if (block['type'] === 'thinking') {
+        const text = block['thinking'];
+        if (typeof text === 'string' && text.trim()) {
+          emitThinkingSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
+        }
+      }
+    }
   }
 
   private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
@@ -1352,14 +1586,24 @@ export class GlobalDaemon {
       `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
     );
 
-    // Emit one chat span per LLM call within this turn
+    // Finalize the chat-span state machine for this turn.
+    //   - The active chat span (open during PreToolUse) gets its trailing
+    //     text/thinking children plus its usage attrs, then ends.
+    //   - Assistant calls that never triggered a PreToolUse (final text-only
+    //     message, or any other tool-less call) get a fresh chat span emitted
+    //     here with their full content as children.
     if (currentTurn) {
-      emitChatSpansFromAssistantCalls(
-        this.tracer,
-        session.currentTurnSpan,
-        session.conversationId,
-        currentTurn.assistantCalls(),
-      );
+      const calls = currentTurn.assistantCalls();
+      if (session.activeChatSpan) {
+        this.finalizeActiveChatSpan(session, calls);
+      }
+      // Emit a chat span for every response that never opened one during
+      // PreToolUse (tool-less responses, or any not yet emitted).
+      for (let i = 0; i < calls.length; i++) {
+        const key = chatMessageKey(calls[i], i);
+        if (session.emittedChatSpanMessageIds.has(key)) continue;
+        this.emitChatSpanForResponse(session, calls, key);
+      }
     }
 
     const parsedTexts = currentTurn?.textBlocks() ?? [];
@@ -1406,6 +1650,14 @@ export class GlobalDaemon {
       pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
       pending.span.end();
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
+    }
+
+    // Close any chat span left open mid-turn (Stop never fired).
+    if (session.activeChatSpan) {
+      session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.activeChatSpan.span.end();
+      session.activeChatSpan = undefined;
+      this.log('DEBUG', `Closed orphaned chat span`);
     }
 
     // Close the current turn if still open
