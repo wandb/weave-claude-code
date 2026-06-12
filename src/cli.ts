@@ -28,6 +28,7 @@ import {
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
+import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
 // Help
@@ -217,6 +218,29 @@ function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
 }
 
+/** Where the effective agent name came from. Parallels `WeaveProjectSource` /
+ *  `ApiKeySource`; has no `NotSet` member because agent_name always resolves
+ *  to the built-in default. */
+enum AgentNameSource {
+  EnvVar = 'WEAVE_AGENT_NAME env var',
+  Settings = 'settings.json',
+  Default = 'default',
+}
+
+/**
+ * Resolve the effective top-level agent name and where it came from. Mirrors
+ * the env-over-settings precedence used for `weave_project`, with the
+ * hardcoded `DEFAULT_AGENT_NAME` as the final fallback. Shared by
+ * `config show` and `config get` so both report the same value.
+ */
+function resolveAgentName(settings: Settings): { value: string; source: AgentNameSource } {
+  const fromEnv = process.env['WEAVE_AGENT_NAME']?.trim();
+  if (fromEnv) return { value: fromEnv, source: AgentNameSource.EnvVar };
+  const fromSettings = settings.agent_name?.trim();
+  if (fromSettings) return { value: fromSettings, source: AgentNameSource.Settings };
+  return { value: DEFAULT_AGENT_NAME, source: AgentNameSource.Default };
+}
+
 async function cmdConfig(args: string[]): Promise<void> {
   const action = args[0];
 
@@ -249,6 +273,8 @@ async function cmdConfig(args: string[]): Promise<void> {
     console.log(`  daemon_socket: ${settings.daemon_socket}`);
     console.log(`  weave_project: ${effectiveProject ?? '(not set)'} [${projectSource}]`);
     console.log(`  wandb_api_key: ${apiKeyDisplay}`);
+    const agentName = resolveAgentName(settings);
+    console.log(`  agent_name:    ${agentName.value} [${agentName.source}]`);
     console.log(`  debug:         ${!!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug} ${process.env['WEAVE_CLAUDE_DEBUG'] ? '[WEAVE_CLAUDE_DEBUG env var]' : ''}`);
     console.log(`  installed_at:  ${settings.installed_at}`);
     console.log(`  version:       ${settings.version}`);
@@ -267,6 +293,13 @@ async function cmdConfig(args: string[]): Promise<void> {
     } catch (err) {
       console.error(`✗ ${err}`);
       process.exit(1);
+    }
+    // agent_name resolves via env/default and may be absent from settings
+    // files written before the field existed, so handle it before the generic
+    // `undefined` → unknown-key check below.
+    if (key === 'agent_name') {
+      console.log(resolveAgentName(settings).value);
+      return;
     }
     const value = (settings as unknown as Record<string, unknown>)[key];
     if (value === undefined) {
@@ -293,7 +326,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const writableKeys = ['weave_project', 'wandb_api_key', 'daemon_socket', 'debug'];
+    const writableKeys = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug'];
     if (!writableKeys.includes(key)) {
       console.error(`Cannot set '${key}'. Writable keys: ${writableKeys.join(', ')}`);
       process.exit(1);

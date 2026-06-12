@@ -15,6 +15,11 @@ export interface Settings {
   log_file: string;
   weave_project: string | null;
   wandb_api_key: string | null;
+  /** Overrides the name shown in Weave's Agents view (the top-level agent).
+   *  null falls back to `DEFAULT_AGENT_NAME` ('claude-code'). Settings
+   *  written before this field existed read as undefined, which the daemon
+   *  treats identically to null. */
+  agent_name: string | null;
   debug: boolean;
   installed_at: string;
   version: string;
@@ -121,6 +126,7 @@ export function createConfig(configDir: string): ConfigResult {
     log_file: logFile,
     weave_project: null,
     wandb_api_key: null,
+    agent_name: null,
     debug: false,
     installed_at: new Date().toISOString(),
     version: VERSION,

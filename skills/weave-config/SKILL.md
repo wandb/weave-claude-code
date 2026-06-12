@@ -33,13 +33,15 @@ Writable keys:
 |-----|--------|---------|
 | `weave_project` | `entity/project` | `my-org/my-project` |
 | `wandb_api_key` | string | `abc123...` |
+| `agent_name` | string | `my-team-bot` |
 | `debug` | `true` / `false` | `true` |
 | `daemon_socket` | file path | `~/.weave-claude-code/daemon.sock` |
 
 **Validation notes:**
 - `weave_project` must contain a `/` (entity/project format). Find your entity name at https://wandb.ai.
 - `wandb_api_key` is available at https://wandb.ai/authorize.
-- Environment variables `WEAVE_PROJECT` and `WANDB_API_KEY` take precedence over settings file values when set.
+- `agent_name` is the name shown for the top-level agent in Weave's Agents view. It must not be empty; surrounding whitespace is trimmed. Defaults to `claude-code` when unset.
+- Environment variables `WEAVE_PROJECT`, `WANDB_API_KEY`, and `WEAVE_AGENT_NAME` take precedence over settings file values when set.
 
 ## Get a Single Value
 

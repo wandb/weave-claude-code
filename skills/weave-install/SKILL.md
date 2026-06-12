@@ -78,7 +78,15 @@ If `wandb_api_key` shows `(not set)` and no `WANDB_API_KEY` env var is active, a
 weave-claude-code config set wandb_api_key API_KEY
 ```
 
-## Step 5 — Verify
+## Step 5 - (Optional) Custom Agent Name
+
+Traces appear under the agent name `claude-code` in Weave's Agents view by default. If the user wants a custom name (e.g. to distinguish teams or projects), set it:
+```bash
+weave-claude-code config set agent_name CUSTOM_NAME
+```
+Skip this step unless the user asks; the default is fine for most users.
+
+## Step 6 - Verify
 
 ```bash
 weave-claude-code status
