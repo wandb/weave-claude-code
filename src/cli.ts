@@ -269,9 +269,18 @@ async function cmdConfig(args: string[]): Promise<void> {
         : ApiKeySource.NotSet;
     const apiKeyDisplay = effectiveApiKey ? `${maskSecret(effectiveApiKey)} [${apiKeySource}]` : `(not set)`;
 
+    // trace_mode: env override > settings > default 'daemon'.
+    const traceModeEnv = process.env['WEAVE_TRACE_MODE']?.trim();
+    const traceMode = traceModeEnv || settings.trace_mode || 'daemon';
+    const traceModeSource = traceModeEnv
+      ? '[WEAVE_TRACE_MODE env var]'
+      : settings.trace_mode ? '[settings]' : '[default]';
+    const socketNote = traceMode === 'session-end' ? ' (unused in session-end mode)' : '';
+
     console.log('Current configuration:');
+    console.log(`  trace_mode:    ${traceMode} ${traceModeSource}`);
     console.log(`  log_file:      ${settings.log_file}`);
-    console.log(`  daemon_socket: ${settings.daemon_socket}`);
+    console.log(`  daemon_socket: ${settings.daemon_socket}${socketNote}`);
     console.log(`  weave_project: ${effectiveProject ?? '(not set)'} [${projectSource}]`);
     console.log(`  wandb_api_key: ${apiKeyDisplay}`);
     const agentName = resolveAgentName(settings);
