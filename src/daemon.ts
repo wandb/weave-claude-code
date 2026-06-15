@@ -836,6 +836,10 @@ export class GlobalDaemon {
       return;
     }
 
+    // For the main agent, parent the tool span under its assistant response's
+    // chat span; subagents keep flat parenting under their invoke_agent span.
+    const toolParent = this.resolveMainAgentToolParent(session, agentId, toolUseId, parentSpan);
+
     // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
     // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
     // nested invoke_agent spans as their own `agent_start` lifecycle marker; an
@@ -846,18 +850,6 @@ export class GlobalDaemon {
     // `promptHash` lets SubagentStart correlate this tracker to the right
     // subagent deterministically by reading the subagent transcript's line 1
     // (the firing prompt) and matching by sha256 + subagent_type.
-    // For the main agent, advance the chat-span machine: find the assistant
-    // response containing this tool_use, ensure its chat span is open, and
-    // parent the tool span under it. (The response's text children are emitted
-    // when the chat span is finalized, not here.) Subagents keep flat parenting
-    // under the invoke_agent span (subagent chat spans are emitted at
-    // SubagentStop / TeammateIdle, where the full transcript is available).
-    let toolParent: Span = parentSpan;
-    if (!agentId) {
-      const advanced = this.advanceMainAgentChatSpan(session, toolUseId);
-      if (advanced) toolParent = advanced;
-    }
-
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
@@ -926,6 +918,28 @@ export class GlobalDaemon {
    * transcript line sharing a `message.id`; at PreToolUse the trailing lines
    * may not be flushed yet.)
    */
+  /**
+   * Parent span for a tool span emitted from PreToolUse. For the main agent,
+   * advance the chat-span machine — find the assistant response containing this
+   * tool_use, ensure its `chat` span is open, and return it so the tool span
+   * nests under it. (The response's text children are emitted when the chat
+   * span is finalized, not here.) Falls back to `fallback` (the turn span) when
+   * the machine can't advance yet, e.g. the transcript writer hasn't flushed
+   * the assistant message. Subagents keep flat parenting under their
+   * invoke_agent span — their chat spans are emitted at SubagentStop /
+   * TeammateIdle, where the full transcript is available — so they return
+   * `fallback` unchanged.
+   */
+  private resolveMainAgentToolParent(
+    session: SessionState,
+    agentId: string | undefined,
+    toolUseId: string,
+    fallback: Span,
+  ): Span {
+    if (agentId) return fallback;
+    return this.advanceMainAgentChatSpan(session, toolUseId) ?? fallback;
+  }
+
   private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
     if (!this.tracer || !session.currentTurnSpan) return undefined;
 

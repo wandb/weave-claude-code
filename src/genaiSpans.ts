@@ -101,6 +101,13 @@ export const ATTR = {
  */
 export const DEFAULT_AGENT_NAME = 'claude-code';
 
+// Values for `gen_ai.operation.name`. `invoke_agent`, `chat`, and
+// `execute_tool` are well-known values from the OTel GenAI semantic conventions
+// (https://opentelemetry.io/docs/specs/semconv/gen-ai/); the spec mandates the
+// well-known value whenever one applies. `assistant_text` has no well-known
+// equivalent, so it's a spec-permitted custom value: the model's
+// natural-language output, emitted as a `chat` child so it interleaves with
+// sibling `execute_tool` spans.
 export const OP = {
   INVOKE_AGENT: 'invoke_agent',
   CHAT: 'chat',
