@@ -168,6 +168,10 @@ export interface TurnSpanArgs {
   agentName: string;
   requestModel?: string;
   displayName?: string;
+  /** Real turn start time from the transcript; defaults to span-creation time
+   *  (the daemon path doesn't pass it). Lets the daemonless builder give the
+   *  turn span its actual duration instead of ~0. */
+  startedAt?: TimeInput;
 }
 
 /**
@@ -193,10 +197,33 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
   // No parent context — turn spans are roots, one trace per turn.
-  return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${args.agentName}`,
-    { kind: SpanKind.INTERNAL, attributes: attrs },
-  );
+  const opts: Parameters<Tracer['startSpan']>[1] = { kind: SpanKind.INTERNAL, attributes: attrs };
+  if (args.startedAt !== undefined) opts.startTime = args.startedAt;
+  return tracer.startSpan(`${OP.INVOKE_AGENT} ${args.agentName}`, opts);
+}
+
+/**
+ * Stamp aggregate token usage onto a span (turn root or sub-agent invoke_agent).
+ * The Agents view reads token totals + cache stats off these higher-level spans,
+ * not by summing chat children — without this they render as 0. `input_tokens`
+ * is the OTel total (uncached + cache_read + cache_creation), matching emitChatSpan.
+ */
+export function setUsageAttrs(span: Span, usage: UsageSummary, reasoningTokens?: number): void {
+  const totalInput =
+    usage.input_tokens
+    + (usage.cache_read_input_tokens ?? 0)
+    + (usage.cache_creation_input_tokens ?? 0);
+  span.setAttribute(ATTR.USAGE_INPUT_TOKENS, totalInput);
+  span.setAttribute(ATTR.USAGE_OUTPUT_TOKENS, usage.output_tokens);
+  if (usage.cache_read_input_tokens !== undefined) {
+    span.setAttribute(ATTR.USAGE_CACHE_READ_INPUT_TOKENS, usage.cache_read_input_tokens);
+  }
+  if (usage.cache_creation_input_tokens !== undefined) {
+    span.setAttribute(ATTR.USAGE_CACHE_CREATION_INPUT_TOKENS, usage.cache_creation_input_tokens);
+  }
+  if (reasoningTokens && reasoningTokens > 0) {
+    span.setAttribute(ATTR.USAGE_REASONING_TOKENS, reasoningTokens);
+  }
 }
 
 export interface InvokeAgentSpanArgs {
@@ -218,7 +245,12 @@ export interface InvokeAgentSpanArgs {
    *  back-pointer attribute so queries can correlate the subagent
    *  invocation with the spawning tool call. */
   spawningToolCallId?: string;
+  /** Subagent's own id (`gen_ai.agent.id`) — the daemonless builder reads it
+   *  from the `agent-<id>.jsonl` transcript filename. */
+  agentId?: string;
   displayName?: string;
+  /** Real subagent start time from its transcript; defaults to creation time. */
+  startedAt?: TimeInput;
 }
 
 /**
@@ -246,13 +278,12 @@ export function startInvokeAgentSpan(
   if (args.spawningToolCallId) {
     attrs[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID] = args.spawningToolCallId;
   }
+  if (args.agentId) attrs[ATTR.AGENT_ID] = args.agentId;
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
-  return tracer.startSpan(
-    `${OP.INVOKE_AGENT} ${args.agentType}`,
-    { kind: SpanKind.INTERNAL, attributes: attrs },
-    ctxWithParent(parentSpan),
-  );
+  const opts: Parameters<Tracer['startSpan']>[1] = { kind: SpanKind.INTERNAL, attributes: attrs };
+  if (args.startedAt !== undefined) opts.startTime = args.startedAt;
+  return tracer.startSpan(`${OP.INVOKE_AGENT} ${args.agentType}`, opts, ctxWithParent(parentSpan));
 }
 
 export interface ToolSpanArgs {

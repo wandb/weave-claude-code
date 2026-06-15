@@ -5,8 +5,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Span, SpanStatusCode, Tracer } from '@opentelemetry/api';
-import { parseSessionFile } from './parser.js';
-import type { ToolCallDetail } from './parser.js';
+import { addUsage, parseSessionFile } from './parser.js';
+import type { ToolCallDetail, UsageSummary } from './parser.js';
 import { isCwdInScope } from './utils.js';
 import {
   ATTR,
@@ -14,11 +14,19 @@ import {
   emitChatSpansFromAssistantCalls,
   jsonStr,
   promptSnippet,
+  setUsageAttrs,
   startInvokeAgentSpan,
   startToolSpan,
   startTurnSpan,
   toolDisplayName,
 } from './genaiSpans.js';
+
+/** Parse an ISO timestamp to a Date, or undefined if absent/invalid. */
+function toDate(ts: string | undefined): Date | undefined {
+  if (!ts) return undefined;
+  const d = new Date(ts);
+  return Number.isFinite(d.getTime()) ? d : undefined;
+}
 
 /**
  * Daemonless span builder. Walks a completed Claude Code transcript (and its
@@ -142,6 +150,13 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
     turnNumber += 1;
     const prompt = turn.prompt();
     const requestModel = turn.primaryModel();
+    const calls = turn.assistantCalls();
+    // Real turn timing from the transcript so the span has its actual duration
+    // (the Agents view reads session time off the turn root). Only use them when
+    // both ends are known, so we never pair a transcript start with a now() end.
+    const startedAt = toDate(calls[0]?.prevTimestamp) ?? toDate(calls[0]?.timestamp);
+    const endedAt = toDate(calls[calls.length - 1]?.timestamp);
+    const useTimes = startedAt !== undefined && endedAt !== undefined;
 
     const turnSpan = startTurnSpan(tracer, {
       sessionId: opts.sessionId,
@@ -154,10 +169,11 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
       agentName,
       requestModel,
       displayName: `Turn ${turnNumber}: ${promptSnippet(prompt)}`,
+      startedAt: useTimes ? startedAt : undefined,
     });
     lastTurnSpan = turnSpan;
 
-    emitChatSpansFromAssistantCalls(tracer, turnSpan, conversationId, turn.assistantCalls());
+    emitChatSpansFromAssistantCalls(tracer, turnSpan, conversationId, calls);
 
     let toolCount = 0;
     for (const tc of turn.toolCalls()) {
@@ -165,18 +181,19 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
       emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts);
     }
 
-    const finishReasons = turn
-      .assistantCalls()
-      .map(c => c.finishReason)
-      .filter((r): r is string => !!r);
+    const finishReasons = calls.map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons.length) turnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
     if (requestModel) turnSpan.setAttribute(ATTR.RESPONSE_MODEL, requestModel);
     turnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, toolCount);
+    // Aggregate token usage on the turn root — the Agents view reads totals here,
+    // not by summing chat children, so without this the turn shows 0 tokens.
+    const reasoning = calls.reduce((n, c) => n + (c.reasoningTokens ?? 0), 0);
+    setUsageAttrs(turnSpan, turn.totalUsage(), reasoning);
     const outText = turn.textBlocks().join('\n');
     if (outText) {
       turnSpan.setAttribute(ATTR.OUTPUT_MESSAGES, jsonStr([{ role: 'assistant', content: outText }]));
     }
-    turnSpan.end();
+    turnSpan.end(useTimes ? endedAt : undefined);
   }
 
   // Leftover pass: subagent transcripts not claimed by a spawning Agent call —
@@ -258,6 +275,11 @@ function emitToolCall(
     // Label the span with the matched teammate's identity when we found one, so
     // re-spawns key off the same type and nest together.
     const agentType = entry?.agentType ?? memberName ?? subType;
+    // gen_ai.agent.id — the subagent's id, read from its transcript filename
+    // (agent-<id>.jsonl). Empty otherwise (the daemon stamped it at runtime).
+    const agentId = entry
+      ? path.basename(entry.transcriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, '')
+      : undefined;
     const promptText = tc.toolInput['prompt'];
     const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
       agentType,
@@ -265,6 +287,7 @@ function emitToolCall(
       pluginVersion: opts.pluginVersion,
       inputMessages: promptText ? [{ role: 'user', content: promptText }] : undefined,
       spawningToolCallId: tc.toolUseId,
+      agentId,
       displayName: toolDisplayName('Agent', tc.toolInput),
     });
     lastInvokeByType.set(agentType, invokeSpan);
@@ -317,14 +340,19 @@ function emitAgentSubtree(
   const nestedOpen: Span[] = [];
 
   let model: string | undefined;
+  let usage: UsageSummary = { input_tokens: 0, output_tokens: 0 };
   for (const turn of parsed.turns) {
     emitChatSpansFromAssistantCalls(tracer, invokeSpan, conversationId, turn.assistantCalls());
     for (const tc of turn.toolCalls()) {
       emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts);
     }
     model = turn.primaryModel() ?? model;
+    usage = addUsage(usage, turn.totalUsage());
   }
   emitLeftoverSubagents(tracer, conversationId, nested, nestedLastInvoke, invokeSpan, nestedOpen, opts);
   for (const s of nestedOpen) s.end();
   if (model) invokeSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+  // Aggregate the subagent's token usage onto its invoke_agent span (so the
+  // sub-agent rolls up tokens too, not just the coordinator turn).
+  setUsageAttrs(invokeSpan, usage);
 }

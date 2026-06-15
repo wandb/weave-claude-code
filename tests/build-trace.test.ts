@@ -253,6 +253,34 @@ test('buildTrace: multi-turn top-level produces one invoke_agent root per turn',
   }
 });
 
+test('buildTrace: turn root carries aggregate usage and real duration', () => {
+  const { tracer, exporter, provider } = setup();
+  const { transcriptPath, dir } = makeSession([
+    { type: 'user', message: { role: 'user', content: 'hi' }, timestamp: '2026-01-01T00:00:00Z' },
+    {
+      type: 'assistant', timestamp: '2026-01-01T00:00:05Z',
+      message: {
+        role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn',
+        usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 30, cache_creation_input_tokens: 10 },
+        content: [{ type: 'text', text: 'done' }],
+      },
+    },
+  ]);
+  try {
+    buildTrace(tracer, transcriptPath, OPTS);
+    provider.forceFlush();
+    const turn = exporter.getFinishedSpans().find(s => s.name === 'invoke_agent tars')!;
+    // input_tokens = 100 + 30 + 10 = 140 (OTel total); output = 20.
+    assert.equal(turn.attributes[ATTR.USAGE_INPUT_TOKENS], 140, 'aggregate input tokens on turn root');
+    assert.equal(turn.attributes[ATTR.USAGE_OUTPUT_TOKENS], 20, 'aggregate output tokens on turn root');
+    // Real duration from transcript (prevTimestamp 00:00 → 00:05 = 5s), not ~0.
+    const durMs = (turn.endTime[0] * 1e3 + turn.endTime[1] / 1e6) - (turn.startTime[0] * 1e3 + turn.startTime[1] / 1e6);
+    assert.ok(durMs >= 4000, `turn span should span ~5s, got ${durMs}ms`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('buildTrace: out-of-scope cwd emits nothing (traceRoots gate)', () => {
   const { tracer, exporter, provider } = setup();
   const { transcriptPath, dir } = makeSession([
