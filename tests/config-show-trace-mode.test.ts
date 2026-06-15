@@ -9,10 +9,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runCli, seedConfigHome } from './helpers.ts';
 
-test('config show: legacy settings (no trace_mode) report the daemon default', async () => {
+test('config show: legacy settings (no trace_mode) report the daemon default + no daemon running', async () => {
   const { home } = seedConfigHome('trace-mode-default');
   const { stdout } = await runCli(home, ['config', 'show']);
   assert.match(stdout, /trace_mode:\s+daemon \[default\]/);
+  // No daemon listening on the throwaway socket path → reported as not running.
+  assert.match(stdout, /daemon_socket:.*\(no daemon running\)/);
 });
 
 test('config show: trace_mode=session-end is displayed and the socket is flagged unused', async () => {

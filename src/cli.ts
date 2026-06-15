@@ -275,7 +275,17 @@ async function cmdConfig(args: string[]): Promise<void> {
     const traceModeSource = traceModeEnv
       ? '[WEAVE_TRACE_MODE env var]'
       : settings.trace_mode ? '[settings]' : '[default]';
-    const socketNote = traceMode === 'session-end' ? ' (unused in session-end mode)' : '';
+    // Annotate the socket with live daemon state so it's clear whether a daemon
+    // is actually running (the path alone is just config). In session-end mode
+    // the socket is inert.
+    let socketNote = ' (unused in session-end mode)';
+    if (traceMode !== 'session-end') {
+      const st = await probeUnixSocket(settings.daemon_socket);
+      socketNote =
+        st === SocketState.Alive ? ' (daemon running)'
+        : st === SocketState.Stale ? ' (stale socket — daemon not responding)'
+        : ' (no daemon running)';
+    }
 
     console.log('Current configuration:');
     console.log(`  trace_mode:    ${traceMode} ${traceModeSource}`);
