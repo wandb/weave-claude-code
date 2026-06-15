@@ -8,6 +8,29 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { spawnSync } from 'child_process';
 
+/**
+ * Decide whether a session whose working directory is `cwd` should be traced,
+ * given a `traceRoots` allowlist of absolute repo paths.
+ *
+ * - Empty `traceRoots` ⇒ global: every session is in scope. This is the
+ *   default and keeps existing (machine-wide) behavior unchanged.
+ * - Non-empty ⇒ in scope only if `cwd` is at or under one of the roots.
+ * - Fail closed: with roots set but an empty/missing `cwd`, returns false —
+ *   we can't prove the session belongs to a traced repo, so we don't trace it.
+ *
+ * Matching is by resolved-path boundary, so `/repo` matches `/repo` and
+ * `/repo/sub` but NOT `/repo-sibling`.
+ */
+export function isCwdInScope(cwd: string, traceRoots: string[]): boolean {
+  if (traceRoots.length === 0) return true;
+  if (!cwd) return false;
+  const resolved = path.resolve(cwd);
+  return traceRoots.some((root) => {
+    const r = path.resolve(root);
+    return resolved === r || resolved.startsWith(r + path.sep);
+  });
+}
+
 export function prompt(question: string): Promise<string> {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

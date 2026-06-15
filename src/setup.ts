@@ -24,6 +24,12 @@ export interface Settings {
   installed_at: string;
   version: string;
   daemon_socket: string;
+  /** Tracing strategy. `daemon` (default) uses the persistent daemon.
+   *  `session-end` is the daemonless path: a SessionEnd hook reconstructs the
+   *  full span tree from the transcript in one pass and uploads — no daemon,
+   *  no socket. Settings written before this field existed read as undefined,
+   *  treated as `daemon`. */
+  trace_mode?: 'daemon' | 'session-end';
 }
 
 export interface ConfigResult {
@@ -122,15 +128,29 @@ export function createConfig(configDir: string): ConfigResult {
 
   fs.mkdirSync(logDir, { recursive: true });
 
+  // Re-running `install` must NOT wipe an existing config: read what's there
+  // and preserve every user-controllable field (weave_project, wandb_api_key,
+  // agent_name, debug, trace_mode, custom paths, installed_at). Only the version
+  // is refreshed. A fresh install (no file, or unreadable) gets the defaults.
+  let existing: Partial<Settings> = {};
+  if (fs.existsSync(settingsFile)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(settingsFile, 'utf8')) as Partial<Settings>;
+    } catch {
+      existing = {};
+    }
+  }
+
   const settings: Settings = {
-    log_file: logFile,
-    weave_project: null,
-    wandb_api_key: null,
-    agent_name: null,
-    debug: false,
-    installed_at: new Date().toISOString(),
+    log_file: existing.log_file ?? logFile,
+    weave_project: existing.weave_project ?? null,
+    wandb_api_key: existing.wandb_api_key ?? null,
+    agent_name: existing.agent_name ?? null,
+    debug: existing.debug ?? false,
+    installed_at: existing.installed_at ?? new Date().toISOString(),
     version: VERSION,
-    daemon_socket: path.join(configDir, 'daemon.sock'),
+    daemon_socket: existing.daemon_socket ?? path.join(configDir, 'daemon.sock'),
+    trace_mode: existing.trace_mode ?? 'daemon',
   };
 
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));

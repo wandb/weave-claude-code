@@ -64,6 +64,28 @@ if [ -z "${WANDB_API_KEY_VALUE}" ] && [ -z "${WANDB_API_KEY:-}" ]; then
   exit 0
 fi
 
+# ── daemonless (session-end) mode ─────────────────────────────────────────────
+#
+# When trace_mode is "session-end" the persistent daemon is bypassed entirely.
+# Every hook event still fires (hooks.json is static), but only SessionEnd does
+# work: it pipes the payload to `weave-claude-code session-end`, which rebuilds
+# the full span tree from the now-complete transcript in one pass and uploads.
+# All other events exit 0 immediately — no daemon, no socket.
+
+TRACE_MODE_VALUE=$(grep -o '"trace_mode" *: *"[^"]*"' "${SETTINGS_FILE}" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')
+TRACE_MODE_VALUE="${WEAVE_TRACE_MODE:-${TRACE_MODE_VALUE}}"
+
+if [ "${TRACE_MODE_VALUE}" = "session-end" ]; then
+  PAYLOAD="$(cat)"
+  case "${PAYLOAD}" in
+    *'"hook_event_name":"SessionEnd"'*|*'"hook_event_name": "SessionEnd"'*)
+      printf '%s' "${PAYLOAD}" | weave-claude-code session-end >> "${ERROR_LOG}" 2>&1 || \
+        echo "$(date -Iseconds) | ERROR | session-end trace build failed" >> "${ERROR_LOG}"
+      ;;
+  esac
+  exit 0
+fi
+
 # ── start daemon if needed ────────────────────────────────────────────────────
 #
 # The socket file alone is NOT proof that the daemon is alive. When the daemon
