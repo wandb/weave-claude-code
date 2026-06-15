@@ -14,7 +14,7 @@
 // Anthropic's `input_tokens` verbatim, downstream consumers computing
 // `cache_read / input_tokens` produced rates greater than 100% (the cache
 // portion was larger than the uncached portion). Spec ref:
-// https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
+// https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

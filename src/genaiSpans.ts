@@ -18,7 +18,7 @@ import type { AssistantCallDetail, UsageSummary } from './parser.js';
 // Attribute keys
 //
 // Canonical `gen_ai.*` keys come from the OTel GenAI semantic conventions
-// (https://opentelemetry.io/docs/specs/semconv/gen-ai/). `weave.*` keys are
+// (https://github.com/open-telemetry/semantic-conventions-genai). `weave.*` keys are
 // Claude-Code-specific extensions with no semconv equivalent. Compaction keys
 // (`weave.compaction.*`) match the Weave Agents backend's semconv exactly —
 // the backend extracts them into dedicated span columns.
@@ -103,11 +103,11 @@ export const DEFAULT_AGENT_NAME = 'claude-code';
 
 // Values for `gen_ai.operation.name`. `invoke_agent`, `chat`, and
 // `execute_tool` are well-known values from the OTel GenAI semantic conventions
-// (https://opentelemetry.io/docs/specs/semconv/gen-ai/); the spec mandates the
-// well-known value whenever one applies. `assistant_text` has no well-known
-// equivalent, so it's a spec-permitted custom value: the model's
-// natural-language output, emitted as a `chat` child so it interleaves with
-// sibling `execute_tool` spans.
+// (https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/registry/attributes/gen-ai.md#gen-ai-operation-name);
+// the spec mandates the well-known value whenever one applies. `assistant_text`
+// has no well-known equivalent, so it's a spec-permitted custom value: the
+// model's natural-language output, emitted as a `chat` child so it interleaves
+// with sibling `execute_tool` spans.
 export const OP = {
   INVOKE_AGENT: 'invoke_agent',
   CHAT: 'chat',
@@ -387,7 +387,7 @@ export interface FinalizeChatSpanArgs {
 export function finalizeChatSpan(span: Span, args: FinalizeChatSpanArgs): void {
   // OTel `input_tokens` is the total prompt; Anthropic splits it into three
   // disjoint fields (uncached + cache_read + cache_creation), so sum them.
-  // https://opentelemetry.io/docs/specs/semconv/gen-ai/anthropic/
+  // https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md
   const totalInputTokens =
     args.usage.input_tokens
     + (args.usage.cache_read_input_tokens ?? 0)
