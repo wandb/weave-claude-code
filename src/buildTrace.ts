@@ -140,6 +140,25 @@ function listSubagents(transcriptPath: string): SubagentEntry[] {
   return out;
 }
 
+/** Real [start, end] envelope of a transcript, from its line timestamps — so an
+ *  invoke_agent span wraps its children in real time instead of build-time now(). */
+function transcriptBounds(transcriptPath: string): { start?: Date; end?: Date } {
+  let text: string;
+  try { text = fs.readFileSync(transcriptPath, 'utf8'); } catch { return {}; }
+  let min: number | undefined, max: number | undefined;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let ts: unknown;
+    try { ts = (JSON.parse(line) as { timestamp?: unknown }).timestamp; } catch { continue; }
+    if (typeof ts !== 'string') continue;
+    const t = Date.parse(ts);
+    if (Number.isNaN(t)) continue;
+    if (min === undefined || t < min) min = t;
+    if (max === undefined || t > max) max = t;
+  }
+  return { start: min !== undefined ? new Date(min) : undefined, end: max !== undefined ? new Date(max) : undefined };
+}
+
 /** gen_ai.agent.id for a teammate, read from its `agent-<id>.jsonl` filename. */
 function agentIdFromPath(transcriptPath: string): string {
   return path.basename(transcriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, '');
@@ -200,6 +219,9 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
   // teammates attach (and set attributes) on the existing span for their type,
   // so it must stay open until all leftovers are processed.
   const openInvokes: Span[] = [];
+  // Real end time per invoke_agent span (from its transcript), applied when the
+  // span is finally ended — without it the span would end at build-time now().
+  const invokeEnd = new Map<Span, Date | undefined>();
 
   let turnNumber = 0;
   let lastTurnSpan: Span | undefined;
@@ -238,7 +260,7 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
     let toolCount = 0;
     for (const tc of turn.toolCalls()) {
       toolCount += 1;
-      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts, coordOwner);
+      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts, coordOwner, invokeEnd);
     }
 
     const finishReasons = calls.map(c => c.finishReason).filter((r): r is string => !!r);
@@ -258,10 +280,11 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
 
   // Leftover pass: subagent transcripts not claimed by a spawning Agent call —
   // agent-teams re-spawns (extra same-type transcripts) and orphan teammates.
-  emitLeftoverSubagents(tracer, conversationId, pool, lastInvokeByType, lastTurnSpan, openInvokes, opts);
+  emitLeftoverSubagents(tracer, conversationId, pool, lastInvokeByType, lastTurnSpan, openInvokes, opts, invokeEnd);
 
-  // All invoke_agent spans are now fully populated — close them.
-  for (const s of openInvokes) s.end();
+  // All invoke_agent spans are now fully populated — close them at their real
+  // transcript end time (falls back to now() only if the transcript had none).
+  for (const s of openInvokes) s.end(invokeEnd.get(s));
 
   return turnNumber;
 }
@@ -281,14 +304,19 @@ function emitLeftoverSubagents(
   fallbackParent: Span | undefined,
   openInvokes: Span[],
   opts: BuildTraceOptions,
+  invokeEnd: Map<Span, Date | undefined>,
 ): void {
   for (const e of pool) {
     if (e.consumed) continue;
     e.consumed = true;
     const owner = { agentName: e.agentType, agentId: agentIdFromPath(e.transcriptPath) };
+    const bounds = transcriptBounds(e.transcriptPath);
     const existing = lastInvokeByType.get(e.agentType);
     if (existing) {
       // existing is still open (ended only after this pass) — safe to append.
+      // Extend its end to cover this re-spawn's real time too.
+      const cur = invokeEnd.get(existing);
+      if (bounds.end && (!cur || bounds.end > cur)) invokeEnd.set(existing, bounds.end);
       emitAgentSubtree(tracer, existing, conversationId, e.transcriptPath, opts, owner);
       continue;
     }
@@ -298,7 +326,9 @@ function emitLeftoverSubagents(
       conversationId,
       pluginVersion: opts.pluginVersion,
       agentId: owner.agentId,
+      startedAt: bounds.start,
     });
+    invokeEnd.set(invokeSpan, bounds.end);
     emitAgentSubtree(tracer, invokeSpan, conversationId, e.transcriptPath, opts, owner);
     lastInvokeByType.set(e.agentType, invokeSpan);
     openInvokes.push(invokeSpan); // ended by the caller after the full pass
@@ -321,6 +351,7 @@ function emitToolCall(
   openInvokes: Span[],
   opts: BuildTraceOptions,
   owner: { agentName?: string; agentId?: string },
+  invokeEnd: Map<Span, Date | undefined>,
 ): void {
   if (tc.toolName === 'Agent') {
     // Correlate to a transcript. Order: exact toolUseId match (plain Agent
@@ -341,6 +372,7 @@ function emitToolCall(
     // gen_ai.agent.id — the subagent's id, read from its transcript filename
     // (agent-<id>.jsonl). Empty otherwise (the daemon stamped it at runtime).
     const agentId = entry ? agentIdFromPath(entry.transcriptPath) : undefined;
+    const bounds = entry ? transcriptBounds(entry.transcriptPath) : {};
     const promptText = tc.toolInput['prompt'];
     const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
       agentType,
@@ -350,7 +382,9 @@ function emitToolCall(
       spawningToolCallId: tc.toolUseId,
       agentId,
       displayName: toolDisplayName('Agent', tc.toolInput),
+      startedAt: bounds.start,
     });
+    invokeEnd.set(invokeSpan, bounds.end);
     lastInvokeByType.set(agentType, invokeSpan);
     if (entry) {
       emitAgentSubtree(tracer, invokeSpan, conversationId, entry.transcriptPath, opts, { agentName: agentType, agentId });
@@ -406,19 +440,20 @@ function emitAgentSubtree(
   const nested = listSubagents(agentTranscriptPath);
   const nestedLastInvoke = new Map<string, Span>();
   const nestedOpen: Span[] = [];
+  const nestedInvokeEnd = new Map<Span, Date | undefined>();
 
   let model: string | undefined;
   let usage: UsageSummary = { input_tokens: 0, output_tokens: 0 };
   for (const turn of parsed.turns) {
     emitChatSpansFromAssistantCalls(tracer, invokeSpan, conversationId, turn.assistantCalls(), owner);
     for (const tc of turn.toolCalls()) {
-      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts, owner);
+      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts, owner, nestedInvokeEnd);
     }
     model = turn.primaryModel() ?? model;
     usage = addUsage(usage, turn.totalUsage());
   }
-  emitLeftoverSubagents(tracer, conversationId, nested, nestedLastInvoke, invokeSpan, nestedOpen, opts);
-  for (const s of nestedOpen) s.end();
+  emitLeftoverSubagents(tracer, conversationId, nested, nestedLastInvoke, invokeSpan, nestedOpen, opts, nestedInvokeEnd);
+  for (const s of nestedOpen) s.end(nestedInvokeEnd.get(s));
   if (model) invokeSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
   // Aggregate the subagent's token usage onto its invoke_agent span (so the
   // sub-agent rolls up tokens too, not just the coordinator turn).

@@ -170,6 +170,22 @@ test('nest-test tree — A10: tool spans carry real, ordered timestamps (not col
   assert.ok(distinct.size > 1, 'tool spans have distinct real timestamps, not one build-time instant');
 });
 
+test('nest-test tree — A11: invoke_agent spans use real times enveloping their own children (no build-time now())', () => {
+  const spans = build();
+  const startMs = (s: ReadableSpan) => s.startTime[0] * 1000 + s.startTime[1] / 1e6;
+  const endMs = (s: ReadableSpan) => s.endTime[0] * 1000 + s.endTime[1] / 1e6;
+  for (const inv of invokeAgents(spans)) {
+    const kids = childrenOf(spans, id(inv)).filter(s => op(s) === OP.EXECUTE_TOOL || op(s) === OP.CHAT);
+    if (!kids.length) continue;
+    const childMin = Math.min(...kids.map(startMs));
+    const childMax = Math.max(...kids.map(endMs));
+    assert.ok(startMs(inv) <= childMin + 1,
+      `${agentName(inv)} invoke_agent starts (${startMs(inv)}) at/before its first child (${childMin}) — not stamped at build time`);
+    assert.ok(endMs(inv) >= childMax - 1,
+      `${agentName(inv)} invoke_agent ends (${endMs(inv)}) at/after its last child (${childMax})`);
+  }
+});
+
 test('nest-test tree — A8: no orphans (every span parents to a span in the trace)', () => {
   const spans = build();
   const ids = new Set(spans.map(id));
