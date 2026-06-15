@@ -2,16 +2,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Integration test for the main-agent chat-span STATE MACHINE, driven through
-// the real daemon hook handlers (SessionStart → UserPromptSubmit → PreToolUse →
-// PostToolUse → Stop / SessionEnd) rather than calling emitChatSpanForResponse
-// directly. This exercises the parts the other two interleave tests don't:
-//   - advanceMainAgentChatSpan opening a chat span at PreToolUse and parenting
-//     the tool span under it,
-//   - the response→response transition finalizing the previous chat span,
-//   - the emittedChatSpanResponseKeys dedup (no double chat span at Stop),
-//   - the SessionEnd path finalizing a still-open chat span (text + usage) when
-//     Stop never fired.
+// Chat-span state machine, driven through the real hook handlers (not by
+// calling emitChatSpanForResponse directly): chat span opened at PreToolUse +
+// tool parenting, response transitions, the dedup (no double chat span at
+// Stop), and SessionEnd finalizing a still-open span. The other interleave
+// tests cover only the helpers in isolation.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -54,9 +49,8 @@ function userText(ts: string, text: string) {
   return { type: 'user', timestamp: ts, message: { role: 'user', content: [{ type: 'text', text }] } };
 }
 
-/** A transcript the handlers read incrementally. `getFd` caches one fd and
- *  re-stats it per read, so appends made after SessionStart are visible. The
- *  path must be inside $HOME (TranscriptFile rejects anything else). */
+/** Incrementally-appendable transcript. Appends after SessionStart are visible
+ *  (getFd caches one fd, re-stat per read). Path must be inside $HOME. */
 function makeTranscript(sessionId: string): { file: string; append: (line: unknown) => void; dir: string } {
   const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-itest-'));
   const file = path.join(dir, `${sessionId}.jsonl`);
@@ -112,16 +106,14 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
     await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
     await d.handlePostToolUse(sid, { tool_use_id: 'tool_1', tool_response: 'ok' });
 
-    // Response msgB: text-only final message (no tool_use → never opens a chat
-    // span at PreToolUse; must be back-filled at Stop).
+    // msgB: text-only (no tool_use → no PreToolUse; back-filled at Stop).
     append(aLine('msgB', '2026-01-01T00:00:10.000Z', { type: 'text', text: 'all done' }, 'end_turn'));
     await d.handleStop(sid, {});
     await provider.forceFlush();
 
     const spans = exporter.getFinishedSpans();
 
-    // Exactly one chat span per response (dedup: msgA opened at PreToolUse and
-    // finalized at Stop must NOT also be emitted by the Stop back-fill loop).
+    // Dedup: one chat span per response (Stop back-fill skips already-final msgA).
     assert.equal(chatByResponse(spans, 'msgA').length, 1, 'one chat span for msgA');
     assert.equal(chatByResponse(spans, 'msgB').length, 1, 'one chat span for msgB');
 

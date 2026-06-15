@@ -929,14 +929,9 @@ export class GlobalDaemon {
   private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
     if (!this.tracer || !session.currentTurnSpan) return undefined;
 
-    // NOTE: this re-reads and re-parses the whole transcript on every
-    // main-agent PreToolUse (parseSessionFd → read entire file + JSON.parse
-    // each line). That's O(transcript size) per tool call, so a long turn with
-    // many tool calls re-parses the growing history repeatedly. It runs off
-    // Claude Code's critical path (the hook handler returns as soon as it
-    // writes to the socket; the daemon processes async and per-session
-    // serialized), so it adds no editor latency — but if this ever shows up in
-    // profiling, parse only the current turn's tail instead of the whole file.
+    // Re-parses the whole transcript per main-agent PreToolUse: O(size) per
+    // tool call. Off CC's critical path (async daemon), so no editor latency;
+    // parse the current turn's tail instead if it shows up in profiling.
     let fd: number;
     try {
       fd = session.transcript.getFd();
@@ -1655,11 +1650,9 @@ export class GlobalDaemon {
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
 
-    // Finalize any chat span left open mid-turn (Stop never fired). The
-    // transcript is fully flushed by SessionEnd, so finalize it the same way
-    // Stop would — emitting its text children + usage — rather than dropping
-    // them. Fall back to a bare orphan close only if the parse fails or the
-    // turn span is already gone (finalize needs it as the parent).
+    // Finalize a chat span left open mid-turn (Stop never fired) from the
+    // now-flushed transcript, like Stop does, so its text + usage aren't lost.
+    // Bare orphan close only if the parse fails or the turn span is gone.
     if (session.activeChatSpan) {
       let finalized = false;
       if (session.currentTurnSpan) {
