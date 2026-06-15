@@ -39,8 +39,9 @@ import {
   toolDisplayName,
   promptSnippet,
   jsonStr,
+  parseTimestamp,
 } from './genaiSpans.js';
-import type { AssistantCallDetail } from './parser.js';
+import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -141,11 +142,7 @@ function findToolUseResponseKey(
 }
 
 function parseIsoOrNow(ts: string | undefined): Date {
-  if (ts) {
-    const d = new Date(ts);
-    if (Number.isFinite(d.getTime())) return d;
-  }
-  return new Date();
+  return parseTimestamp(ts) ?? new Date();
 }
 
 /**
@@ -932,6 +929,14 @@ export class GlobalDaemon {
   private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
     if (!this.tracer || !session.currentTurnSpan) return undefined;
 
+    // NOTE: this re-reads and re-parses the whole transcript on every
+    // main-agent PreToolUse (parseSessionFd → read entire file + JSON.parse
+    // each line). That's O(transcript size) per tool call, so a long turn with
+    // many tool calls re-parses the growing history repeatedly. It runs off
+    // Claude Code's critical path (the hook handler returns as soon as it
+    // writes to the socket; the daemon processes async and per-session
+    // serialized), so it adds no editor latency — but if this ever shows up in
+    // profiling, parse only the current turn's tail instead of the whole file.
     let fd: number;
     try {
       fd = session.transcript.getFd();
@@ -1650,12 +1655,32 @@ export class GlobalDaemon {
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
 
-    // Close any chat span left open mid-turn (Stop never fired).
+    // Finalize any chat span left open mid-turn (Stop never fired). The
+    // transcript is fully flushed by SessionEnd, so finalize it the same way
+    // Stop would — emitting its text children + usage — rather than dropping
+    // them. Fall back to a bare orphan close only if the parse fails or the
+    // turn span is already gone (finalize needs it as the parent).
     if (session.activeChatSpan) {
-      session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      session.activeChatSpan.span.end();
-      session.activeChatSpan = undefined;
-      this.log('DEBUG', `Closed orphaned chat span`);
+      let finalized = false;
+      if (session.currentTurnSpan) {
+        let parsed: ParsedSession | null = null;
+        try {
+          parsed = parseSessionFd(session.transcript.getFd());
+        } catch {
+          parsed = null;
+        }
+        const lastTurn = parsed?.turns[parsed.turns.length - 1];
+        if (lastTurn) {
+          this.finalizeActiveChatSpan(session, lastTurn.assistantCalls());
+          finalized = true;
+        }
+      }
+      if (session.activeChatSpan) {
+        session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        session.activeChatSpan.span.end();
+        session.activeChatSpan = undefined;
+      }
+      this.log('DEBUG', finalized ? `Finalized active chat span at SessionEnd` : `Closed orphaned chat span`);
     }
 
     // Close the current turn if still open

@@ -484,7 +484,8 @@ export function emitChatSpansFromAssistantCalls(
   }
 }
 
-function parseTimestamp(ts: string | undefined): Date | undefined {
+/** Parse an ISO timestamp; returns undefined for missing or unparseable input. */
+export function parseTimestamp(ts: string | undefined): Date | undefined {
   if (!ts) return undefined;
   const d = new Date(ts);
   return Number.isFinite(d.getTime()) ? d : undefined;
