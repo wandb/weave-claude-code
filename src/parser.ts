@@ -27,11 +27,29 @@ export interface AssistantCallDetail {
   finishReason?: string;        // stop_reason / finish_reason if present
 }
 
+/**
+ * A single tool invocation within a turn: the assistant's `tool_use` block
+ * paired with the `tool_result` that came back (in a later user message, keyed
+ * by `tool_use_id`). `toolResult` is undefined when no result is present in the
+ * transcript yet (e.g. an interrupted session).
+ */
+export interface ToolCallDetail {
+  toolName: string;
+  toolUseId: string;
+  toolInput: Record<string, unknown>;
+  toolResult?: unknown;
+  isError: boolean;
+}
+
 export interface Turn {
   totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
   textBlocks(): string[];
   assistantCalls(): AssistantCallDetail[];
+  /** tool_use blocks in this turn, each paired with its tool_result. */
+  toolCalls(): ToolCallDetail[];
+  /** Text of the user message that triggered this turn (empty if unknown). */
+  prompt(): string;
 }
 
 export interface ParsedSession {
@@ -101,10 +119,23 @@ interface AssistantLine {
   prevTimestamp?: string;
 }
 
+/** Result payload for a single tool_use, keyed by tool_use_id session-wide. */
+interface ToolResultEntry {
+  result: unknown;
+  isError: boolean;
+}
+
 function buildSession(lines: unknown[]): ParsedSession {
   const turns: Turn[] = [];
   let currentAssistantLines: AssistantLine[] = [];
   let prevTimestamp: string | undefined;
+
+  // tool_use_ids are globally unique within a session, so a single shared map
+  // is sufficient. buildTurn's toolCalls() reads this lazily, so results that
+  // arrive after the turn was constructed are still paired correctly.
+  const toolResults = new Map<string, ToolResultEntry>();
+  // Prompt text of the user message that triggered the in-progress turn.
+  let currentPrompt = '';
 
   for (const line of lines) {
     const entry = line as Record<string, unknown>;
@@ -119,11 +150,26 @@ function buildSession(lines: unknown[]): ParsedSession {
       const rawContent = message?.['content'];
       const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
-      // A user message with text content marks the end of the previous turn.
+      // Collect tool_result blocks before the turn-end check (a user message
+      // can carry results without text and must not be missed).
+      for (const block of content) {
+        if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') {
+          toolResults.set(block['tool_use_id'] as string, {
+            result: block['content'],
+            isError: block['is_error'] === true,
+          });
+        }
+      }
+
+      // A user message with text content marks the end of the previous turn
+      // and is the prompt for the next one.
       const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
-      if (hasText && currentAssistantLines.length > 0) {
-        turns.push(buildTurn(currentAssistantLines));
-        currentAssistantLines = [];
+      if (hasText) {
+        if (currentAssistantLines.length > 0) {
+          turns.push(buildTurn(currentAssistantLines, toolResults, currentPrompt));
+          currentAssistantLines = [];
+        }
+        currentPrompt = extractUserText(rawContent, content);
       }
     }
 
@@ -131,13 +177,24 @@ function buildSession(lines: unknown[]): ParsedSession {
   }
 
   if (currentAssistantLines.length > 0) {
-    turns.push(buildTurn(currentAssistantLines));
+    turns.push(buildTurn(currentAssistantLines, toolResults, currentPrompt));
   }
 
   return { turns };
 }
 
-function buildTurn(assistantLines: AssistantLine[]): Turn {
+function extractUserText(rawContent: unknown, content: Array<Record<string, unknown>>): string {
+  if (typeof rawContent === 'string') return rawContent;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block['type'] === 'text' && typeof block['text'] === 'string') {
+      parts.push(block['text'] as string);
+    }
+  }
+  return parts.join('\n');
+}
+
+function buildTurn(assistantLines: AssistantLine[], toolResults: Map<string, ToolResultEntry>, prompt: string): Turn {
   const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
     const message = line['message'] as Record<string, unknown> | undefined;
     const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
@@ -179,11 +236,36 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
 
   const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
 
+  const toolCalls = (): ToolCallDetail[] => {
+    const out: ToolCallDetail[] = [];
+    for (const call of calls) {
+      for (const block of call.contentBlocks) {
+        if (!block || typeof block !== 'object') continue;
+        const obj = block as Record<string, unknown>;
+        if (obj['type'] !== 'tool_use' || typeof obj['id'] !== 'string') continue;
+        // Skip malformed blocks with no tool name — avoids emitting an
+        // `execute_tool ` span with a trailing-space name.
+        if (typeof obj['name'] !== 'string' || !(obj['name'] as string)) continue;
+        const result = toolResults.get(obj['id'] as string);
+        out.push({
+          toolName: obj['name'] as string,
+          toolUseId: obj['id'] as string,
+          toolInput: (obj['input'] as Record<string, unknown>) ?? {},
+          toolResult: result?.result,
+          isError: result?.isError ?? false,
+        });
+      }
+    }
+    return out;
+  };
+
   return {
     totalUsage: () => totalUsageValue,
     primaryModel: () => model,
     textBlocks: () => texts,
     assistantCalls: () => calls,
+    toolCalls,
+    prompt: () => prompt,
   };
 }
 

@@ -24,6 +24,12 @@ export interface Settings {
   installed_at: string;
   version: string;
   daemon_socket: string;
+  /** Tracing strategy. `daemon` (default) uses the persistent daemon.
+   *  `session-end` is the daemonless path: a SessionEnd hook reconstructs the
+   *  full span tree from the transcript in one pass and uploads — no daemon,
+   *  no socket. Settings written before this field existed read as undefined,
+   *  treated as `daemon`. */
+  trace_mode?: 'daemon' | 'session-end';
 }
 
 export interface ConfigResult {
@@ -131,6 +137,7 @@ export function createConfig(configDir: string): ConfigResult {
     installed_at: new Date().toISOString(),
     version: VERSION,
     daemon_socket: path.join(configDir, 'daemon.sock'),
+    trace_mode: 'daemon',
   };
 
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));

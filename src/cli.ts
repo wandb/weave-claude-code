@@ -28,6 +28,7 @@ import {
 } from './setup.js';
 import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
 import { runDaemon } from './daemon.js';
+import { runSessionEnd } from './sessionEnd.js';
 import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
@@ -326,7 +327,7 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const writableKeys = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug'];
+    const writableKeys = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug', 'trace_mode'];
     if (!writableKeys.includes(key)) {
       console.error(`Cannot set '${key}'. Writable keys: ${writableKeys.join(', ')}`);
       process.exit(1);
@@ -339,6 +340,11 @@ async function cmdConfig(args: string[]): Promise<void> {
 
     if (key === 'debug' && value !== 'true' && value !== 'false') {
       console.error(`Invalid value for debug: '${value}'\nExpected: true or false`);
+      process.exit(1);
+    }
+
+    if (key === 'trace_mode' && value !== 'daemon' && value !== 'session-end') {
+      console.error(`Invalid value for trace_mode: '${value}'\nExpected: daemon or session-end`);
       process.exit(1);
     }
 
@@ -713,6 +719,43 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', () => resolve(data));
+  });
+}
+
+/**
+ * Daemonless `session-end` command: reads the SessionEnd hook payload from
+ * stdin, builds the full span tree from the transcript, and uploads. Always
+ * exits 0 — a tracing failure must never disrupt Claude Code.
+ */
+async function cmdSessionEnd(): Promise<void> {
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch {
+    return; // not configured — nothing to do
+  }
+  const raw = await readStdin();
+  const debug = !!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true;
+  try {
+    const result = await runSessionEnd(raw, settings, process.env);
+    // Under debug, leave a breadcrumb (the hook redirects our stderr to the
+    // error log) so "why are there no traces?" is diagnosable.
+    if (debug) {
+      console.error(`weave session-end: ${result.status}${result.reason ? ` (${result.reason})` : ''} turns=${result.turns}`);
+    }
+  } catch (err) {
+    if (debug) console.error(`weave session-end: error ${err}`);
+    // Swallow: never fail the hook.
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const cmd = args[0];
@@ -765,6 +808,11 @@ async function main(): Promise<void> {
 
   if (cmd === 'daemon') {
     await runDaemon();
+    return;
+  }
+
+  if (cmd === 'session-end') {
+    await cmdSessionEnd();
     return;
   }
 
