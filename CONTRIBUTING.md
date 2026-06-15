@@ -4,8 +4,8 @@ Until further notice, this project does not accept external contributions as of 
 
 ## Local checks
 
-This repository uses npm-driven checks and a repo-managed Git pre-commit hook,
-including secret scanning with `gitleaks`.
+This repository uses npm-driven checks and a repo-managed Git pre-commit hook.
+Secret scanning runs in CI via TruffleHog.
 
 ```shell
 npm install
