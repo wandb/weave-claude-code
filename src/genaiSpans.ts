@@ -295,6 +295,10 @@ export interface ToolSpanArgs {
    *  to the agent that ran it (it groups by agent identity, not span tree). */
   agentName?: string;
   agentId?: string;
+  /** Real start time from the transcript (the assistant message that issued the
+   *  tool_use). Without it the span gets build-time `now()`, collapsing every
+   *  tool span to one instant and destroying execution order in the UI. */
+  startedAt?: TimeInput;
 }
 
 export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanArgs): Span {
@@ -310,7 +314,7 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
 
   return tracer.startSpan(
     `${OP.EXECUTE_TOOL} ${args.toolName}`,
-    { kind: SpanKind.INTERNAL, attributes: attrs },
+    { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
     ctxWithParent(parentSpan),
   );
 }

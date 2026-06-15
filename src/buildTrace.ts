@@ -360,6 +360,7 @@ function emitToolCall(
     return;
   }
 
+  const startedAt = toDate(tc.timestamp);
   const toolSpan = startToolSpan(tracer, parentSpan, {
     toolName: tc.toolName,
     toolUseId: tc.toolUseId,
@@ -367,6 +368,7 @@ function emitToolCall(
     displayName: toolDisplayName(tc.toolName, tc.toolInput),
     agentName: owner.agentName,
     agentId: owner.agentId,
+    startedAt,
   });
   if (tc.toolResult !== undefined) {
     toolSpan.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(tc.toolResult));
@@ -375,7 +377,9 @@ function emitToolCall(
     toolSpan.setAttribute(ATTR.ERROR_TYPE, 'tool_error');
     toolSpan.setStatus({ code: SpanStatusCode.ERROR });
   }
-  toolSpan.end();
+  // End at the tool_result time; fall back to the start so a missing result
+  // gives a near-zero-duration span rather than stretching to build-time now().
+  toolSpan.end(toDate(tc.resultTimestamp) ?? startedAt);
 }
 
 /**

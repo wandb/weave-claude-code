@@ -155,6 +155,21 @@ test('nest-test tree — A9: child spans carry their owning agent (the field the
   }
 });
 
+test('nest-test tree — A10: tool spans carry real, ordered timestamps (not collapsed to build time)', () => {
+  const spans = build();
+  const probe = invokeAgents(spans).find(s => agentName(s) === 'nest-probe')!;
+  const bashes = childrenOf(spans, id(probe)).filter(s => op(s) === OP.EXECUTE_TOOL && tool(s) === 'Bash');
+  const startMs = (s: ReadableSpan) => s.startTime[0] * 1000 + s.startTime[1] / 1e6;
+  const args = (s: ReadableSpan) => String(s.attributes[ATTR.TOOL_CALL_ARGUMENTS] ?? '');
+  const t1 = bashes.find(s => args(s).includes('turn 1 step 3'))!;
+  const t2 = bashes.find(s => args(s).includes('turn 2 step 1'))!;
+  assert.ok(t1 && t2, 'found turn-1 and turn-2 Bash spans');
+  assert.ok(startMs(t1) < startMs(t2), 'turn-1-done Bash starts before turn-2 Bash (real execution order)');
+  // Guard against the build-time-collapse bug: all tool spans must not share one timestamp.
+  const distinct = new Set(bashes.map(startMs));
+  assert.ok(distinct.size > 1, 'tool spans have distinct real timestamps, not one build-time instant');
+});
+
 test('nest-test tree — A8: no orphans (every span parents to a span in the trace)', () => {
   const spans = build();
   const ids = new Set(spans.map(id));

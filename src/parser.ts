@@ -39,6 +39,10 @@ export interface ToolCallDetail {
   toolInput: Record<string, unknown>;
   toolResult?: unknown;
   isError: boolean;
+  /** ISO timestamp of the assistant message that issued the tool_use (span start). */
+  timestamp?: string;
+  /** ISO timestamp of the tool_result message (span end). */
+  resultTimestamp?: string;
 }
 
 export interface Turn {
@@ -123,6 +127,8 @@ interface AssistantLine {
 interface ToolResultEntry {
   result: unknown;
   isError: boolean;
+  /** ISO timestamp of the user message carrying the result (tool span end). */
+  timestamp?: string;
 }
 
 function buildSession(lines: unknown[]): ParsedSession {
@@ -157,6 +163,7 @@ function buildSession(lines: unknown[]): ParsedSession {
           toolResults.set(block['tool_use_id'] as string, {
             result: block['content'],
             isError: block['is_error'] === true,
+            timestamp,
           });
         }
       }
@@ -253,6 +260,8 @@ function buildTurn(assistantLines: AssistantLine[], toolResults: Map<string, Too
           toolInput: (obj['input'] as Record<string, unknown>) ?? {},
           toolResult: result?.result,
           isError: result?.isError ?? false,
+          timestamp: call.timestamp,
+          resultTimestamp: result?.timestamp,
         });
       }
     }
