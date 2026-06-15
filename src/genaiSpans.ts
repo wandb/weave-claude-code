@@ -291,6 +291,10 @@ export interface ToolSpanArgs {
   toolUseId: string;
   toolInput: Record<string, unknown>;
   displayName?: string;
+  /** Owning agent — stamped on the span so the Agents view attributes the tool
+   *  to the agent that ran it (it groups by agent identity, not span tree). */
+  agentName?: string;
+  agentId?: string;
 }
 
 export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanArgs): Span {
@@ -300,6 +304,8 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
     [ATTR.TOOL_CALL_ID]: args.toolUseId,
     [ATTR.TOOL_CALL_ARGUMENTS]: jsonStr(args.toolInput),
   };
+  if (args.agentName) attrs[ATTR.AGENT_NAME] = args.agentName;
+  if (args.agentId) attrs[ATTR.AGENT_ID] = args.agentId;
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
   return tracer.startSpan(
@@ -324,6 +330,10 @@ export interface ChatSpanArgs {
   finishReasons?: string[];
   inputMessages?: unknown;
   outputMessages?: unknown;
+  /** Owning agent — stamped so the Agents view attributes the chat to the
+   *  agent that made it (it groups by agent identity, not span tree). */
+  agentName?: string;
+  agentId?: string;
 }
 
 /**
@@ -352,6 +362,8 @@ export function emitChatSpan(
     [ATTR.USAGE_OUTPUT_TOKENS]: args.usage.output_tokens,
     [ATTR.OUTPUT_TYPE]: 'text',
   };
+  if (args.agentName) attrs[ATTR.AGENT_NAME] = args.agentName;
+  if (args.agentId) attrs[ATTR.AGENT_ID] = args.agentId;
   const provider = providerFromModel(args.model);
   if (provider) attrs[ATTR.PROVIDER_NAME] = provider;
   if (args.usage.cache_read_input_tokens !== undefined) {
@@ -394,6 +406,7 @@ export function emitChatSpansFromAssistantCalls(
   parentSpan: Span,
   conversationId: string,
   calls: AssistantCallDetail[],
+  owner?: { agentName?: string; agentId?: string },
 ): void {
   for (const c of calls) {
     if (!c.model) continue;
@@ -411,6 +424,8 @@ export function emitChatSpansFromAssistantCalls(
       outputMessages: c.contentBlocks.length
         ? [{ role: 'assistant', content: assistantBlocksToText(c.contentBlocks), parts: c.contentBlocks }]
         : undefined,
+      agentName: owner?.agentName,
+      agentId: owner?.agentId,
     });
   }
 }

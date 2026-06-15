@@ -107,7 +107,64 @@ function listSubagents(transcriptPath: string): SubagentEntry[] {
     }
   }
   out.sort((a, b) => a.mtime - b.mtime);
+
+  // Collapse agent-teams re-spawns. The harness can leave more than one
+  // transcript for a single teammate (a partial snapshot + the complete one),
+  // sharing the same `agentType` and no `toolUseId`. They reuse the same
+  // tool_use ids, so a partial's id-set is a subset of the complete one's.
+  // Without this, the leftover pass merges both under one invoke_agent span and
+  // double-counts the overlapping turns' tool calls (wrong tool→agent
+  // attribution). Drop any teammate entry whose tool_use ids are a subset of
+  // another same-type entry's — keep only the most complete transcript.
+  const teammates = out.filter(e => !e.toolUseId);
+  if (teammates.length > 1) {
+    const ids = new Map<SubagentEntry, Set<string>>(teammates.map(e => [e, toolUseIdSet(e.transcriptPath)]));
+    const drop = new Set<SubagentEntry>();
+    for (const a of teammates) {
+      const sa = ids.get(a)!;
+      // A tool-less snapshot has no ids to be a subset by — leave it (it emits
+      // no tool spans, so it can't cause a double-count; at worst an empty span).
+      if (sa.size === 0) continue;
+      for (const b of teammates) {
+        if (a === b || drop.has(b) || a.agentType !== b.agentType) continue;
+        const sb = ids.get(b)!;
+        const aSubsetOfB = [...sa].every(x => sb.has(x));
+        if (aSubsetOfB && (sb.size > sa.size || (sb.size === sa.size && out.indexOf(b) < out.indexOf(a)))) {
+          drop.add(a);
+          break;
+        }
+      }
+    }
+    if (drop.size) return out.filter(e => !drop.has(e));
+  }
   return out;
+}
+
+/** gen_ai.agent.id for a teammate, read from its `agent-<id>.jsonl` filename. */
+function agentIdFromPath(transcriptPath: string): string {
+  return path.basename(transcriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, '');
+}
+
+/** Collect every tool_use id in a transcript (for re-spawn dedup). */
+function toolUseIdSet(transcriptPath: string): Set<string> {
+  const ids = new Set<string>();
+  let text: string;
+  try { text = fs.readFileSync(transcriptPath, 'utf8'); } catch { return ids; }
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const content = (JSON.parse(line) as { message?: { content?: unknown } }).message?.content;
+      if (Array.isArray(content)) {
+        for (const b of content) {
+          if (b && typeof b === 'object' && (b as { type?: string }).type === 'tool_use') {
+            const tid = (b as { id?: unknown }).id;
+            if (typeof tid === 'string') ids.add(tid);
+          }
+        }
+      }
+    } catch { /* skip malformed line */ }
+  }
+  return ids;
 }
 
 /** Claim the entry whose meta toolUseId matches (exact), if any. */
@@ -173,12 +230,15 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
     });
     lastTurnSpan = turnSpan;
 
-    emitChatSpansFromAssistantCalls(tracer, turnSpan, conversationId, calls);
+    // Owning agent for the coordinator's own chat/tool spans — the Agents view
+    // groups by agent identity, so each child span must carry it.
+    const coordOwner = { agentName };
+    emitChatSpansFromAssistantCalls(tracer, turnSpan, conversationId, calls, coordOwner);
 
     let toolCount = 0;
     for (const tc of turn.toolCalls()) {
       toolCount += 1;
-      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts);
+      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts, coordOwner);
     }
 
     const finishReasons = calls.map(c => c.finishReason).filter((r): r is string => !!r);
@@ -225,10 +285,11 @@ function emitLeftoverSubagents(
   for (const e of pool) {
     if (e.consumed) continue;
     e.consumed = true;
+    const owner = { agentName: e.agentType, agentId: agentIdFromPath(e.transcriptPath) };
     const existing = lastInvokeByType.get(e.agentType);
     if (existing) {
       // existing is still open (ended only after this pass) — safe to append.
-      emitAgentSubtree(tracer, existing, conversationId, e.transcriptPath, opts);
+      emitAgentSubtree(tracer, existing, conversationId, e.transcriptPath, opts, owner);
       continue;
     }
     if (!fallbackParent) continue;
@@ -236,8 +297,9 @@ function emitLeftoverSubagents(
       agentType: e.agentType,
       conversationId,
       pluginVersion: opts.pluginVersion,
+      agentId: owner.agentId,
     });
-    emitAgentSubtree(tracer, invokeSpan, conversationId, e.transcriptPath, opts);
+    emitAgentSubtree(tracer, invokeSpan, conversationId, e.transcriptPath, opts, owner);
     lastInvokeByType.set(e.agentType, invokeSpan);
     openInvokes.push(invokeSpan); // ended by the caller after the full pass
   }
@@ -258,6 +320,7 @@ function emitToolCall(
   lastInvokeByType: Map<string, Span>,
   openInvokes: Span[],
   opts: BuildTraceOptions,
+  owner: { agentName?: string; agentId?: string },
 ): void {
   if (tc.toolName === 'Agent') {
     // Correlate to a transcript. Order: exact toolUseId match (plain Agent
@@ -277,9 +340,7 @@ function emitToolCall(
     const agentType = entry?.agentType ?? memberName ?? subType;
     // gen_ai.agent.id — the subagent's id, read from its transcript filename
     // (agent-<id>.jsonl). Empty otherwise (the daemon stamped it at runtime).
-    const agentId = entry
-      ? path.basename(entry.transcriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, '')
-      : undefined;
+    const agentId = entry ? agentIdFromPath(entry.transcriptPath) : undefined;
     const promptText = tc.toolInput['prompt'];
     const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
       agentType,
@@ -292,7 +353,7 @@ function emitToolCall(
     });
     lastInvokeByType.set(agentType, invokeSpan);
     if (entry) {
-      emitAgentSubtree(tracer, invokeSpan, conversationId, entry.transcriptPath, opts);
+      emitAgentSubtree(tracer, invokeSpan, conversationId, entry.transcriptPath, opts, { agentName: agentType, agentId });
     }
     // Ended by the caller after the leftover pass — re-spawns may still attach.
     openInvokes.push(invokeSpan);
@@ -304,6 +365,8 @@ function emitToolCall(
     toolUseId: tc.toolUseId,
     toolInput: tc.toolInput,
     displayName: toolDisplayName(tc.toolName, tc.toolInput),
+    agentName: owner.agentName,
+    agentId: owner.agentId,
   });
   if (tc.toolResult !== undefined) {
     toolSpan.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(tc.toolResult));
@@ -329,6 +392,7 @@ function emitAgentSubtree(
   conversationId: string,
   agentTranscriptPath: string,
   opts: BuildTraceOptions,
+  owner: { agentName?: string; agentId?: string },
 ): void {
   const parsed = parseSessionFile(agentTranscriptPath);
   if (!parsed) return;
@@ -342,9 +406,9 @@ function emitAgentSubtree(
   let model: string | undefined;
   let usage: UsageSummary = { input_tokens: 0, output_tokens: 0 };
   for (const turn of parsed.turns) {
-    emitChatSpansFromAssistantCalls(tracer, invokeSpan, conversationId, turn.assistantCalls());
+    emitChatSpansFromAssistantCalls(tracer, invokeSpan, conversationId, turn.assistantCalls(), owner);
     for (const tc of turn.toolCalls()) {
-      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts);
+      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts, owner);
     }
     model = turn.primaryModel() ?? model;
     usage = addUsage(usage, turn.totalUsage());
