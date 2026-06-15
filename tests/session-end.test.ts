@@ -26,11 +26,11 @@ const SETTINGS: Settings = {
   version: '0.0.0', daemon_socket: '/tmp/x.sock', trace_mode: 'session-end',
 };
 
-function makeTranscript(): { transcriptPath: string; dir: string } {
+function makeTranscript(cwd = '/work'): { transcriptPath: string; dir: string } {
   const dir = fs.mkdtempSync(path.join(os.homedir(), '.wcp-se-'));
   const transcriptPath = path.join(dir, 'session.jsonl');
   fs.writeFileSync(transcriptPath, [
-    { type: 'user', message: { role: 'user', content: 'hi' }, timestamp: '2026-01-01T00:00:00Z' },
+    { type: 'user', cwd, message: { role: 'user', content: 'hi' }, timestamp: '2026-01-01T00:00:00Z' },
     { type: 'assistant', timestamp: '2026-01-01T00:00:01Z', message: { role: 'assistant', model: 'm', usage: {}, content: [{ type: 'text', text: 'ok' }] } },
   ].map(l => JSON.stringify(l)).join('\n'));
   return { transcriptPath, dir };
@@ -91,6 +91,45 @@ test('runSessionEnd: env WANDB_API_KEY/WEAVE_PROJECT override settings', async (
     const res = await runSessionEnd(payload, { ...SETTINGS, weave_project: null, wandb_api_key: null },
       { WEAVE_PROJECT: 'e/p', WANDB_API_KEY: 'kk' } as NodeJS.ProcessEnv, inj.make);
     assert.equal(res.status, 'ok');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runSessionEnd: scope resolves from transcript cwd when payload omits it (regression)', async () => {
+  // The SessionEnd payload often lacks cwd; without the transcript fallback, a
+  // set trace_roots fail-closes and drops everything. Here the payload has NO
+  // cwd, trace_roots matches the transcript's recorded cwd → must still build.
+  const { transcriptPath, dir } = makeTranscript('/work/scoped-repo');
+  const inj = injectedProvider();
+  try {
+    const payload = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 's1', transcript_path: transcriptPath }); // no cwd
+    const inScope = await runSessionEnd(payload, { ...SETTINGS, ...({ trace_roots: ['/work/scoped-repo'] } as any) }, {}, inj.make);
+    assert.equal(inScope.status, 'ok');
+    assert.equal(inScope.turns, 1);
+    // And a non-matching root still gates it out (scope still enforced).
+    const out = await runSessionEnd(payload, { ...SETTINGS, ...({ trace_roots: ['/work/other'] } as any) }, {}, inj.make);
+    assert.equal(out.turns, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runSessionEnd: skips subagent/teammate transcripts (parent captures them)', async () => {
+  // Agent-teams teammate sessions fire their own SessionEnd; building them would
+  // duplicate work the coordinator already nests. They live under .../subagents/.
+  const { transcriptPath, dir } = makeTranscript();
+  const sub = path.join(dir, 'session', 'subagents');
+  fs.mkdirSync(sub, { recursive: true });
+  const teammatePath = path.join(sub, 'agent-abc.jsonl');
+  fs.copyFileSync(transcriptPath, teammatePath);
+  const inj = injectedProvider();
+  try {
+    const payload = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 's1', transcript_path: teammatePath, cwd: '/work' });
+    const res = await runSessionEnd(payload, SETTINGS, {}, inj.make);
+    assert.equal(res.status, 'skipped');
+    assert.match(res.reason ?? '', /subagent|teammate/);
+    assert.equal(inj.exporter.getFinishedSpans().length, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

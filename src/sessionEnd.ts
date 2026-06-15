@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
+import * as fs from 'fs';
 import { Tracer } from '@opentelemetry/api';
 import { buildTrace } from './buildTrace.js';
 import { createTracerProvider } from './tracerProvider.js';
@@ -33,6 +34,34 @@ export interface SessionEndResult {
  * Resolve `trace_roots` from env (comma-separated `WEAVE_TRACE_ROOTS`) or the
  * settings file. Env wins. Empty ⇒ global (trace everything).
  */
+/**
+ * Read the working directory the session ran in from the transcript itself.
+ * Claude Code stamps `cwd` on transcript lines; the SessionEnd hook payload does
+ * NOT reliably include it (interactive sessions omit it), so the scope gate
+ * can't depend on the payload alone — without this it fail-closes and drops
+ * every trace whenever `trace_roots` is set. Scans the first lines for a `cwd`.
+ */
+export function cwdFromTranscript(transcriptPath: string): string | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+  let scanned = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    if (++scanned > 200) break; // cwd appears early; cap the scan
+    try {
+      const o = JSON.parse(line) as Record<string, unknown>;
+      if (typeof o['cwd'] === 'string' && o['cwd']) return o['cwd'] as string;
+    } catch {
+      // skip unparseable line
+    }
+  }
+  return undefined;
+}
+
 export function resolveTraceRoots(settings: Settings, env: NodeJS.ProcessEnv): string[] {
   const fromEnv = env['WEAVE_TRACE_ROOTS'];
   if (fromEnv && fromEnv.trim()) {
@@ -73,6 +102,13 @@ export async function runSessionEnd(
     return { status: 'skipped', reason: 'missing session_id or transcript_path', turns: 0 };
   }
 
+  // Subagent / agent-teams teammate sessions fire their own SessionEnd, but the
+  // parent coordinator's build already nests their work (correlated from
+  // <session>/subagents/). Skip them here to avoid standalone duplicate traces.
+  if (/[/\\]subagents[/\\]/.test(transcriptPath)) {
+    return { status: 'skipped', reason: 'subagent/teammate transcript (captured by the parent session)', turns: 0 };
+  }
+
   const weaveProject = env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
   const apiKey = env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
   if (!weaveProject || !apiKey) {
@@ -90,6 +126,11 @@ export async function runSessionEnd(
   const provider = makeProvider({ weaveProject, apiKey, baseUrl, agentName, debug });
   const tracer = provider.getTracer('weave-claude-code', VERSION);
 
+  // cwd drives the scope gate. The SessionEnd payload often omits it, so fall
+  // back to the cwd recorded in the transcript — otherwise a set `trace_roots`
+  // silently drops everything.
+  const cwd = payload.cwd || cwdFromTranscript(transcriptPath) || '';
+
   let turns = 0;
   try {
     turns = buildTrace(tracer, transcriptPath, {
@@ -97,7 +138,7 @@ export async function runSessionEnd(
       // Resume/forked-session conversation stitching is deferred; a fresh
       // session's conversation id equals its session id.
       conversationId: sessionId,
-      cwd: payload.cwd ?? '',
+      cwd,
       source: payload.source ?? 'session-end',
       agentName,
       pluginVersion: VERSION,
