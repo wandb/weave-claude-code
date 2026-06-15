@@ -131,6 +131,11 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
   // (extra same-type transcripts) attach in the leftover pass.
   const lastInvokeByType = new Map<string, Span>();
 
+  // invoke_agent spans are ended only after the leftover pass — re-spawned
+  // teammates attach (and set attributes) on the existing span for their type,
+  // so it must stay open until all leftovers are processed.
+  const openInvokes: Span[] = [];
+
   let turnNumber = 0;
   let lastTurnSpan: Span | undefined;
   for (const turn of parsed.turns) {
@@ -157,7 +162,7 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
     let toolCount = 0;
     for (const tc of turn.toolCalls()) {
       toolCount += 1;
-      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, opts);
+      emitToolCall(tracer, turnSpan, conversationId, tc, pool, lastInvokeByType, openInvokes, opts);
     }
 
     const finishReasons = turn
@@ -176,7 +181,10 @@ export function buildTrace(tracer: Tracer, transcriptPath: string, opts: BuildTr
 
   // Leftover pass: subagent transcripts not claimed by a spawning Agent call —
   // agent-teams re-spawns (extra same-type transcripts) and orphan teammates.
-  emitLeftoverSubagents(tracer, conversationId, pool, lastInvokeByType, lastTurnSpan, opts);
+  emitLeftoverSubagents(tracer, conversationId, pool, lastInvokeByType, lastTurnSpan, openInvokes, opts);
+
+  // All invoke_agent spans are now fully populated — close them.
+  for (const s of openInvokes) s.end();
 
   return turnNumber;
 }
@@ -194,6 +202,7 @@ function emitLeftoverSubagents(
   pool: SubagentEntry[],
   lastInvokeByType: Map<string, Span>,
   fallbackParent: Span | undefined,
+  openInvokes: Span[],
   opts: BuildTraceOptions,
 ): void {
   for (const e of pool) {
@@ -201,6 +210,7 @@ function emitLeftoverSubagents(
     e.consumed = true;
     const existing = lastInvokeByType.get(e.agentType);
     if (existing) {
+      // existing is still open (ended only after this pass) — safe to append.
       emitAgentSubtree(tracer, existing, conversationId, e.transcriptPath, opts);
       continue;
     }
@@ -211,8 +221,8 @@ function emitLeftoverSubagents(
       pluginVersion: opts.pluginVersion,
     });
     emitAgentSubtree(tracer, invokeSpan, conversationId, e.transcriptPath, opts);
-    invokeSpan.end();
     lastInvokeByType.set(e.agentType, invokeSpan);
+    openInvokes.push(invokeSpan); // ended by the caller after the full pass
   }
 }
 
@@ -229,6 +239,7 @@ function emitToolCall(
   tc: ToolCallDetail,
   pool: SubagentEntry[],
   lastInvokeByType: Map<string, Span>,
+  openInvokes: Span[],
   opts: BuildTraceOptions,
 ): void {
   if (tc.toolName === 'Agent') {
@@ -260,7 +271,8 @@ function emitToolCall(
     if (entry) {
       emitAgentSubtree(tracer, invokeSpan, conversationId, entry.transcriptPath, opts);
     }
-    invokeSpan.end();
+    // Ended by the caller after the leftover pass — re-spawns may still attach.
+    openInvokes.push(invokeSpan);
     return;
   }
 
@@ -298,18 +310,21 @@ function emitAgentSubtree(
   const parsed = parseSessionFile(agentTranscriptPath);
   if (!parsed) return;
   // A subagent can itself spawn subagents — correlate them with the same
-  // pool + leftover strategy, recursively (arbitrary nesting depth).
+  // pool + leftover strategy, recursively (arbitrary nesting depth). Nested
+  // invoke_agent spans are ended only after this subtree's own leftover pass.
   const nested = listSubagents(agentTranscriptPath);
   const nestedLastInvoke = new Map<string, Span>();
+  const nestedOpen: Span[] = [];
 
   let model: string | undefined;
   for (const turn of parsed.turns) {
     emitChatSpansFromAssistantCalls(tracer, invokeSpan, conversationId, turn.assistantCalls());
     for (const tc of turn.toolCalls()) {
-      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, opts);
+      emitToolCall(tracer, invokeSpan, conversationId, tc, nested, nestedLastInvoke, nestedOpen, opts);
     }
     model = turn.primaryModel() ?? model;
   }
-  emitLeftoverSubagents(tracer, conversationId, nested, nestedLastInvoke, invokeSpan, opts);
+  emitLeftoverSubagents(tracer, conversationId, nested, nestedLastInvoke, invokeSpan, nestedOpen, opts);
+  for (const s of nestedOpen) s.end();
   if (model) invokeSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
 }

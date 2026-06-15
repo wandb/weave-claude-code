@@ -195,6 +195,44 @@ test('buildTrace: agent-teams teammates correlate by type when meta lacks toolUs
   }
 });
 
+test('buildTrace: re-spawn leftover sets attrs on a still-open invoke_agent span (regression)', () => {
+  // Regression for "operation on ended Span": a re-spawn (leftover) attaches to
+  // the invoke_agent span created by the spawning Agent call. If that span were
+  // ended before the leftover pass, the re-spawn's RESPONSE_MODEL setAttribute
+  // would be silently dropped. Here the CLAIMED transcript has no model and the
+  // RE-SPAWN supplies it, so the model can only land if the span is still open.
+  const { tracer, exporter, provider } = setup();
+  const { transcriptPath, dir } = makeSession([
+    { type: 'user', message: { role: 'user', content: 'go' }, timestamp: '2026-01-01T00:00:00Z' },
+    {
+      type: 'assistant', timestamp: '2026-01-01T00:00:01Z',
+      message: { role: 'assistant', model: 'm', usage: {}, content: [{ type: 'tool_use', id: 'toolu_T', name: 'Agent', input: { subagent_type: 'r', team_name: 'tm', prompt: 'p' } }] },
+    },
+    { type: 'user', timestamp: '2026-01-01T00:00:09Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_T', content: 'd' }] } },
+  ]);
+  const sub = path.join(dir, 'session', 'subagents');
+  fs.mkdirSync(sub, { recursive: true });
+  // Claimed transcript: NO model. Re-spawn: HAS model 'respawn-model'.
+  fs.writeFileSync(path.join(sub, 'agent-a.jsonl'), JSON.stringify({ type: 'assistant', timestamp: '2026-01-01T00:00:02Z', message: { role: 'assistant', usage: {}, content: [{ type: 'text', text: 'x' }] } }));
+  fs.writeFileSync(path.join(sub, 'agent-a.meta.json'), JSON.stringify({ agentType: 'r' }));
+  fs.writeFileSync(path.join(sub, 'agent-b.jsonl'), JSON.stringify({ type: 'assistant', timestamp: '2026-01-01T00:00:05Z', message: { role: 'assistant', model: 'respawn-model', usage: {}, content: [{ type: 'text', text: 'y' }] } }));
+  fs.writeFileSync(path.join(sub, 'agent-b.meta.json'), JSON.stringify({ agentType: 'r' }));
+  // Make agent-b newer so it sorts after agent-a (claimed first).
+  const now = Date.now();
+  fs.utimesSync(path.join(sub, 'agent-a.jsonl'), new Date(now - 10000), new Date(now - 10000));
+  fs.utimesSync(path.join(sub, 'agent-b.jsonl'), new Date(now), new Date(now));
+  try {
+    buildTrace(tracer, transcriptPath, OPTS);
+    provider.forceFlush();
+    const invoke = exporter.getFinishedSpans().find(s => s.name === 'invoke_agent r')!;
+    assert.ok(invoke, 'invoke_agent span present');
+    assert.equal(invoke.attributes[ATTR.RESPONSE_MODEL], 'respawn-model',
+      'model set by the re-spawn leftover must land — proves span was still open');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('buildTrace: multi-turn top-level produces one invoke_agent root per turn', () => {
   const { tracer, exporter, provider } = setup();
   const { transcriptPath, dir } = makeSession([
