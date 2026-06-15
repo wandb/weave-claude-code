@@ -124,6 +124,58 @@ This is especially useful with `weave-claude-code install --non-interactive`, wh
 
 ---
 
+## Tracing Modes: Daemon (default) vs. Daemonless
+
+The plugin can build traces two ways. **The default is `daemon` and nothing
+changes unless you opt in** — upgrading is a no-op, and settings files written
+before this option existed are treated as `daemon`.
+
+| Mode | How it works | Background process? |
+|------|--------------|---------------------|
+| `daemon` *(default)* | A persistent background daemon holds OTel spans open and streams them as hook events arrive across every session on the machine. | Yes — one long-lived process + a Unix socket. |
+| `session-end` | No daemon. When a session ends, a `SessionEnd` hook rebuilds that session's **entire** span tree from its transcript in one pass and uploads it, then exits. | No — nothing persistent. |
+
+### Why you might switch to `session-end`
+
+The daemon is a single global process holding a Unix socket and in-memory
+session state. When it dies ungracefully (closing a terminal / `SIGHUP`, OOM, or
+`kill`), the socket goes stale: events are silently dropped, you see
+`Unknown session` errors, and tracing stops until it's restarted. `session-end`
+removes that entire failure class — there's no shared process or socket to go
+stale, each session is traced independently, and a per-instance setting like
+`WANDB_BASE_URL` is picked up fresh every session (no daemon-restart dance).
+
+**Choose `session-end` if** you hit daemon flakiness (stale socket /
+`Unknown session` / needing to restart), you run agent-teams or long sessions,
+or you simply want a stateless setup with no background process. **Stay on
+`daemon`** otherwise — it streams spans live during a session, which
+`session-end` does not (it uploads once, at session end).
+
+### Trade-off
+
+`session-end` reconstructs everything **structural** from the transcript —
+turns, chat/LLM calls, tool calls and results, nested subagents and agent-teams
+teammates, token usage, and models. It does **not** currently capture two
+hook-only enrichments: permission-request span events and context-compaction
+stats. Everything you need to read a trace is present; these two extras are
+planned for a follow-up.
+
+### How to switch
+
+```bash
+# Opt in to daemonless tracing
+weave-claude-code config set trace_mode session-end
+
+# Revert to the default daemon
+weave-claude-code config set trace_mode daemon
+```
+
+Then reload plugins (`/reload-plugins` inside a session) or relaunch `claude`.
+`WEAVE_TRACE_MODE=session-end` can also be set in the environment to switch the
+hook routing for the current shell without changing the saved setting.
+
+---
+
 ## Sending Traces to a Dedicated or Private W&B Instance
 
 If you use W&B Dedicated Cloud or a self-hosted instance, set `WANDB_BASE_URL` to point the plugin at your deployment before launching Claude Code:
