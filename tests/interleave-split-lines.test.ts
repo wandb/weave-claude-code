@@ -76,13 +76,14 @@ function makeDaemon(tracer: ReturnType<typeof setupTracer>['tracer']): GlobalDae
   return d;
 }
 
-test('reconstruction: split thinking/text/tool_use lines interleave, none dropped, usage counted once', async () => {
+test('reconstruction: split thinking/redacted_thinking/text/tool_use lines interleave, none dropped, usage counted once', async () => {
   // One turn:
-  //   response msgA: thinking, text, tool_use  (3 split lines, shared id)
+  //   response msgA: thinking, redacted_thinking, text, tool_use  (4 split lines, shared id)
   //   response msgB: text-only (no tool_use)
   const file = writeTranscript([
     userText('2026-01-01T00:00:00.000Z', 'do the thing'),
     aLine('msgA', '2026-01-01T00:00:01.000Z', { type: 'thinking', thinking: 'let me think' }),
+    aLine('msgA', '2026-01-01T00:00:01.500Z', { type: 'redacted_thinking', data: 'ENCRYPTED' }),
     aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }),
     aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'),
     aLine('msgB', '2026-01-01T00:00:10.000Z', { type: 'text', text: 'all done' }, 'end_turn'),
@@ -94,7 +95,7 @@ test('reconstruction: split thinking/text/tool_use lines interleave, none droppe
     assert.ok(parsed);
     const calls = parsed.turns[parsed.turns.length - 1].assistantCalls();
     // Sanity: the parser really does split one response across lines.
-    assert.equal(calls.filter(c => c.responseId === 'msgA').length, 3, 'msgA is 3 split lines');
+    assert.equal(calls.filter(c => c.responseId === 'msgA').length, 4, 'msgA is 4 split lines');
 
     const daemon = makeDaemon(tracer);
     const turn = tracer.startSpan('invoke_agent claude-code');
@@ -125,16 +126,24 @@ test('reconstruction: split thinking/text/tool_use lines interleave, none droppe
         .sort((a, b) => hrToNs(a.startTime) - hrToNs(b.startTime));
 
     const aChildren = childrenOf(chatA);
-    // thinking + text are NOT dropped, and appear in transcript order.
+    // thinking, redacted_thinking, and text are NOT dropped, and appear in
+    // transcript order. redacted_thinking has no readable content, so it
+    // surfaces as a placeholder thinking span rather than being dropped.
     assert.deepEqual(
       aChildren.map(s => s.attributes[ATTR.OPERATION_NAME]),
-      [OP.THINKING, OP.ASSISTANT_TEXT],
-      'thinking then text, both present (the dropped-text regression)',
+      [OP.THINKING, OP.THINKING, OP.ASSISTANT_TEXT],
+      'thinking, redacted placeholder, text — all present, in order',
+    );
+    assert.deepEqual(
+      JSON.parse(aChildren[1].attributes[ATTR.OUTPUT_MESSAGES] as string),
+      [{ role: 'assistant', parts: [{ type: 'thinking', content: '[redacted]' }] }],
+      'redacted_thinking renders a [redacted] placeholder',
     );
     // Each child is stamped with its transcript line timestamp (so it sorts
     // before the tool_use of the same response, whose live span starts later).
     assert.equal(isoOf(aChildren[0].startTime), '2026-01-01T00:00:01.000Z');
-    assert.equal(isoOf(aChildren[1].startTime), '2026-01-01T00:00:02.000Z');
+    assert.equal(isoOf(aChildren[1].startTime), '2026-01-01T00:00:01.500Z');
+    assert.equal(isoOf(aChildren[2].startTime), '2026-01-01T00:00:02.000Z');
 
     // Usage counted ONCE for the response (not 3x for the 3 split lines).
     assert.equal(chatA.attributes[ATTR.USAGE_OUTPUT_TOKENS], 1508);

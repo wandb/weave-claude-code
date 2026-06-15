@@ -1068,6 +1068,10 @@ export class GlobalDaemon {
         if (typeof text === 'string' && text.trim()) {
           emitThinkingSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
         }
+      } else if (block['type'] === 'redacted_thinking') {
+        // Reasoning withheld by safety filtering: the `data` blob is encrypted,
+        // so surface a placeholder thinking span to keep it in transcript order.
+        emitThinkingSpan(this.tracer, parent, { conversationId, text: '[redacted]', startedAt: ts, endedAt: ts });
       }
     }
   }
