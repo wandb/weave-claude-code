@@ -18,7 +18,7 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import { loadSettings, VERSION } from './setup.js';
+import { loadSettings, VERSION, type Settings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import {
   parseSessionFd,
@@ -54,20 +54,19 @@ import type { AssistantCallDetail, ParsedSession } from './parser.js';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Inbound control message sent directly to the socket (not a hook event). */
+/** Inbound control message sent directly to the socket (not a hook event).
+ *  `shutdown` stops the daemon; `config-hash` asks it to reply with the
+ *  fingerprint of the config it loaded (used by `status` for drift detection). */
 interface ControlMessage {
-  command: 'shutdown';
+  command: 'shutdown' | 'config-hash';
 }
 
 /** Raw hook-event payload forwarded by hook-handler.sh. */
 type HookPayload = Record<string, unknown>;
 
 function isControlMessage(payload: unknown): payload is ControlMessage {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    (payload as ControlMessage).command === 'shutdown'
-  );
+  const cmd = (payload as ControlMessage | null)?.command;
+  return typeof payload === 'object' && payload !== null && (cmd === 'shutdown' || cmd === 'config-hash');
 }
 
 /** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
@@ -467,7 +466,10 @@ export class GlobalDaemon {
 
     // Restrict socket to owner-only access
     const prevUmask = process.umask(0o077);
-    this.server = net.createServer((socket) => this.handleConnection(socket));
+    // allowHalfOpen lets handleConnection write a reply after the client
+    // half-closes (the `config-hash` query). Every branch closes the socket
+    // explicitly so the high-frequency hook-event path still ends promptly.
+    this.server = net.createServer({ allowHalfOpen: true }, (socket) => this.handleConnection(socket));
     await new Promise<void>((resolve, reject) => {
       this.server!.listen(this.socketPath, resolve);
       this.server!.once('error', reject);
@@ -561,25 +563,34 @@ export class GlobalDaemon {
 
     socket.on('end', () => {
       clearTimeout(timer);
-      if (rejectedForSize) return;
+      if (rejectedForSize) { socket.destroy(); return; }
       const raw = Buffer.concat(chunks).toString('utf8').trim();
-      if (!raw) return;
+      if (!raw) { socket.end(); return; }
 
       let payload: unknown;
       try {
         payload = JSON.parse(raw);
       } catch {
         this.log('ERROR', `Malformed JSON from hook: ${raw.slice(0, 200)}`);
+        socket.end();
         return;
       }
 
       this.lastActivity = Date.now();
 
       if (isControlMessage(payload)) {
-        void this.shutdown('control message');
+        if (payload.command === 'config-hash') {
+          socket.end(JSON.stringify({ config_hash: this.configFingerprint() }));
+        } else {
+          socket.end();
+          void this.shutdown('control message');
+        }
         return;
       }
 
+      // Payload is already buffered, so close now rather than holding the
+      // half-open socket open while routeEvent runs.
+      socket.end();
       const hookPayload = payload as HookPayload;
       const sessionId = hookPayload['session_id'] as string | undefined;
       if (sessionId) {
@@ -1839,10 +1850,62 @@ export class GlobalDaemon {
     return 'tool_error';
   }
 
+  /** Fingerprint of the config this daemon loaded at startup. Held in memory;
+   *  replied over the socket for the `config-hash` control message. */
+  private configFingerprint(): string {
+    return daemonConfigFingerprint({
+      weaveProject: this.weaveProject,
+      apiKey: this.apiKey,
+      baseUrl: this.baseUrl,
+      agentName: this.agentName,
+      debug: this.debugEnabled,
+    });
+  }
+
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
     if (level === 'DEBUG' && !this.debugEnabled) return;
     appendToLog(this.logFile, level, msg);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Config resolution and fingerprinting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The config the daemon loads at startup and holds for its lifetime. */
+export interface DaemonConfig {
+  weaveProject: string | null;
+  apiKey: string | null;
+  baseUrl: string;
+  agentName: string;
+  debug: boolean;
+}
+
+/** Resolve the effective daemon config from settings + env, applying the same
+ *  env-over-settings precedence the daemon uses at startup. */
+export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv): DaemonConfig {
+  return {
+    weaveProject: env['WEAVE_PROJECT'] ?? settings.weave_project ?? null,
+    apiKey: env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null,
+    baseUrl: (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, ''),
+    // `||` (not `??`) so an empty/whitespace value falls through to the default
+    // rather than producing a blank `invoke_agent ` span name.
+    agentName: env['WEAVE_AGENT_NAME']?.trim() || settings.agent_name?.trim() || DEFAULT_AGENT_NAME,
+    debug: !!env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true,
+  };
+}
+
+/** Hex chars kept from the config hash. 16 (64 bits) is ample to detect a
+ *  config change while keeping the value compact for logs and the socket reply. */
+const CONFIG_FINGERPRINT_LENGTH = 16;
+
+/** Short, stable hash of a daemon config. The API key is hashed, not exposed,
+ *  so the fingerprint is safe to send over the socket. */
+export function daemonConfigFingerprint(c: DaemonConfig): string {
+  return createHash('sha256')
+    .update(JSON.stringify([c.weaveProject, c.apiKey, c.baseUrl, c.agentName, c.debug]))
+    .digest('hex')
+    .slice(0, CONFIG_FINGERPRINT_LENGTH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1855,15 +1918,7 @@ export async function runDaemon(): Promise<void> {
 
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
 
-  const weaveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-  const apiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-  const baseUrl = (process.env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
-  // `||` (not `??`) so an empty/whitespace env var or setting falls through to
-  // the default rather than producing a blank `invoke_agent ` span name.
-  const agentName =
-    process.env['WEAVE_AGENT_NAME']?.trim() ||
-    settings.agent_name?.trim() ||
-    DEFAULT_AGENT_NAME;
+  const { weaveProject, apiKey, baseUrl, agentName, debug } = resolveDaemonConfig(settings, process.env);
 
   if (!weaveProject || !apiKey) {
     const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
@@ -1874,8 +1929,7 @@ export async function runDaemon(): Promise<void> {
   // Ensure downstream tooling (e.g. wandb settings) still sees the API key.
   process.env['WANDB_API_KEY'] = apiKey;
 
-  const debugEnabled = !!process.env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true;
-  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debugEnabled, agentName);
+  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debug, agentName);
 
   try {
     await daemon.start();

@@ -45,6 +45,34 @@ export function sendToSocket(socketPath: string, message: string): Promise<void>
 }
 
 /**
+ * Send a message and read the daemon's reply. Like `sendToSocket`, but the
+ * daemon writes a response before closing (e.g. the `config-hash` query), so
+ * this resolves with that response string. Rejects on connect error or timeout
+ * so callers can treat "no reply" as "cannot determine".
+ */
+export function requestFromSocket(socketPath: string, message: string, timeoutMs = 2000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const client = net.createConnection(socketPath, () => {
+      client.write(message);
+      client.end(); // half-close: done sending; the daemon replies then closes
+    });
+    client.setEncoding('utf8');
+    client.on('data', (chunk: string) => { data += chunk; });
+    client.on('close', () => settle(() => resolve(data)));
+    client.on('error', (err) => settle(() => reject(err)));
+    const timer = setTimeout(() => settle(() => { client.destroy(); reject(new Error('socket request timed out')); }), timeoutMs);
+  });
+}
+
+/**
  * Locate the `claude` CLI binary via `which`. Returns the absolute path or null if not found.
  */
 export function findClaudeCLI(): string | null {
