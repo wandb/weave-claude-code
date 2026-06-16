@@ -191,9 +191,9 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
 // Blocks reach us as `unknown` from the transcript; the guards below narrow the
 // ones we care about. Any other block type falls through every guard and is
 // ignored.
-export interface TextBlock { type: 'text'; text: string; }
-export interface ThinkingBlock { type: 'thinking'; thinking: string; }
-export interface RedactedThinkingBlock { type: 'redacted_thinking'; data?: string; }
+type TextBlock = { type: 'text'; text: string };
+type ThinkingBlock = { type: 'thinking'; thinking: string };
+type RedactedThinkingBlock = { type: 'redacted_thinking'; data?: string };
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -219,8 +219,8 @@ export function isRedactedThinkingBlock(block: unknown): block is RedactedThinki
 export function extractAssistantTextBlocks(blocks: unknown[]): string[] {
   const out: string[] = [];
   for (const block of blocks) {
-    if (typeof block === 'string') {
-      if (block.trim()) out.push(block);
+    if (typeof block === 'string' && block.trim()) {
+      out.push(block);
     } else if (isTextBlock(block) && block.text.trim()) {
       out.push(block.text);
     }

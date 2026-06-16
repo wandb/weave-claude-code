@@ -1062,14 +1062,10 @@ export class GlobalDaemon {
   ): void {
     if (!this.tracer) return;
     for (const block of blocks) {
-      if (isTextBlock(block)) {
-        if (block.text.trim()) {
-          emitAssistantTextSpan(this.tracer, parent, { conversationId, text: block.text, startedAt: ts, endedAt: ts });
-        }
-      } else if (isThinkingBlock(block)) {
-        if (block.thinking.trim()) {
-          emitThinkingSpan(this.tracer, parent, { conversationId, text: block.thinking, startedAt: ts, endedAt: ts });
-        }
+      if (isTextBlock(block) && block.text.trim()) {
+        emitAssistantTextSpan(this.tracer, parent, { conversationId, text: block.text, startedAt: ts, endedAt: ts });
+      } else if (isThinkingBlock(block) && block.thinking.trim()) {
+        emitThinkingSpan(this.tracer, parent, { conversationId, text: block.thinking, startedAt: ts, endedAt: ts });
       } else if (isRedactedThinkingBlock(block)) {
         // Reasoning withheld by safety filtering: the `data` blob is encrypted,
         // so surface a placeholder thinking span to keep it in transcript order.
