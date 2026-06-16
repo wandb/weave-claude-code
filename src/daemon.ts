@@ -20,7 +20,13 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import { parseSessionFd, extractAssistantTextBlocks } from './parser.js';
+import {
+  parseSessionFd,
+  extractAssistantTextBlocks,
+  isTextBlock,
+  isThinkingBlock,
+  isRedactedThinkingBlock,
+} from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
@@ -1055,20 +1061,16 @@ export class GlobalDaemon {
     conversationId: string,
   ): void {
     if (!this.tracer) return;
-    for (const raw of blocks) {
-      const block = raw as Record<string, unknown> | undefined;
-      if (!block || typeof block !== 'object') continue;
-      if (block['type'] === 'text') {
-        const text = block['text'];
-        if (typeof text === 'string' && text.trim()) {
-          emitAssistantTextSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
+    for (const block of blocks) {
+      if (isTextBlock(block)) {
+        if (block.text.trim()) {
+          emitAssistantTextSpan(this.tracer, parent, { conversationId, text: block.text, startedAt: ts, endedAt: ts });
         }
-      } else if (block['type'] === 'thinking') {
-        const text = block['thinking'];
-        if (typeof text === 'string' && text.trim()) {
-          emitThinkingSpan(this.tracer, parent, { conversationId, text, startedAt: ts, endedAt: ts });
+      } else if (isThinkingBlock(block)) {
+        if (block.thinking.trim()) {
+          emitThinkingSpan(this.tracer, parent, { conversationId, text: block.thinking, startedAt: ts, endedAt: ts });
         }
-      } else if (block['type'] === 'redacted_thinking') {
+      } else if (isRedactedThinkingBlock(block)) {
         // Reasoning withheld by safety filtering: the `data` blob is encrypted,
         // so surface a placeholder thinking span to keep it in transcript order.
         emitThinkingSpan(this.tracer, parent, { conversationId, text: '[redacted]', startedAt: ts, endedAt: ts });
