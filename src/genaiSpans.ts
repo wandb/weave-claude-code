@@ -3,6 +3,7 @@
 // SPDX-PackageName: weave-claude-code
 
 import {
+  Attributes,
   Span,
   SpanKind,
   Tracer,
@@ -105,14 +106,15 @@ export const DEFAULT_AGENT_NAME = 'claude-code';
 // `execute_tool` are well-known values from the OTel GenAI semantic conventions
 // (https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/registry/attributes/gen-ai.md#gen-ai-operation-name);
 // the spec mandates the well-known value whenever one applies. `assistant_text`
-// has no well-known equivalent, so it's a spec-permitted custom value: the
-// model's natural-language output, emitted as a `chat` child so it interleaves
-// with sibling `execute_tool` spans.
+// and `thinking` have no well-known equivalent, so they're spec-permitted custom
+// values — the model's natural-language output and its private reasoning, each
+// emitted as a `chat` child so they interleave with sibling `execute_tool` spans.
 export const OP = {
   INVOKE_AGENT: 'invoke_agent',
   CHAT: 'chat',
   EXECUTE_TOOL: 'execute_tool',
   ASSISTANT_TEXT: 'assistant_text',
+  THINKING: 'thinking',
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +157,7 @@ export function ctxWithParent(parent: Span): Context {
 // Span builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface TurnSpanArgs {
+type TurnSpanArgs = {
   /** Current process's Claude Code session id — stamped on the span as a
    *  debug breadcrumb (`weave.claude_code.session.id`). Per resume, this
    *  changes; the conversation id does not. */
@@ -176,7 +178,7 @@ export interface TurnSpanArgs {
   agentName: string;
   requestModel?: string;
   displayName?: string;
-}
+};
 
 /**
  * Start a turn span. Each turn is the root of its own trace; the Weave Agents
@@ -185,7 +187,7 @@ export interface TurnSpanArgs {
  * turn span so it's queryable without a separate session-level span.
  */
 export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
-  const attrs: Record<string, string | number> = {
+  const attrs: Attributes = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
     [ATTR.AGENT_NAME]: args.agentName,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
@@ -207,7 +209,7 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   );
 }
 
-export interface InvokeAgentSpanArgs {
+type InvokeAgentSpanArgs = {
   /** Agent type label — becomes the second word of the span name and is
    *  stamped as `gen_ai.agent.name`. For Claude Code subagents this is the
    *  `subagent_type` from the spawning `Agent` tool call (e.g. "Explore",
@@ -227,7 +229,7 @@ export interface InvokeAgentSpanArgs {
    *  invocation with the spawning tool call. */
   spawningToolCallId?: string;
   displayName?: string;
-}
+};
 
 /**
  * Start a nested `invoke_agent` span — used for subagents Claude Code
@@ -242,7 +244,7 @@ export function startInvokeAgentSpan(
   parentSpan: Span,
   args: InvokeAgentSpanArgs,
 ): Span {
-  const attrs: Record<string, string | number> = {
+  const attrs: Attributes = {
     [ATTR.OPERATION_NAME]: OP.INVOKE_AGENT,
     [ATTR.AGENT_NAME]: args.agentType,
     [ATTR.AGENT_VERSION]: args.pluginVersion,
@@ -263,15 +265,15 @@ export function startInvokeAgentSpan(
   );
 }
 
-export interface ToolSpanArgs {
+type ToolSpanArgs = {
   toolName: string;
   toolUseId: string;
   toolInput: Record<string, unknown>;
   displayName?: string;
-}
+};
 
 export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanArgs): Span {
-  const attrs: Record<string, string> = {
+  const attrs: Attributes = {
     [ATTR.OPERATION_NAME]: OP.EXECUTE_TOOL,
     [ATTR.TOOL_NAME]: args.toolName,
     [ATTR.TOOL_CALL_ID]: args.toolUseId,
@@ -286,7 +288,7 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
   );
 }
 
-export interface ChatSpanArgs {
+type ChatSpanArgs = {
   /** Stitching key — same value as the parent turn span's
    *  `gen_ai.conversation.id`. For subagent chats this is suffixed with
    *  `:${agent_id}` upstream so the subagent's calls form their own
@@ -301,14 +303,14 @@ export interface ChatSpanArgs {
   finishReasons?: string[];
   inputMessages?: unknown;
   outputMessages?: unknown;
-}
+};
 
 /**
  * Emit a chat span as a child of `parentSpan`. The span is started AND ended
  * inside this helper. Used by code paths that construct the chat span from
  * transcript data after the fact (SubagentStop, TeammateIdle). For the main
- * agent path — where the chat span parents the assistant_text / execute_tool
- * spans that occur during the API call — use `startChatSpan` /
+ * agent path — where the chat span parents the assistant_text / thinking /
+ * execute_tool spans that occur during the API call — use `startChatSpan` /
  * `finalizeChatSpan` instead.
  */
 export function emitChatSpan(
@@ -332,11 +334,11 @@ export function emitChatSpan(
   });
 }
 
-export interface StartChatSpanArgs {
+type StartChatSpanArgs = {
   conversationId: string;
   model?: string;
   startedAt: TimeInput;
-}
+};
 
 /**
  * Start a chat span (open). Caller is responsible for emitting any child
@@ -352,7 +354,7 @@ export function startChatSpan(
   parentSpan: Span,
   args: StartChatSpanArgs,
 ): Span {
-  const attrs: Record<string, string | number | boolean | string[]> = {
+  const attrs: Attributes = {
     [ATTR.OPERATION_NAME]: OP.CHAT,
     [ATTR.CONVERSATION_ID]: args.conversationId,
     [ATTR.OUTPUT_TYPE]: 'text',
@@ -370,7 +372,7 @@ export function startChatSpan(
   );
 }
 
-export interface FinalizeChatSpanArgs {
+type FinalizeChatSpanArgs = {
   usage: UsageSummary;
   reasoningTokens?: number;
   responseId?: string;
@@ -381,7 +383,7 @@ export interface FinalizeChatSpanArgs {
    *  attribute and updates the span name. */
   model?: string;
   endedAt?: TimeInput;
-}
+};
 
 /** Stamp usage / response attrs on an open chat span and end it. */
 export function finalizeChatSpan(span: Span, args: FinalizeChatSpanArgs): void {
@@ -425,12 +427,12 @@ export function finalizeChatSpan(span: Span, args: FinalizeChatSpanArgs): void {
   span.end(args.endedAt);
 }
 
-export interface AssistantTextSpanArgs {
+type AssistantTextSpanArgs = {
   conversationId: string;
   text: string;
   startedAt?: TimeInput;
   endedAt?: TimeInput;
-}
+};
 
 /**
  * Emit a span representing one text content block from an assistant message.
@@ -445,7 +447,7 @@ export function emitAssistantTextSpan(
   parentSpan: Span,
   args: AssistantTextSpanArgs,
 ): void {
-  const attrs: Record<string, string> = {
+  const attrs: Attributes = {
     [ATTR.OPERATION_NAME]: OP.ASSISTANT_TEXT,
     [ATTR.CONVERSATION_ID]: args.conversationId,
     [ATTR.OUTPUT_MESSAGES]: jsonStr([
@@ -454,6 +456,39 @@ export function emitAssistantTextSpan(
   };
   const span = tracer.startSpan(
     OP.ASSISTANT_TEXT,
+    { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
+    ctxWithParent(parentSpan),
+  );
+  span.end(args.endedAt ?? args.startedAt);
+}
+
+type ThinkingSpanArgs = {
+  conversationId: string;
+  text: string;
+  startedAt?: TimeInput;
+  endedAt?: TimeInput;
+};
+
+/**
+ * Emit a span representing one thinking content block. Like
+ * `emitAssistantTextSpan` but for `{type: 'thinking'}` blocks — Claude's
+ * private reasoning surfaced in its content stream. Kept distinct so callers
+ * can hide thinking spans in the UI without hiding ordinary assistant text.
+ */
+export function emitThinkingSpan(
+  tracer: Tracer,
+  parentSpan: Span,
+  args: ThinkingSpanArgs,
+): void {
+  const attrs: Attributes = {
+    [ATTR.OPERATION_NAME]: OP.THINKING,
+    [ATTR.CONVERSATION_ID]: args.conversationId,
+    [ATTR.OUTPUT_MESSAGES]: jsonStr([
+      { role: 'assistant', parts: [{ type: 'thinking', content: args.text }] },
+    ]),
+  };
+  const span = tracer.startSpan(
+    OP.THINKING,
     { kind: SpanKind.INTERNAL, attributes: attrs, startTime: args.startedAt },
     ctxWithParent(parentSpan),
   );
@@ -513,7 +548,7 @@ export interface PermissionRequestEventArgs {
 
 /** Added at PermissionRequest time. Records that the request happened. */
 export function addPermissionRequestEvent(toolSpan: Span, args: PermissionRequestEventArgs): void {
-  const attrs: Record<string, string> = {};
+  const attrs: Attributes = {};
   if (args.suggestions !== undefined) {
     attrs[ATTR.EVT_PERMISSION_SUGGESTIONS] = jsonStr(args.suggestions);
   }

@@ -187,6 +187,30 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
   };
 }
 
+// The assistant content-block shapes we act on (Anthropic Messages API).
+// Blocks reach us as `unknown` from the transcript; the guards below narrow the
+// ones we care about. Any other block type falls through every guard and is
+// ignored.
+type TextBlock = { type: 'text'; text: string };
+type ThinkingBlock = { type: 'thinking'; thinking: string };
+type RedactedThinkingBlock = { type: 'redacted_thinking'; data?: string };
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+export function isTextBlock(block: unknown): block is TextBlock {
+  return isObject(block) && block['type'] === 'text' && typeof block['text'] === 'string';
+}
+
+export function isThinkingBlock(block: unknown): block is ThinkingBlock {
+  return isObject(block) && block['type'] === 'thinking' && typeof block['thinking'] === 'string';
+}
+
+export function isRedactedThinkingBlock(block: unknown): block is RedactedThinkingBlock {
+  return isObject(block) && block['type'] === 'redacted_thinking';
+}
+
 /**
  * Pull human-readable text out of assistant `content` blocks. Accepts the raw
  * union (string entries, `{type: 'text', text}` objects, etc.) and returns
@@ -195,14 +219,10 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
 export function extractAssistantTextBlocks(blocks: unknown[]): string[] {
   const out: string[] = [];
   for (const block of blocks) {
-    if (typeof block === 'string') {
-      if (block.trim()) out.push(block);
-      continue;
-    }
-    if (!block || typeof block !== 'object') continue;
-    const obj = block as Record<string, unknown>;
-    if (obj['type'] === 'text' && typeof obj['text'] === 'string' && (obj['text'] as string).trim()) {
-      out.push(obj['text'] as string);
+    if (typeof block === 'string' && block.trim()) {
+      out.push(block);
+    } else if (isTextBlock(block) && block.text.trim()) {
+      out.push(block.text);
     }
   }
   return out;

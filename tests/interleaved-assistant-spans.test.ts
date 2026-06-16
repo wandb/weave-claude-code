@@ -12,9 +12,9 @@
 // every interstitial utterance smushed together.
 //
 // New behavior: each assistant API call gets a chat span that PARENTS the
-// tool spans AND per-block assistant_text spans that occur during that call,
-// in transcript order. Token usage stays on the chat span (where it
-// accurately represents one API invocation).
+// tool spans AND per-block assistant_text / thinking spans that occur during
+// that call, in transcript order. Token usage stays on the chat span (where
+// it accurately represents one API invocation).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -29,6 +29,7 @@ import {
   finalizeChatSpan,
   startToolSpan,
   emitAssistantTextSpan,
+  emitThinkingSpan,
   OP,
   ATTR,
 } from '../src/genaiSpans.ts';
@@ -139,6 +140,32 @@ test('chat span parents per-block assistant_text and execute_tool children in tr
     JSON.parse(chatChildren[0].attributes[ATTR.OUTPUT_MESSAGES] as string),
     [{ role: 'assistant', parts: [{ type: 'text', content: 'Now let me add the method' }] }],
   );
+});
+
+test('emitThinkingSpan: thinking content lands as a thinking part on its own span', async () => {
+  const { tracer, exporter, provider } = setupTracer();
+  const parent = tracer.startSpan('chat');
+
+  emitThinkingSpan(tracer, parent, {
+    conversationId: 'conv-1',
+    text: 'Let me reason about this...',
+  });
+
+  parent.end();
+  await provider.forceFlush();
+
+  const span = exporter
+    .getFinishedSpans()
+    .find((s) => s.attributes[ATTR.OPERATION_NAME] === OP.THINKING);
+  assert.ok(span);
+  assert.equal(span.name, OP.THINKING);
+  const messages = JSON.parse(span.attributes[ATTR.OUTPUT_MESSAGES] as string);
+  assert.deepEqual(messages, [
+    {
+      role: 'assistant',
+      parts: [{ type: 'thinking', content: 'Let me reason about this...' }],
+    },
+  ]);
 });
 
 test('startChatSpan without model: finalizeChatSpan stamps the model and updates the name', async () => {
