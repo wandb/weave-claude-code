@@ -226,7 +226,7 @@ Read or update plugin configuration without leaving Claude Code.
 ## What Gets Traced
 
 The plugin emits OTel spans that follow the [GenAI semantic
-conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) and ships
+conventions](https://github.com/open-telemetry/semantic-conventions-genai) and ships
 them to the Weave Agents observability backend (`/agents/otel/v1/traces`).
 Each user prompt produces one OTel trace (the "turn"); multi-turn
 conversations are stitched together server-side via
