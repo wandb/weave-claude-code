@@ -48,6 +48,7 @@ Commands:
   status             Check installation status (pass --json for machine-readable output)
   logs               Display daemon logs (--tail N, --follow)
   daemon             Start the background daemon (used by hook handler)
+  restart            Restart the daemon to apply configuration changes
   uninstall          Remove the plugin and all associated files
 
 Options:
@@ -717,6 +718,91 @@ async function cmdUninstall(keepLogs: boolean): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// restart
+// ---------------------------------------------------------------------------
+
+/** How long `restart` waits for the daemon to stop, then to come back up. */
+const RESTART_WAIT_MS = 5000;
+/** How often to re-probe the socket while waiting during `restart`. */
+const RESTART_POLL_INTERVAL_MS = 50;
+
+/** Poll the socket until `want` holds; false on timeout. */
+async function waitForSocketState(
+  socketPath: string,
+  want: (s: SocketState) => boolean,
+  timeoutMs = RESTART_WAIT_MS,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (want(await probeUnixSocket(socketPath))) return true;
+    await new Promise((r) => setTimeout(r, RESTART_POLL_INTERVAL_MS));
+  }
+  return false;
+}
+
+/**
+ * Restart the daemon so config changes take effect: it reads settings once at
+ * startup (see runDaemon), so changes need a fresh process.
+ */
+async function cmdRestart(): Promise<void> {
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  const socketPath = settings.daemon_socket;
+
+  // Stop the running daemon, if any.
+  if ((await probeUnixSocket(socketPath)) === SocketState.Alive) {
+    try {
+      await sendToSocket(socketPath, JSON.stringify({ command: 'shutdown' }));
+    } catch {
+      // Connection may drop as it exits; the probe below confirms.
+    }
+    if (!(await waitForSocketState(socketPath, (s) => s !== SocketState.Alive))) {
+      console.error('⚠ Existing daemon did not stop within 5s. Aborting restart.');
+      console.error('  Diagnose: weave-claude-code status');
+      process.exit(1);
+    }
+    console.log('✓ Stopped running daemon');
+  } else {
+    console.log('- No running daemon to stop');
+  }
+
+  // Don't spawn a daemon that would just exit for lack of config (mirrors runDaemon).
+  const project = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+  const apiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  if (!project || !apiKey) {
+    const missing = [!project && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
+    console.error(`⚠ Not starting daemon, missing configuration: ${missing}`);
+    console.error('  Set it with: weave-claude-code config set weave_project ENTITY/PROJECT');
+    process.exit(1);
+  }
+
+  // Detached, reusing this process's runtime (execArgv) so it works as the
+  // installed JS bin and under tsx in tests.
+  const child = spawn(
+    process.execPath,
+    [...process.execArgv, process.argv[1]!, 'daemon'],
+    { detached: true, stdio: 'ignore' },
+  );
+  child.unref();
+
+  if (!(await waitForSocketState(socketPath, (s) => s === SocketState.Alive))) {
+    console.error('⚠ Daemon did not start within 5s.');
+    console.error('  Diagnose: weave-claude-code status');
+    console.error('  Logs:     weave-claude-code logs --tail 50');
+    process.exit(1);
+  }
+
+  console.log('✓ Daemon restarted');
+  console.log(`  Tracing as: ${resolveAgentName(settings).value}`);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -772,6 +858,11 @@ async function main(): Promise<void> {
 
   if (cmd === 'daemon') {
     await runDaemon();
+    return;
+  }
+
+  if (cmd === 'restart') {
+    await cmdRestart();
     return;
   }
 

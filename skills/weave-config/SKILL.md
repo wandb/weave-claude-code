@@ -52,4 +52,12 @@ weave-claude-code config get KEY
 
 ## After Changes
 
-After setting `weave_project` or `wandb_api_key`, confirm the update by running `weave-claude-code config show` and reporting the new value to the user. Note that changes take effect immediately for the next Claude Code session — no restart required.
+After setting `weave_project`, `wandb_api_key`, or `agent_name`, run `weave-claude-code config show` to confirm the new value.
+
+The daemon reads these once at startup and persists across Claude Code sessions, so a change is **not** picked up by a daemon that is already running. Apply it with:
+
+```bash
+weave-claude-code restart
+```
+
+This stops the running daemon and starts a fresh one. (If none is running, the next Claude Code session starts one with the updated config.)
