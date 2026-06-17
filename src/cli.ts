@@ -26,8 +26,8 @@ import {
   type Settings,
   type PluginSource,
 } from './setup.js';
-import { prompt, sendToSocket, probeUnixSocket, SocketState } from './utils.js';
-import { runDaemon } from './daemon.js';
+import { prompt, sendToSocket, requestFromSocket, probeUnixSocket, SocketState } from './utils.js';
+import { runDaemon, resolveDaemonConfig, daemonConfigFingerprint } from './daemon.js';
 import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
@@ -410,6 +410,9 @@ interface StatusReport {
   plugin_source: PluginSource | null;
   daemon_socket: { path: string | null; state: SocketState | null };
   log_file: { path: string | null; size_bytes: number | null };
+  /** True when a daemon is alive but loaded an older config than settings.json
+   *  now resolves to, so a restart is needed to pick up the change. */
+  config_drift: boolean;
   ready_to_trace: boolean;
   view_traces_url: string | null;
 }
@@ -439,6 +442,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     plugin_source: readRegisteredPluginSource(MARKETPLACE_NAME),
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
+    config_drift: false,
     ready_to_trace: false,
     view_traces_url: null,
   };
@@ -490,6 +494,21 @@ async function gatherStatus(): Promise<StatusSnapshot> {
   // from the inode hides crashes and makes "Ready to trace" lie.
   report.daemon_socket.path = settings.daemon_socket;
   report.daemon_socket.state = await probeUnixSocket(settings.daemon_socket);
+
+  // Ask the live daemon for the fingerprint of the config it loaded. If it
+  // differs from what settings.json now resolves to, the running daemon is
+  // stale and a restart is needed. Any error (old daemon, no reply) means we
+  // can't tell, so leave config_drift false.
+  if (report.daemon_socket.state === SocketState.Alive) {
+    try {
+      const reply = await requestFromSocket(settings.daemon_socket, JSON.stringify({ command: 'config-hash' }));
+      const running = (JSON.parse(reply) as Record<string, unknown>)['config_hash'];
+      const current = daemonConfigFingerprint(resolveDaemonConfig(settings, process.env));
+      report.config_drift = typeof running === 'string' && running !== current;
+    } catch {
+      // Daemon did not reply with a fingerprint; cannot determine drift.
+    }
+  }
 
   report.log_file.path = settings.log_file;
   if (fs.existsSync(settings.log_file)) {
@@ -543,6 +562,9 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   }
 
   console.log(`✓ Agent name: ${report.agent_name}`);
+  if (report.config_drift) {
+    console.log('⚠ Daemon is running an older config. Run: weave-claude-code restart');
+  }
 
   if (report.plugin_source === null) {
     console.log('✗ Source: not registered');
