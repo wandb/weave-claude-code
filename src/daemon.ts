@@ -57,7 +57,7 @@ import type { AssistantCallDetail, ParsedSession } from './parser.js';
 /** Inbound control message sent directly to the socket (not a hook event).
  *  `shutdown` stops the daemon; `config-hash` asks it to reply with the
  *  fingerprint of the config it loaded (used by `status` for drift detection). */
-interface ControlMessage {
+type ControlMessage = {
   command: 'shutdown' | 'config-hash';
 }
 
@@ -71,7 +71,7 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
 }
 
 /** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
-interface PendingToolCall {
+type PendingToolCall = {
   span: Span;
   toolName: string;
   toolInput: Record<string, unknown>;
@@ -85,7 +85,7 @@ interface PendingToolCall {
  *  text/thinking children are emitted when the span is finalized (at the next
  *  response transition or at Stop), once all its split transcript lines are
  *  present. */
-interface ActiveChatSpan {
+type ActiveChatSpan = {
   /** Response key (Anthropic `message.id`, or index fallback) this chat span
    *  represents; see `chatMessageKey`. */
   responseKey: string;
@@ -235,7 +235,7 @@ async function readSubagentFirstLineWithRetry(
  * The Agent tool call does NOT emit an `execute_tool` span; it emits this
  * `invoke_agent` span directly.
  */
-interface SubagentTracker {
+type SubagentTracker = {
   subagentType: string;
   detectedAt: Date;
   toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
@@ -277,14 +277,14 @@ interface SubagentTracker {
  *  oldest not-yet-emitted entry (FIFO), so re-spawns never overwrite a live span
  *  (which would leak it and mis-attribute the first teammate's transcript). This
  *  mirrors SubagentTracking.findPendingTeammateIdle for the per-session path. */
-interface TeamMember {
+type TeamMember = {
   invokeAgentSpan: Span;
   conversationId: string;
   coordinatorTranscriptPath: string;
   emitted: boolean;
 }
 
-interface SessionState {
+type SessionState = {
   sessionId: string;
   /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
    *  turns stitch with their pre-resume turns server-side. Equals `sessionId`
@@ -1880,7 +1880,7 @@ export class GlobalDaemon {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The config the daemon loads at startup and holds for its lifetime. */
-interface DaemonConfig {
+type DaemonConfig = {
   weaveProject: string | null;
   apiKey: string | null;
   baseUrl: string;
