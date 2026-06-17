@@ -26,6 +26,7 @@ after(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 interface SettingsOverrides {
   weave_project?: string | null;
   wandb_api_key?: string | null;
+  agent_name?: string | null;
 }
 
 function writeSettings(home: string, overrides: SettingsOverrides = {}): { socketPath: string; logFile: string } {
@@ -50,6 +51,7 @@ function runStatus(home: string, extraArgs: string[] = []): Promise<{ stdout: st
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
   delete env['WEAVE_PROJECT'];
   delete env['WANDB_API_KEY'];
+  delete env['WEAVE_AGENT_NAME'];
 
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -79,6 +81,22 @@ suite('weave-claude-code status (pretty)', () => {
     assert.match(r.stdout, /- Log file: .+ \(not created yet\)/);
     assert.match(r.stdout, /Status: Ready to trace/);
     assert.match(r.stdout, /View traces: https:\/\/wandb\.ai\/fake-entity\/fake-project\/weave\/agents/);
+  });
+
+  test('prints the configured agent name', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'pretty-agent-set-'));
+    writeSettings(home, { agent_name: 'goober' });
+
+    const r = await runStatus(home);
+    assert.match(r.stdout, /✓ Agent name: goober\n/);
+  });
+
+  test('falls back to the default agent name when unset', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'pretty-agent-default-'));
+    writeSettings(home); // no agent_name key, mirrors settings written before the field existed
+
+    const r = await runStatus(home);
+    assert.match(r.stdout, /✓ Agent name: claude-code\n/);
   });
 
   test('missing settings file: prints "Configuration: not found" and exits non-zero', async () => {
@@ -143,7 +161,7 @@ suite('weave-claude-code status --json', () => {
     // Required top-level fields per the documented schema.
     for (const key of [
       'version', 'settings_file', 'cli_path', 'weave_project', 'weave_project_source',
-      'api_key_configured', 'plugin_source', 'daemon_socket', 'log_file', 'ready_to_trace',
+      'api_key_configured', 'agent_name', 'plugin_source', 'daemon_socket', 'log_file', 'ready_to_trace',
       'view_traces_url',
     ]) {
       assert.ok(key in parsed, `missing required field: ${key}`);
@@ -152,6 +170,7 @@ suite('weave-claude-code status --json', () => {
     assert.equal(parsed['weave_project'], 'fake-entity/fake-project');
     assert.equal(parsed['weave_project_source'], 'settings.json');
     assert.equal(parsed['api_key_configured'], true);
+    assert.equal(parsed['agent_name'], 'claude-code');
 
     const socket = parsed['daemon_socket'] as { path: string; state: string };
     assert.equal(socket.path, socketPath);
@@ -163,6 +182,15 @@ suite('weave-claude-code status --json', () => {
 
     assert.equal(parsed['ready_to_trace'], true);
     assert.equal(parsed['view_traces_url'], 'https://wandb.ai/fake-entity/fake-project/weave/agents');
+  });
+
+  test('reports the resolved agent name in JSON', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'json-agent-'));
+    writeSettings(home, { agent_name: 'goober' });
+
+    const r = await runStatus(home, ['--json']);
+    const parsed = JSON.parse(r.stdout) as Record<string, unknown>;
+    assert.equal(parsed['agent_name'], 'goober');
   });
 
   test('exits non-zero and emits a report with null fields when settings file is missing', async () => {

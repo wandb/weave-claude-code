@@ -399,6 +399,8 @@ interface StatusReport {
   weave_project: string | null;
   weave_project_source: WeaveProjectSource;
   api_key_configured: boolean;
+  /** Agent name shown in Weave; always set (falls back to the default). */
+  agent_name: string;
   /**
    * Where Claude Code is loading this plugin from. `null` means the
    * marketplace isn't registered yet (run `weave-claude-code install`).
@@ -432,6 +434,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     weave_project: null,
     weave_project_source: WeaveProjectSource.NotSet,
     api_key_configured: false,
+    agent_name: DEFAULT_AGENT_NAME,
     plugin_source: readRegisteredPluginSource(MARKETPLACE_NAME),
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
@@ -478,6 +481,8 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     snap.api_key_masked = maskSecret(effectiveApiKey);
     snap.api_key_source = process.env['WANDB_API_KEY'] ? ApiKeySource.EnvVar : ApiKeySource.Settings;
   }
+
+  report.agent_name = resolveAgentName(settings).value;
 
   // Probe daemon socket — distinguishes alive (listening) from stale (file
   // exists but no listener, eg. daemon crashed). Reporting "(exists)" purely
@@ -535,6 +540,8 @@ function printPrettyStatus(snap: StatusSnapshot): void {
     console.log('✗ W&B API key: not configured');
     console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
   }
+
+  console.log(`✓ Agent name: ${report.agent_name}`);
 
   if (report.plugin_source === null) {
     console.log('✗ Source: not registered');
