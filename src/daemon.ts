@@ -65,8 +65,9 @@ interface ControlMessage {
 type HookPayload = Record<string, unknown>;
 
 function isControlMessage(payload: unknown): payload is ControlMessage {
-  const cmd = (payload as ControlMessage | null)?.command;
-  return typeof payload === 'object' && payload !== null && (cmd === 'shutdown' || cmd === 'config-hash');
+  if (typeof payload !== 'object' || payload === null) return false;
+  const cmd = (payload as Record<string, unknown>).command;
+  return cmd === 'shutdown' || cmd === 'config-hash';
 }
 
 /** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
@@ -563,9 +564,15 @@ export class GlobalDaemon {
 
     socket.on('end', () => {
       clearTimeout(timer);
-      if (rejectedForSize) { socket.destroy(); return; }
+      if (rejectedForSize) {
+        socket.destroy();
+        return;
+      }
       const raw = Buffer.concat(chunks).toString('utf8').trim();
-      if (!raw) { socket.end(); return; }
+      if (!raw) {
+        socket.end();
+        return;
+      }
 
       let payload: unknown;
       try {
@@ -1873,7 +1880,7 @@ export class GlobalDaemon {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The config the daemon loads at startup and holds for its lifetime. */
-export interface DaemonConfig {
+interface DaemonConfig {
   weaveProject: string | null;
   apiKey: string | null;
   baseUrl: string;

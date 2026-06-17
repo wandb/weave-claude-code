@@ -68,7 +68,14 @@ export function requestFromSocket(socketPath: string, message: string, timeoutMs
     client.on('data', (chunk: string) => { data += chunk; });
     client.on('close', () => settle(() => resolve(data)));
     client.on('error', (err) => settle(() => reject(err)));
-    const timer = setTimeout(() => settle(() => { client.destroy(); reject(new Error('socket request timed out')); }), timeoutMs);
+    const timer = setTimeout(
+      () =>
+        settle(() => {
+          client.destroy();
+          reject(new Error('socket request timed out'));
+        }),
+      timeoutMs,
+    );
   });
 }
 
