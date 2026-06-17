@@ -7,9 +7,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
+  Baggage,
   Span,
   SpanStatusCode,
   Tracer,
+  context as otelContext,
+  propagation,
   diag,
   DiagConsoleLogger,
   DiagLogLevel,
@@ -32,6 +35,8 @@ import {
   ATTR,
   DEFAULT_AGENT_NAME,
   CompactionAttrs,
+  IntegrationBaggageSpanProcessor,
+  createIntegrationBaggage,
   startTurnSpan,
   startToolSpan,
   startInvokeAgentSpan,
@@ -295,6 +300,10 @@ interface SessionState {
   cwd: string;
   source: string;
   initialRequestModel?: string;
+  /** Integration identity (name, version, meta.*) as OTel Baggage, built once
+   *  at SessionStart. Activated for every event in `routeEvent` so each span
+   *  inherits it via `IntegrationBaggageSpanProcessor`. */
+  integrationBaggage: Baggage;
 
   currentTurnSpan?: Span;
 
@@ -528,7 +537,10 @@ export class GlobalDaemon {
 
     this.provider = new NodeTracerProvider({
       resource,
-      spanProcessors: [new BatchSpanProcessor(exporter)],
+      // IntegrationBaggageSpanProcessor runs first so it stamps the integration
+      // identity (from the active session baggage) onto every span before the
+      // batch processor exports it.
+      spanProcessors: [new IntegrationBaggageSpanProcessor(), new BatchSpanProcessor(exporter)],
     });
     this.provider.register();
     this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
@@ -609,6 +621,28 @@ export class GlobalDaemon {
 
     this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
 
+    // Activate the session's integration baggage for the whole event so every
+    // span created while handling it inherits the integration identity (copied
+    // on by IntegrationBaggageSpanProcessor). The session and its baggage don't
+    // exist until SessionStart runs, so that one event dispatches unwrapped — it
+    // creates no spans anyway.
+    const session = this.sessions.get(sessionId);
+    const eventContext = session
+      ? propagation.setBaggage(otelContext.active(), session.integrationBaggage)
+      : otelContext.active();
+    await otelContext.with(eventContext, () =>
+      this.dispatchEvent(eventName, sessionId, agentId, payload),
+    );
+  }
+
+  /** Run the handler for a single hook event. Split out from `routeEvent` so
+   *  the latter can run it inside the session's baggage context. */
+  private async dispatchEvent(
+    eventName: string | undefined,
+    sessionId: string,
+    agentId: string | undefined,
+    payload: HookPayload,
+  ): Promise<void> {
     try {
       switch (eventName) {
         case 'SessionStart':
@@ -680,6 +714,17 @@ export class GlobalDaemon {
 
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
+    // Claude Code stamps its CLI version on each transcript line; capture it
+    // best-effort from the head line for the integration metadata. Absent when
+    // the writer hasn't flushed yet — the meta key is simply omitted.
+    const headLine = readFirstTranscriptLine(transcript.resolvedPath);
+    const claudeCodeAppVersion =
+      typeof headLine?.['version'] === 'string' ? (headLine['version'] as string) : undefined;
+    const integrationBaggage = createIntegrationBaggage({
+      version: VERSION,
+      meta: { claude_code_app_version: claudeCodeAppVersion },
+    });
+
     this.sessions.set(sessionId, {
       sessionId,
       conversationId,
@@ -687,6 +732,7 @@ export class GlobalDaemon {
       cwd,
       source,
       initialRequestModel,
+      integrationBaggage,
       turnNumber: 0,
       totalToolCalls: 0,
       turnToolCalls: 0,

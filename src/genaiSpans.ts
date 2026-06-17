@@ -4,14 +4,17 @@
 
 import {
   Attributes,
+  Baggage,
   Span,
   SpanKind,
   Tracer,
   Context,
   TimeInput,
   context as otelContext,
+  propagation,
   trace,
 } from '@opentelemetry/api';
+import type { ReadableSpan, Span as SdkSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { extractAssistantTextBlocks } from './parser.js';
 import type { AssistantCallDetail, UsageSummary } from './parser.js';
 
@@ -75,6 +78,17 @@ export const ATTR = {
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
+  // Integration identity — attributes the trace to the emitting integration
+  // (this plugin) so the Weave Agents backend can group/filter by integration
+  // alongside peers (weave-openclaw, the playground's `weave.source`). Distinct
+  // from `gen_ai.agent.name`, which is user-overridable and changes per
+  // subagent. These are non-semconv `weave.*` keys, so the backend routes them
+  // into its queryable custom-attribute maps. Stamped on the turn (invoke_agent)
+  // root; `meta.*` keys (built with WEAVE_INTEGRATION_META_PREFIX) carry
+  // free-form per-session context.
+  WEAVE_INTEGRATION_NAME: 'weave.integration.name',
+  WEAVE_INTEGRATION_VERSION: 'weave.integration.version',
+
   // Back-pointer from a subagent `invoke_agent` span to the parent agent's
   // `Agent` tool call that spawned it. Set on the inner `invoke_agent` span
   // so queries can correlate the subagent invocation with the spawning
@@ -101,6 +115,76 @@ export const ATTR = {
  * fallback when neither is set.
  */
 export const DEFAULT_AGENT_NAME = 'claude-code';
+
+/**
+ * Stable identifier for this integration, stamped as `weave.integration.name`
+ * on every turn span. Unlike the agent name (`gen_ai.agent.name`), it is not
+ * user-overridable and does not change for subagents, so it's a reliable
+ * dimension for "which integration produced this trace" in the Weave Agents
+ * backend.
+ */
+export const INTEGRATION_NAME = 'weave-claude-code';
+
+/**
+ * Prefix for free-form integration metadata. Each entry of a turn's
+ * `integrationMeta` is stamped as `weave.integration.meta.<key>`, so new
+ * fields (e.g. `claude_code_app_version`) need no new attribute constant.
+ */
+export const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
+
+/** Common prefix for all integration-identity attributes. The span processor
+ *  copies baggage entries under this prefix onto each span. */
+export const WEAVE_INTEGRATION_PREFIX = 'weave.integration.';
+
+/**
+ * Build the per-session integration Baggage. `name` is the fixed integration
+ * id; `version` is the plugin version; `meta` is free-form per-session context
+ * flattened to `weave.integration.meta.<key>` (falsy values skipped). The
+ * daemon activates this baggage for each session event so
+ * `IntegrationBaggageSpanProcessor` stamps it onto every span the event emits.
+ */
+export function createIntegrationBaggage(args: {
+  version: string;
+  meta?: Record<string, string | undefined>;
+}): Baggage {
+  const entries: Record<string, { value: string }> = {
+    [ATTR.WEAVE_INTEGRATION_NAME]: { value: INTEGRATION_NAME },
+    [ATTR.WEAVE_INTEGRATION_VERSION]: { value: args.version },
+  };
+  if (args.meta) {
+    for (const [key, value] of Object.entries(args.meta)) {
+      if (value) entries[`${WEAVE_INTEGRATION_META_PREFIX}${key}`] = { value };
+    }
+  }
+  return propagation.createBaggage(entries);
+}
+
+/**
+ * Copies `weave.integration.*` baggage entries off the active context onto each
+ * span at start. This is how integration identity reaches every span (turn
+ * root and all children) from a single per-session baggage attribution, instead
+ * of stamping each builder. Runs at `onStart` because attributes set after a
+ * span ends are dropped; the copy is a one-time snapshot (baggage is static per
+ * session). Baggage itself is never exported, only the copied attributes.
+ */
+export class IntegrationBaggageSpanProcessor implements SpanProcessor {
+  onStart(span: SdkSpan, parentContext: Context): void {
+    const baggage = propagation.getBaggage(parentContext);
+    if (!baggage) return;
+    for (const [key, entry] of baggage.getAllEntries()) {
+      if (key.startsWith(WEAVE_INTEGRATION_PREFIX)) {
+        span.setAttribute(key, entry.value);
+      }
+    }
+  }
+  onEnd(_span: ReadableSpan): void {}
+  forceFlush(): Promise<void> {
+    return Promise.resolve();
+  }
+  shutdown(): Promise<void> {
+    return Promise.resolve();
+  }
+}
 
 // Values for `gen_ai.operation.name`. `invoke_agent`, `chat`, and
 // `execute_tool` are well-known values from the OTel GenAI semantic conventions
@@ -202,7 +286,13 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 
-  // No parent context — turn spans are roots, one trace per turn.
+  // `weave.integration.*` is not set here — it rides the active session baggage
+  // and is stamped on this span (and all children) by
+  // IntegrationBaggageSpanProcessor at onStart.
+  //
+  // No parent span in context — turn spans are roots, one trace per turn. (The
+  // active context carries integration baggage but no span, so this stays a
+  // root.)
   return tracer.startSpan(
     `${OP.INVOKE_AGENT} ${args.agentName}`,
     { kind: SpanKind.INTERNAL, attributes: attrs },
