@@ -7,9 +7,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { findClaudeCLI, appendToLog } from './utils.js';
-import { VERSION } from './version.mjs';
+import { VERSION, BUILD_VERSION } from './version.mjs';
 
-export { VERSION };
+export { VERSION, BUILD_VERSION };
 
 export interface Settings {
   log_file: string;
