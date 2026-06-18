@@ -1,6 +1,6 @@
 ---
 name: weave-status
-description: This skill should be used when the user wants to "check weave status", "verify the weave plugin is running", "see if weave is set up correctly", "check weave configuration", "is weave working", or needs to diagnose why Claude Code sessions are not appearing in Weave.
+description: This skill should be used when the user wants to "check weave status", "verify the weave plugin is running", "see if weave is set up correctly", "check weave configuration", "is weave working", "weave is running an older config", "the daemon is on an old config", or needs to diagnose why Claude Code sessions are not appearing in Weave.
 ---
 
 # Weave Claude Code Plugin — Status
