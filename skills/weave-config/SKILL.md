@@ -1,6 +1,6 @@
 ---
 name: weave-config
-description: This skill should be used when the user wants to "configure weave", "set weave project", "change weave project", "set wandb api key", "update weave settings", "show weave config", "change weave configuration", or needs to read or update any Weave Claude Code plugin settings.
+description: This skill should be used when the user wants to "configure weave", "set weave project", "change weave project", "set wandb api key", "update weave settings", "show weave config", "change weave configuration", "restart the weave daemon", "apply weave config changes", "restart weave to pick up changes", or needs to read or update any Weave Claude Code plugin settings.
 ---
 
 # Weave Claude Code Plugin — Config
