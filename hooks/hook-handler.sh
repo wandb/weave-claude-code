@@ -77,7 +77,16 @@ is_daemon_alive() {
 }
 
 if ! is_daemon_alive; then
-  weave-claude-code daemon >> "${ERROR_LOG}" 2>&1 &
+  # Detach the daemon from the spawning session. The daemon is started lazily by
+  # whichever session's hook fires first; if that terminal later closes (the
+  # engineer closes the tab) mid-run, the resulting SIGHUP would kill the daemon
+  # and wipe its in-memory cross-session team map — breaking agent-teams nesting
+  # for every still-running specialist. `nohup` makes the daemon ignore SIGHUP;
+  # `disown` detaches it from this shell's job table. (macOS has no `setsid`, so
+  # nohup+disown is the portable detach.) The daemon still self-reaps via its
+  # inactivity timeout, so it won't linger forever.
+  nohup weave-claude-code daemon >> "${ERROR_LOG}" 2>&1 &
+  disown 2>/dev/null || true
 
   # Wait up to 5 s (50 × 100 ms) for the daemon to accept connections.
   # The daemon unlinks any stale socket file before binding — see
