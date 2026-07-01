@@ -1727,14 +1727,39 @@ export class GlobalDaemon {
       `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
+    this.finalizeSession(session, 'session_ended');
+
+    this.log('INFO', `Finished session ${sessionId}`);
+
+    this.sessions.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
+    session.transcript.close();
+  }
+
+  /**
+   * End every span still open on a session — pending tool calls, the active
+   * chat span, the current turn (root) span, and any tracked subagent
+   * `invoke_agent` spans — stamping `weave.claude_code.orphan_reason` so the
+   * trace records why each closed outside its normal path. The active chat
+   * span is finalized from the transcript (recovering its text + usage) like
+   * Stop does; only a failed parse falls back to a bare orphan close.
+   *
+   * Called from SessionEnd and from `drain` (daemon shutdown). Finalizing at
+   * shutdown is what keeps a turn's root span exported: without it, a turn
+   * interrupted by an inactivity/signal/restart shutdown leaks its still-open
+   * root, leaving its already-exported tool/chat children rootless. Idempotent
+   * per span — each builder ends at most once.
+   */
+  private finalizeSession(session: SessionState, orphanReason: string): void {
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       resolvePermissionIfPending(pending, false);
-      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before tool completed' });
+      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
+      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'tool did not complete before shutdown' });
       pending.span.end();
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
+    session.pendingToolCalls.clear();
 
     // Finalize a chat span left open mid-turn (Stop never fired) from the
     // now-flushed transcript, like Stop does, so its text + usage aren't lost.
@@ -1755,17 +1780,18 @@ export class GlobalDaemon {
         }
       }
       if (session.activeChatSpan) {
-        session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+        session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
         session.activeChatSpan.span.end();
         session.activeChatSpan = undefined;
       }
-      this.log('DEBUG', finalized ? `Finalized active chat span at SessionEnd` : `Closed orphaned chat span`);
+      this.log('DEBUG', finalized ? `Finalized active chat span` : `Closed orphaned chat span`);
     }
 
-    // Close the current turn if still open
+    // Close the current turn (root) span if still open
     if (session.currentTurnSpan) {
-      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
+      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
       session.currentTurnSpan.end();
+      session.currentTurnSpan = undefined;
       this.log('DEBUG', `Closed orphaned turn span`);
     }
 
@@ -1773,19 +1799,13 @@ export class GlobalDaemon {
     // or SubagentStop. Without this they'd leak open and never export.
     for (const tracker of session.subagents.all()) {
       if (tracker.invokeAgentSpan && !tracker.ended) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, 'session_ended');
-        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'session ended before subagent completed' });
+        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
+        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'subagent did not complete before shutdown' });
         tracker.invokeAgentSpan.end();
         tracker.ended = true;
       }
       this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
     }
-
-    this.log('INFO', `Finished session ${sessionId}`);
-
-    this.sessions.delete(sessionId);
-    this.sessionQueues.delete(sessionId);
-    session.transcript.close();
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -1820,6 +1840,21 @@ export class GlobalDaemon {
   private async shutdown(reason: string): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    await this.drain(reason);
+    process.exit(0);
+  }
+
+  /**
+   * Everything a shutdown does except the final `process.exit`: end in-flight
+   * spans, flush the exporter, and release the socket. Split out from
+   * `shutdown` so it can be exercised in tests without terminating the process.
+   *
+   * Order matters: open sessions are finalized (their root turn spans ended)
+   * BEFORE `provider.shutdown()` flushes, so those roots make the final export
+   * batch instead of being dropped — the fix for rootless traces left behind
+   * when the daemon exits mid-turn.
+   */
+  private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
     // Backstop: close any queued team-member invoke_agent spans whose teammate
@@ -1831,6 +1866,11 @@ export class GlobalDaemon {
       }
     }
     this.teamMembers.clear();
+    // Finalize every live session's still-open spans (turn root, active chat,
+    // pending tools, subagents) so an interrupted turn keeps its exported root.
+    for (const session of this.sessions.values()) {
+      this.finalizeSession(session, 'daemon_shutdown');
+    }
     if (this.provider) {
       try {
         await this.provider.shutdown();
@@ -1844,7 +1884,6 @@ export class GlobalDaemon {
     if (fs.existsSync(this.socketPath)) {
       fs.unlinkSync(this.socketPath);
     }
-    process.exit(0);
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
