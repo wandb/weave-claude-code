@@ -334,7 +334,15 @@ type SessionState = {
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
 
-const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
+// How long the daemon stays alive with no hook events before self-reaping. It
+// only fires when nothing is in flight (the INFLIGHT_HOLD_MAX_MS guards keep an
+// active turn/tool/team alive regardless), so this window purely governs how
+// long an idle daemon stays warm for the next prompt. Set to 120 min so gaps in
+// a working session (a long build, a meeting, lunch) don't reap the daemon and
+// strand the resumed session on a fresh, amnesiac one, the dominant source of
+// "Unknown session" drops. Longer idle gaps still reap; session reconstruction
+// then recovers those. Override with WEAVE_INACTIVITY_MS.
+const INACTIVITY_TIMEOUT_MS = 120 * 60 * 1_000;  // 120 minutes
 // Absolute ceiling for holding the daemon open past the normal inactivity
 // timeout while work is still in flight — either cross-session team
 // correlation (hasUnemittedTeamMembers) or an ordinary open turn / pending
