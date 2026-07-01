@@ -520,18 +520,10 @@ export class GlobalDaemon {
   }
 
   /**
-   * Bind the daemon socket, tolerant of a herd of concurrent starts. Tries to
-   * listen; on EADDRINUSE/EEXIST it RE-PROBES the socket rather than blindly
-   * unlinking it:
-   *   - a LIVE listener means another daemon won the race → stand down (exit 0);
-   *   - a STALE inode (ungraceful prior exit) is safe to remove → unlink, retry.
-   * Only a confirmed-stale socket is ever unlinked, so a late starter can never
-   * delete the winner's live socket (which would split the teamMembers map
-   * across two daemons and break cross-session nesting).
-   *
-   * Replaces the old existsSync→probe→unlink→listen sequence, which raced: two
-   * daemons that both saw no socket reached listen() together and the loser
-   * crashed with EEXIST/EADDRINUSE (exit 1) instead of exiting cleanly.
+   * Bind the daemon socket, tolerant of a herd of concurrent starts. Listen; on
+   * EADDRINUSE/EEXIST, re-probe: a live listener means another daemon won → exit
+   * 0; a stale inode is unlinked and retried. Only a confirmed-stale socket is
+   * ever unlinked, so a late starter can't delete the winner's live socket.
    */
   private async bindSocketWithHerdProtection(): Promise<void> {
     const MAX_RECLAIM_ATTEMPTS = 5;
