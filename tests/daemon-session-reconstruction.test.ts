@@ -4,7 +4,7 @@
 
 // The daemon shuts itself down after a short idle window and keeps all session
 // state in memory, seeded only at SessionStart. A Claude Code session that
-// outlives a daemon restart (e.g. the user steps away >10 min, the daemon idles
+// outlives a daemon restart (e.g. the user steps away, the daemon idles
 // out, then they resume the SAME session) sends its next UserPromptSubmit to a
 // fresh daemon that never saw its SessionStart — producing "Unknown session"
 // and silently dropping all tracing for the rest of that session.
