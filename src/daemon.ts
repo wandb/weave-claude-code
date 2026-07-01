@@ -336,10 +336,12 @@ type SessionState = {
 
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
 // Absolute ceiling for holding the daemon open past the normal inactivity
-// timeout while cross-session team work is in flight (see checkInactivity).
-// Bounds the case where a teammate crashes and never emits TeammateIdle, so an
-// unemitted entry can't pin the daemon forever.
-const TEAM_INFLIGHT_MAX_MS = 60 * 60 * 1_000;   // 60 minutes
+// timeout while work is still in flight — either cross-session team
+// correlation (hasUnemittedTeamMembers) or an ordinary open turn / pending
+// tool / tracked subagent (hasInFlightWork); see checkInactivity. Bounds the
+// pathological case (a teammate that never emits TeammateIdle, or a stuck
+// session) so an in-flight entry can't pin the daemon forever.
+const INFLIGHT_HOLD_MAX_MS = 60 * 60 * 1_000;   // 60 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
@@ -1818,9 +1820,9 @@ export class GlobalDaemon {
     // still-open specialist span. Agent-teams runs have quiet windows (engineer
     // think-time; gaps between spawn and first teammate report) that would
     // otherwise trip the 10-min timeout mid-triage. Hold open until the team
-    // work drains, bounded by TEAM_INFLIGHT_MAX_MS so a crashed teammate that
+    // work drains, bounded by INFLIGHT_HOLD_MAX_MS so a crashed teammate that
     // never emits TeammateIdle can't pin the daemon indefinitely.
-    if (idle < TEAM_INFLIGHT_MAX_MS && this.hasUnemittedTeamMembers()) {
+    if (idle < INFLIGHT_HOLD_MAX_MS && this.hasUnemittedTeamMembers()) {
       this.log('DEBUG', 'Inactivity timeout reached but team correlation in flight — staying up');
       return;
     }
@@ -1828,9 +1830,9 @@ export class GlobalDaemon {
     // pending tool call, or a tracked subagent. A long-running tool or turn
     // (longer than the timeout, with no other session active) would otherwise
     // trip the timeout mid-flight — dropping the still-open spans and forcing
-    // the resumed work onto a fresh, amnesiac daemon. Same TEAM_INFLIGHT_MAX_MS
+    // the resumed work onto a fresh, amnesiac daemon. Same INFLIGHT_HOLD_MAX_MS
     // ceiling so a stuck session can't pin the daemon indefinitely.
-    if (idle < TEAM_INFLIGHT_MAX_MS && this.hasInFlightWork()) {
+    if (idle < INFLIGHT_HOLD_MAX_MS && this.hasInFlightWork()) {
       this.log('DEBUG', 'Inactivity timeout reached but work in flight — staying up');
       return;
     }
