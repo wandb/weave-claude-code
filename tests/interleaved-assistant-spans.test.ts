@@ -74,6 +74,7 @@ test('chat span parents per-block assistant_text and execute_tool children in tr
     toolName: 'Edit',
     toolUseId: 'toolu_01',
     toolInput: { file_path: '/foo.ts' },
+    conversationId: 'conv-1',
   });
   t1.end();
   emitAssistantTextSpan(tracer, chat, {
@@ -84,6 +85,7 @@ test('chat span parents per-block assistant_text and execute_tool children in tr
     toolName: 'Edit',
     toolUseId: 'toolu_02',
     toolInput: { file_path: '/foo.test.ts' },
+    conversationId: 'conv-1',
   });
   t2.end();
   emitAssistantTextSpan(tracer, chat, {
