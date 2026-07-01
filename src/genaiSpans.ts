@@ -359,6 +359,11 @@ type ToolSpanArgs = {
   toolName: string;
   toolUseId: string;
   toolInput: Record<string, unknown>;
+  /** Stitching key — same value as the enclosing turn span's
+   *  `gen_ai.conversation.id`. Stamped directly on the tool span (not just
+   *  inherited from the parent) so the span stays attributable to its
+   *  conversation even if its root turn span is lost to a hard crash. */
+  conversationId: string;
   displayName?: string;
 };
 
@@ -368,6 +373,7 @@ export function startToolSpan(tracer: Tracer, parentSpan: Span, args: ToolSpanAr
     [ATTR.TOOL_NAME]: args.toolName,
     [ATTR.TOOL_CALL_ID]: args.toolUseId,
     [ATTR.TOOL_CALL_ARGUMENTS]: jsonStr(args.toolInput),
+    [ATTR.CONVERSATION_ID]: args.conversationId,
   };
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
 

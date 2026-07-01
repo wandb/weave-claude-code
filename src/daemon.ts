@@ -969,6 +969,7 @@ export class GlobalDaemon {
       toolName,
       toolUseId,
       toolInput,
+      conversationId: session.conversationId,
       displayName: toolDisplayName(toolName, toolInput),
     });
     session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
