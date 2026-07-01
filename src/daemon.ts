@@ -458,9 +458,10 @@ export class GlobalDaemon {
       this.log('INFO', 'No weave_project / API key configured — tracing disabled');
     }
 
-    // Bind the socket, yielding cleanly if another daemon already owns it.
+    // Bind the socket, exiting cleanly if another daemon already owns it.
     // Concurrent hook invocations can each cold-start a daemon, but only one
-    // can bind; the rest yield. See bindSocketWithHerdProtection.
+    // can bind; the losers exit (process.exit(0)) and their hook still reaches
+    // the winner over the socket. See bindSocketWithHerdProtection.
     await this.bindSocketWithHerdProtection();
 
     this.running = true;
@@ -522,7 +523,7 @@ export class GlobalDaemon {
    * Bind the daemon socket, tolerant of a herd of concurrent starts. Tries to
    * listen; on EADDRINUSE/EEXIST it RE-PROBES the socket rather than blindly
    * unlinking it:
-   *   - a LIVE listener means another daemon won the race → yield (exit 0);
+   *   - a LIVE listener means another daemon won the race → stand down (exit 0);
    *   - a STALE inode (ungraceful prior exit) is safe to remove → unlink, retry.
    * Only a confirmed-stale socket is ever unlinked, so a late starter can never
    * delete the winner's live socket (which would split the teamMembers map
@@ -530,7 +531,7 @@ export class GlobalDaemon {
    *
    * Replaces the old existsSync→probe→unlink→listen sequence, which raced: two
    * daemons that both saw no socket reached listen() together and the loser
-   * crashed with EEXIST/EADDRINUSE (exit 1) instead of yielding.
+   * crashed with EEXIST/EADDRINUSE (exit 1) instead of exiting cleanly.
    */
   private async bindSocketWithHerdProtection(): Promise<void> {
     const MAX_RECLAIM_ATTEMPTS = 5;
