@@ -1171,10 +1171,14 @@ export class GlobalDaemon {
     // generic tool call. The Agent tool's PostToolUse closes this span with the
     // subagent's final return as `gen_ai.output.messages`.
     //
+    // Fires for the main agent AND a subagent that spawns its own subagent
+    // (`agentId` set): `toolParent` already resolves to the spawner's
+    // invoke_agent span, so the grandchild nests instead of orphaning.
+    //
     // `promptHash` lets SubagentStart correlate this tracker to the right
     // subagent deterministically by reading the subagent transcript's line 1
     // (the firing prompt) and matching by sha256 + subagent_type.
-    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
+    if (toolName === 'Agent' && toolInput['subagent_type']) {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
       const invokeAgentSpan = startInvokeAgentSpan(this.tracer, toolParent, {
