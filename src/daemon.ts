@@ -334,7 +334,15 @@ type SessionState = {
 // GlobalDaemon
 // ─────────────────────────────────────────────────────────────────────────────
 
-const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;  // 10 minutes
+// How long the daemon stays alive with no hook events before self-reaping. It
+// only fires when nothing is in flight (the INFLIGHT_HOLD_MAX_MS guards keep an
+// active turn/tool/team alive regardless), so this window purely governs how
+// long an idle daemon stays warm for the next prompt. Set to 120 min so gaps in
+// a working session (a long build, a meeting, lunch) don't reap the daemon and
+// strand the resumed session on a fresh, amnesiac one, the dominant source of
+// "Unknown session" drops. Longer idle gaps still reap; session reconstruction
+// then recovers those. Override with WEAVE_INACTIVITY_MS.
+const INACTIVITY_TIMEOUT_MS = 120 * 60 * 1_000;  // 120 minutes
 // Absolute ceiling for holding the daemon open past the normal inactivity
 // timeout while work is still in flight — either cross-session team
 // correlation (hasUnemittedTeamMembers) or an ordinary open turn / pending
@@ -413,6 +421,55 @@ class SubagentTracking {
   all(): SubagentTracker[] {
     return [...this.trackers];
   }
+}
+
+/** Options for {@link newSessionState}. `turnNumber` seeds the turn counter: 0
+ *  for a brand-new session, or the number of turns already on disk when
+ *  reconstructing a session lost across a daemon restart (so the resumed turn
+ *  keeps counting up instead of resetting to 1). */
+type NewSessionStateOptions = {
+  sessionId: string;
+  conversationId: string;
+  transcript: TranscriptFile;
+  cwd: string;
+  source: string;
+  initialRequestModel: string | undefined;
+  turnNumber: number;
+};
+
+/** Build a fresh SessionState. */
+function newSessionState(options: NewSessionStateOptions): SessionState {
+  const { sessionId, conversationId, transcript, cwd, source, initialRequestModel, turnNumber } =
+    options;
+  // Claude Code stamps its CLI version on each transcript line; capture it
+  // best-effort from the head line for the integration metadata. Absent when
+  // the writer hasn't flushed yet, the meta key is simply omitted. Built
+  // here (not at the SessionStart call site) so a session reconstructed after
+  // a daemon restart carries the same integration identity on its spans.
+  const headLine = readFirstTranscriptLine(transcript.resolvedPath);
+  const version = headLine?.['version'];
+  const claudeCodeAppVersion = typeof version === 'string' ? version : undefined;
+  const integrationBaggage = createIntegrationBaggage({
+    version: VERSION,
+    meta: { claude_code_app_version: claudeCodeAppVersion },
+  });
+
+  return {
+    sessionId,
+    conversationId,
+    transcript,
+    cwd,
+    source,
+    initialRequestModel,
+    integrationBaggage,
+    turnNumber,
+    totalToolCalls: 0,
+    turnToolCalls: 0,
+    toolCounts: {},
+    pendingToolCalls: new Map(),
+    subagents: new SubagentTracking(),
+    emittedChatSpanResponseKeys: new Set(),
+  };
 }
 
 export class GlobalDaemon {
@@ -769,33 +826,18 @@ export class GlobalDaemon {
 
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
-    // Claude Code stamps its CLI version on each transcript line; capture it
-    // best-effort from the head line for the integration metadata. Absent when
-    // the writer hasn't flushed yet — the meta key is simply omitted.
-    const headLine = readFirstTranscriptLine(transcript.resolvedPath);
-    const claudeCodeAppVersion =
-      typeof headLine?.['version'] === 'string' ? (headLine['version'] as string) : undefined;
-    const integrationBaggage = createIntegrationBaggage({
-      version: VERSION,
-      meta: { claude_code_app_version: claudeCodeAppVersion },
-    });
-
-    this.sessions.set(sessionId, {
+    this.sessions.set(
       sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      integrationBaggage,
-      turnNumber: 0,
-      totalToolCalls: 0,
-      turnToolCalls: 0,
-      toolCounts: {},
-      pendingToolCalls: new Map(),
-      subagents: new SubagentTracking(),
-      emittedChatSpanResponseKeys: new Set(),
-    });
+      newSessionState({
+        sessionId,
+        conversationId,
+        transcript,
+        cwd,
+        source,
+        initialRequestModel,
+        turnNumber: 0,
+      }),
+    );
 
     const resumed = conversationId !== sessionId;
     this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
@@ -880,10 +922,71 @@ export class GlobalDaemon {
     return current;
   }
 
+  /**
+   * Return the tracked session, reconstructing it from the event's
+   * `transcript_path` when this daemon never saw its SessionStart. The daemon
+   * idles out after a short quiet window and keeps all session state in memory;
+   * Claude Code only emits SessionStart on startup/resume/clear/compact, so a
+   * session that outlives a daemon restart would otherwise be permanently
+   * untraced (the "Unknown session" errors). Every hook event carries
+   * `transcript_path`, which is enough to rebuild state and resume tracing.
+   */
+  private async getOrReconstructSession(
+    sessionId: string,
+    payload: HookPayload,
+  ): Promise<SessionState | undefined> {
+    const existing = this.sessions.get(sessionId);
+    if (existing) return existing;
+
+    const rawPath = payload['transcript_path'] as string | undefined;
+    if (!rawPath) return undefined;
+
+    let transcript: TranscriptFile;
+    try {
+      transcript = new TranscriptFile(rawPath);
+    } catch (err) {
+      this.log('ERROR', `Cannot reconstruct session ${sessionId}: invalid transcript_path: ${err}`);
+      return undefined;
+    }
+
+    const source = (payload['source'] as string | undefined) ?? 'reconstructed';
+    const cwd = (payload['cwd'] as string | undefined) ?? '';
+    const initialRequestModel = payload['model'] as string | undefined;
+    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
+
+    // Seed the turn counter from the turns already on disk so numbering
+    // continues across the restart instead of resetting to 1.
+    let priorTurns = 0;
+    try {
+      priorTurns = parseSessionFd(transcript.getFd())?.turns.length ?? 0;
+    } catch (err) {
+      this.log('DEBUG', `Reconstruct ${sessionId}: could not count prior turns: ${err}`);
+    }
+
+    const session = newSessionState({
+      sessionId,
+      conversationId,
+      transcript,
+      cwd,
+      source,
+      initialRequestModel,
+      turnNumber: priorTurns,
+    });
+    this.sessions.set(sessionId, session);
+    this.log(
+      'INFO',
+      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
+    );
+    return session;
+  }
+
   private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
-    const session = this.sessions.get(sessionId);
+    // Reconstruct the session if this daemon never saw its SessionStart (e.g. it
+    // idled out mid-session and a fresh daemon took over) so the rest of the
+    // session stays traced instead of dropping with "Unknown session".
+    const session = await this.getOrReconstructSession(sessionId, payload);
     if (!session) {
-      this.log('ERROR', `Unknown session: ${sessionId}`);
+      this.log('ERROR', `Unknown session (no transcript_path to reconstruct): ${sessionId}`);
       return;
     }
     if (!this.tracer) return;
