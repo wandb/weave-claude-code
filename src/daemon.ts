@@ -423,6 +423,55 @@ class SubagentTracking {
   }
 }
 
+/** Options for {@link newSessionState}. `turnNumber` seeds the turn counter: 0
+ *  for a brand-new session, or the number of turns already on disk when
+ *  reconstructing a session lost across a daemon restart (so the resumed turn
+ *  keeps counting up instead of resetting to 1). */
+type NewSessionStateOptions = {
+  sessionId: string;
+  conversationId: string;
+  transcript: TranscriptFile;
+  cwd: string;
+  source: string;
+  initialRequestModel: string | undefined;
+  turnNumber: number;
+};
+
+/** Build a fresh SessionState. */
+function newSessionState(options: NewSessionStateOptions): SessionState {
+  const { sessionId, conversationId, transcript, cwd, source, initialRequestModel, turnNumber } =
+    options;
+  // Claude Code stamps its CLI version on each transcript line; capture it
+  // best-effort from the head line for the integration metadata. Absent when
+  // the writer hasn't flushed yet, the meta key is simply omitted. Built
+  // here (not at the SessionStart call site) so a session reconstructed after
+  // a daemon restart carries the same integration identity on its spans.
+  const headLine = readFirstTranscriptLine(transcript.resolvedPath);
+  const version = headLine?.['version'];
+  const claudeCodeAppVersion = typeof version === 'string' ? version : undefined;
+  const integrationBaggage = createIntegrationBaggage({
+    version: VERSION,
+    meta: { claude_code_app_version: claudeCodeAppVersion },
+  });
+
+  return {
+    sessionId,
+    conversationId,
+    transcript,
+    cwd,
+    source,
+    initialRequestModel,
+    integrationBaggage,
+    turnNumber,
+    totalToolCalls: 0,
+    turnToolCalls: 0,
+    toolCounts: {},
+    pendingToolCalls: new Map(),
+    subagents: new SubagentTracking(),
+    emittedChatSpanResponseKeys: new Set(),
+  };
+}
+
 export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
@@ -779,7 +828,15 @@ export class GlobalDaemon {
 
     this.sessions.set(
       sessionId,
-      this.newSessionState(sessionId, conversationId, transcript, cwd, source, initialRequestModel, 0),
+      newSessionState({
+        sessionId,
+        conversationId,
+        transcript,
+        cwd,
+        source,
+        initialRequestModel,
+        turnNumber: 0,
+      }),
     );
 
     const resumed = conversationId !== sessionId;
@@ -865,50 +922,6 @@ export class GlobalDaemon {
     return current;
   }
 
-  /** Build a fresh SessionState. `turnNumber` seeds the turn counter: 0 for a
-   *  brand-new session, or the number of turns already on disk when
-   *  reconstructing a session lost across a daemon restart (so the resumed turn
-   *  keeps counting up instead of resetting to 1). */
-  private newSessionState(
-    sessionId: string,
-    conversationId: string,
-    transcript: TranscriptFile,
-    cwd: string,
-    source: string,
-    initialRequestModel: string | undefined,
-    turnNumber: number,
-  ): SessionState {
-    // Claude Code stamps its CLI version on each transcript line; capture it
-    // best-effort from the head line for the integration metadata. Absent when
-    // the writer hasn't flushed yet — the meta key is simply omitted. Built
-    // here (not at the SessionStart call site) so a session reconstructed after
-    // a daemon restart carries the same integration identity on its spans.
-    const headLine = readFirstTranscriptLine(transcript.resolvedPath);
-    const claudeCodeAppVersion =
-      typeof headLine?.['version'] === 'string' ? (headLine['version'] as string) : undefined;
-    const integrationBaggage = createIntegrationBaggage({
-      version: VERSION,
-      meta: { claude_code_app_version: claudeCodeAppVersion },
-    });
-
-    return {
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      integrationBaggage,
-      turnNumber,
-      totalToolCalls: 0,
-      turnToolCalls: 0,
-      toolCounts: {},
-      pendingToolCalls: new Map(),
-      subagents: new SubagentTracking(),
-      emittedChatSpanResponseKeys: new Set(),
-    };
-  }
-
   /**
    * Return the tracked session, reconstructing it from the event's
    * `transcript_path` when this daemon never saw its SessionStart. The daemon
@@ -950,9 +963,15 @@ export class GlobalDaemon {
       this.log('DEBUG', `Reconstruct ${sessionId}: could not count prior turns: ${err}`);
     }
 
-    const session = this.newSessionState(
-      sessionId, conversationId, transcript, cwd, source, initialRequestModel, priorTurns,
-    );
+    const session = newSessionState({
+      sessionId,
+      conversationId,
+      transcript,
+      cwd,
+      source,
+      initialRequestModel,
+      turnNumber: priorTurns,
+    });
     this.sessions.set(sessionId, session);
     this.log(
       'INFO',
