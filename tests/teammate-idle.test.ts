@@ -25,28 +25,15 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
 import { readFirstTranscriptLine } from '../src/transcriptFile.ts';
 import { parseSessionFile } from '../src/parser.ts';
-import { startInvokeAgentSpan, emitChatSpansFromAssistantCalls, ATTR } from '../src/genaiSpans.ts';
+import { ATTR } from '../src/genaiSpans.ts';
+import { childrenOf, flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function setupTracer(): {
-  tracer: ReturnType<BasicTracerProvider['getTracer']>;
-  exporter: InMemorySpanExporter;
-  provider: BasicTracerProvider;
-} {
-  const exporter = new InMemorySpanExporter();
-  const provider = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(exporter)],
-  });
-  const tracer = provider.getTracer('test');
-  return { tracer, exporter, provider };
+interface Driver {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
 }
 
 /** Write a fake teammate transcript to a temp file and return its path.
@@ -142,57 +129,56 @@ test('parseSessionFile: skips agent-setting lines, parses LLM calls from teammat
   }
 });
 
-test('TeammateIdle span tree: invoke_agent span contains chat child', async () => {
-  const filePath = writeTeammateTranscript([AGENT_SETTING_LINE, MODE_LINE, USER_LINE, ASSISTANT_LINE]);
-  const { tracer, exporter, provider } = setupTracer();
+test('TeammateIdle span tree: teammate turn carries the teammate chat span, tagged by agent name', async () => {
+  // Drive the per-session teammate path end-to-end in-process: SubagentStart
+  // (orphan) creates the SubAgent marker; SubagentStop keeps it open;
+  // TeammateIdle emits the teammate's chat spans under a fresh teammate turn
+  // (the SubAgent is a leaf and can't parent them). Each teammate chat span is
+  // tagged with `gen_ai.agent.name` so the Agents view groups it.
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
 
+  const home = os.homedir();
+  const coordSid = 'coord-span-001';
+  const coordDir = fs.mkdtempSync(path.join(home, '.weave-tmspan-'));
+  const coordPath = path.join(coordDir, `${coordSid}.jsonl`);
+  fs.writeFileSync(coordPath, JSON.stringify({ type: 'system', content: [] }) + '\n');
+
+  // Subagent transcript at the path the daemon derives:
+  // <coord-dir>/<coordSid>/subagents/agent-<agentId>.jsonl
+  const agentId = 'agent-span-abc';
+  const subDir = path.join(coordDir, coordSid, 'subagents');
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(path.join(subDir, `agent-${agentId}.jsonl`),
+    [USER_LINE, ASSISTANT_LINE].map(l => JSON.stringify(l)).join('\n') + '\n');
+
+  const d = makeGenaiDaemon() as unknown as Driver;
   try {
-    const parsed = parseSessionFile(filePath);
-    assert.ok(parsed);
-
-    // Mimic what handleTeammateIdle does: agent type comes from payload['teammate_name'],
-    // transcript path comes from payload['transcript_path'].
-    const agentType = 'cks-specialist'; // from payload['teammate_name']
-    const parentSpan = tracer.startSpan('turn');
-    const invokeSpan = startInvokeAgentSpan(tracer, parentSpan, {
-      agentType,
-      conversationId: 'conv-1',
-      pluginVersion: '0.2.6',
-      displayName: `Agent: ${agentType}`,
-    });
-
-    for (const turn of parsed.turns) {
-      emitChatSpansFromAssistantCalls(tracer, invokeSpan, 'conv-1', turn.assistantCalls());
-    }
-    invokeSpan.end();
-    parentSpan.end();
-
-    await provider.forceFlush();
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: coordSid, transcript_path: coordPath, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordSid, prompt: '/triage' });
+    // Orphan SubagentStart (no matching PreToolUse tracker).
+    await d.routeEvent({ hook_event_name: 'SubagentStart', session_id: coordSid, agent_id: agentId, agent_type: 'cks-specialist' });
+    await d.routeEvent({ hook_event_name: 'SubagentStop', session_id: coordSid, agent_id: agentId });
+    await d.routeEvent({ hook_event_name: 'TeammateIdle', session_id: coordSid, teammate_name: 'cks-specialist', team_name: 'triage-span' });
+    await flushWeave();
 
     const spans = exporter.getFinishedSpans();
-    const invokeAgentSpan = spans.find(s => s.name === 'invoke_agent cks-specialist');
-    assert.ok(invokeAgentSpan, 'invoke_agent span should exist');
-    assert.equal(
-      invokeAgentSpan.attributes[ATTR.AGENT_NAME],
-      'cks-specialist',
-      'gen_ai.agent.name should be set',
-    );
 
-    const chatSpan = spans.find(s => s.name === 'chat claude-opus-4-8');
-    assert.ok(chatSpan, 'chat span should exist');
+    // The teammate's own turn root (fresh trace), tagged with the teammate name.
+    const teammateTurn = spans.find(s => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent' && s.attributes[ATTR.AGENT_NAME] === 'cks-specialist');
+    assert.ok(teammateTurn, 'teammate turn span exists tagged with gen_ai.agent.name');
 
-    // Chat span should be a child of the invoke_agent span.
-    assert.equal(
-      chatSpan.parentSpanContext?.spanId,
-      invokeAgentSpan.spanContext().spanId,
-      'chat span should be child of invoke_agent span',
-    );
+    // The teammate chat span nests under the teammate turn and is tagged too.
+    const chatKids = childrenOf(spans, teammateTurn).filter(s => s.attributes[ATTR.OPERATION_NAME] === 'chat');
+    assert.equal(chatKids.length, 1, 'one chat span under the teammate turn');
+    const chatSpan = chatKids[0];
+    assert.equal(chatSpan.attributes[ATTR.AGENT_NAME], 'cks-specialist', 'chat span tagged with the teammate name');
 
-    // Token counts should be correct (cache-inclusive total for input).
+    // Token counts are correct (cache-inclusive total for input).
     assert.equal(chatSpan.attributes[ATTR.USAGE_INPUT_TOKENS], 1500, 'input_tokens = 1000 + 500 cache_read');
     assert.equal(chatSpan.attributes[ATTR.USAGE_OUTPUT_TOKENS], 200);
   } finally {
-    fs.rmSync(path.dirname(filePath), { recursive: true });
+    fs.rmSync(coordDir, { recursive: true, force: true });
   }
 });
 

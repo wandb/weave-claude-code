@@ -12,8 +12,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import * as weave from 'weave';
 
 import { MARKETPLACE_NAME } from '../src/setup.ts';
+import { GlobalDaemon } from '../src/daemon.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -102,6 +105,64 @@ export function writeKnownMarketplace(home: string, source: Record<string, unkno
 // so the OTel exporter never reaches real wandb.ai. Used by the daemon-lifecycle
 // tests (session reconstruction, in-flight idle hold, startup race).
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GenAI span harness (in-process)
+//
+// The daemon emits spans through the Weave SDK's global GenAI state, so tests
+// initialise `weave` once with an in-memory OTLP exporter (fully offline) and
+// drive a `GlobalDaemon` whose `tracingEnabled` flag is set (bypassing the real
+// `weave.init` that `start()` would otherwise run). `weave.init` sets process-
+// global state, so each test *file* (isolated in its own subprocess by
+// `node --test`) initialises once and resets the exporter between tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let genaiExporter: InMemorySpanExporter | undefined;
+
+/**
+ * Initialise `weave` with an in-memory exporter (once per test process) and
+ * return it. Call `exporter.reset()` at the start of each test to isolate spans.
+ */
+export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
+  if (!genaiExporter) {
+    genaiExporter = new InMemorySpanExporter();
+    await weave.init('e/p', { genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) } });
+  }
+  return genaiExporter;
+}
+
+/** Construct a GlobalDaemon with tracing marked enabled (the SDK is already
+ *  initialised via `initWeaveInMemory`), skipping the real socket/`start()`. */
+export function makeGenaiDaemon(agentName = 'claude-code'): GlobalDaemon {
+  const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
+  const d = new GlobalDaemon('/tmp/unused.sock', logFile, 'e/p', 'k', 'https://x', false, agentName);
+  (d as unknown as { tracingEnabled: boolean }).tracingEnabled = true;
+  return d;
+}
+
+/** Flush any spans buffered in the SDK so the in-memory exporter has them. */
+export function flushWeave(): Promise<void> {
+  return weave.flushOTel();
+}
+
+/** Parent span id of an exported span. weave's BasicTracerProvider exposes it
+ *  as the `parentSpanId` string (older node providers used `parentSpanContext`),
+ *  so read whichever is present. */
+export function spanParentId(s: ReadableSpan): string | undefined {
+  return (s as unknown as { parentSpanId?: string }).parentSpanId ?? s.parentSpanContext?.spanId;
+}
+
+/** Direct children of `parent`, ordered by span start time. */
+export function childrenOf(spans: ReadableSpan[], parent: ReadableSpan): ReadableSpan[] {
+  const parentId = parent.spanContext().spanId;
+  return spans
+    .filter(s => spanParentId(s) === parentId)
+    .sort((a, b) => hrToNs(a.startTime) - hrToNs(b.startTime));
+}
+
+function hrToNs(t: [number, number]): number {
+  return t[0] * 1e9 + t[1];
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));

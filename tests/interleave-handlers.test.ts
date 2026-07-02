@@ -2,30 +2,27 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Chat-span state machine, driven through the real hook handlers (not by
-// calling emitChatSpanForResponse directly): chat span opened at PreToolUse +
-// tool parenting, response transitions, the dedup (no double chat span at
-// Stop), and SessionEnd finalizing a still-open span. The other interleave
-// tests cover only the helpers in isolation.
+// Chat-span state machine, driven through the real hook handlers (via
+// routeEvent, so the ambient conversation is installed): chat span opened at
+// PreToolUse + tool parenting, response transitions, the dedup (no double chat
+// span at Stop), and SessionEnd finalizing a still-open span.
+//
+// Post-SDK-migration: a response's text/thinking blocks are ORDERED
+// `gen_ai.output.messages` parts on its single `chat` span (not separate child
+// spans). The tools the model called still nest under that chat span as
+// `execute_tool` children.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-  type ReadableSpan,
-} from '@opentelemetry/sdk-trace-base';
-import { GlobalDaemon } from '../src/daemon.ts';
-import { ATTR, OP } from '../src/genaiSpans.ts';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import { ATTR } from '../src/genaiSpans.ts';
+import { childrenOf, flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-function setupTracer() {
-  const exporter = new InMemorySpanExporter();
-  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
-  return { tracer: provider.getTracer('test'), exporter, provider };
+interface Driver {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
 }
 
 const USAGE = { input_tokens: 100, output_tokens: 1508, cache_read_input_tokens: 400 };
@@ -62,54 +59,37 @@ function makeTranscript(sessionId: string): { file: string; append: (line: unkno
   };
 }
 
-interface Handlers {
-  handleSessionStart(s: string, p: Record<string, unknown>): Promise<void>;
-  handleUserPromptSubmit(s: string, p: Record<string, unknown>): Promise<void>;
-  handlePreToolUse(s: string, a: string | undefined, p: Record<string, unknown>): Promise<void>;
-  handlePostToolUse(s: string, p: Record<string, unknown>): Promise<void>;
-  handleStop(s: string, p: Record<string, unknown>): Promise<void>;
-  handleSessionEnd(s: string, p: Record<string, unknown>): Promise<void>;
-  tracer: unknown;
-}
-
-function makeDaemon(tracer: ReturnType<typeof setupTracer>['tracer']): Handlers {
-  const logFile = path.join(os.tmpdir(), `wcp-itest-${process.pid}.log`);
-  const d = new GlobalDaemon('/tmp/unused.sock', logFile, 'e/p', 'k', 'https://x', false, 'claude-code');
-  (d as unknown as { tracer: unknown }).tracer = tracer;
-  return d as unknown as Handlers;
-}
-
-function childrenOf(spans: ReadableSpan[], parent: ReadableSpan): ReadableSpan[] {
-  return spans
-    .filter(s => s.parentSpanContext?.spanId === parent.spanContext().spanId)
-    .sort((a, b) => hrToNs(a.startTime) - hrToNs(b.startTime));
-}
 function chatByResponse(spans: ReadableSpan[], id: string): ReadableSpan[] {
-  return spans.filter(s => s.attributes[ATTR.OPERATION_NAME] === OP.CHAT && s.attributes[ATTR.RESPONSE_ID] === id);
+  return spans.filter(s => s.attributes[ATTR.OPERATION_NAME] === 'chat' && s.attributes[ATTR.RESPONSE_ID] === id);
+}
+function partsOf(span: ReadableSpan): Array<Record<string, unknown>> {
+  const msgs = JSON.parse(span.attributes[ATTR.OUTPUT_MESSAGES] as string) as Array<{ parts?: Array<Record<string, unknown>> }>;
+  return msgs[0]?.parts ?? [];
 }
 
 test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool interleave, usage once, no double-emit', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
   const sid = 'sess-A';
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
 
-  const { tracer, exporter, provider } = setupTracer();
-  const d = makeDaemon(tracer);
+  const d = makeGenaiDaemon() as unknown as Driver;
   try {
-    await d.handleSessionStart(sid, { transcript_path: file, source: 'startup', cwd: '/x' });
-    await d.handleUserPromptSubmit(sid, { prompt: 'do the thing' });
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do the thing' });
 
     // Response msgA: text then tool_use (split lines, shared id), flushed
     // before the tool's PreToolUse fires.
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
-    await d.handlePostToolUse(sid, { tool_use_id: 'tool_1', tool_response: 'ok' });
+    await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tool_1', tool_response: 'ok' });
 
-    // msgB: text-only (no tool_use → no PreToolUse; back-filled at Stop).
+    // msgB: text-only (no tool_use -> no PreToolUse; back-filled at Stop).
     append(aLine('msgB', '2026-01-01T00:00:10.000Z', { type: 'text', text: 'all done' }, 'end_turn'));
-    await d.handleStop(sid, {});
-    await provider.forceFlush();
+    await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await flushWeave();
 
     const spans = exporter.getFinishedSpans();
 
@@ -118,45 +98,53 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
     assert.equal(chatByResponse(spans, 'msgB').length, 1, 'one chat span for msgB');
 
     const chatA = chatByResponse(spans, 'msgA')[0];
+    // msgA text + tool_use are ordered output parts on the chat span.
+    assert.deepEqual(partsOf(chatA), [
+      { type: 'text', content: 'first I will edit' },
+      { type: 'tool_call', toolCallId: 'tool_1', toolName: 'Edit', arguments: '{}' },
+    ], 'msgA: text then tool_call, in transcript order, as output parts');
+    // The tool the model called nests under the chat span as an execute_tool child.
     const aKids = childrenOf(spans, chatA).map(s => s.attributes[ATTR.OPERATION_NAME]);
-    assert.deepEqual(aKids, [OP.ASSISTANT_TEXT, OP.EXECUTE_TOOL], 'msgA: text then tool, both parented under the chat span');
+    assert.deepEqual(aKids, ['execute_tool'], 'msgA: the execute_tool span nests under the chat span');
 
     // Usage counted once for the split response.
     assert.equal(chatA.attributes[ATTR.USAGE_OUTPUT_TOKENS], 1508);
     assert.equal(chatA.attributes[ATTR.USAGE_INPUT_TOKENS], 100 + 400);
 
     const chatB = chatByResponse(spans, 'msgB')[0];
-    assert.deepEqual(childrenOf(spans, chatB).map(s => s.attributes[ATTR.OPERATION_NAME]), [OP.ASSISTANT_TEXT]);
+    assert.deepEqual(partsOf(chatB), [{ type: 'text', content: 'all done' }]);
+    assert.equal(childrenOf(spans, chatB).length, 0, 'tool-less msgB has no execute_tool children');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('handlers: a new response transitions and finalizes the previous chat span', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
   const sid = 'sess-B';
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do two things'));
 
-  const { tracer, exporter, provider } = setupTracer();
-  const d = makeDaemon(tracer);
+  const d = makeGenaiDaemon() as unknown as Driver;
   try {
-    await d.handleSessionStart(sid, { transcript_path: file, source: 'startup', cwd: '/x' });
-    await d.handleUserPromptSubmit(sid, { prompt: 'do two things' });
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do two things' });
 
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'editing A' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_A', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_A', tool_name: 'Edit', tool_input: {} });
-    await d.handlePostToolUse(sid, { tool_use_id: 'tool_A', tool_response: 'ok' });
+    await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tool_A', tool_name: 'Edit', tool_input: {} });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tool_A', tool_response: 'ok' });
 
-    // Second response with its own tool_use → PreToolUse(tool_B) must finalize
+    // Second response with its own tool_use -> PreToolUse(tool_B) must finalize
     // msgA's chat span (transition) before opening msgB's.
     append(aLine('msgB', '2026-01-01T00:00:05.000Z', { type: 'text', text: 'editing B' }));
     append(aLine('msgB', '2026-01-01T00:00:06.000Z', { type: 'tool_use', id: 'tool_B', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_B', tool_name: 'Edit', tool_input: {} });
-    await d.handlePostToolUse(sid, { tool_use_id: 'tool_B', tool_response: 'ok' });
+    await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tool_B', tool_name: 'Edit', tool_input: {} });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tool_B', tool_response: 'ok' });
 
-    await d.handleStop(sid, {});
-    await provider.forceFlush();
+    await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await flushWeave();
 
     const spans = exporter.getFinishedSpans();
     assert.equal(chatByResponse(spans, 'msgA').length, 1, 'msgA finalized exactly once at the transition');
@@ -164,45 +152,44 @@ test('handlers: a new response transitions and finalizes the previous chat span'
 
     for (const id of ['msgA', 'msgB']) {
       const chat = chatByResponse(spans, id)[0];
+      const parts = partsOf(chat).map(p => p['type']);
+      assert.deepEqual(parts, ['text', 'tool_call'], `${id}: text + tool_call output parts`);
       const kids = childrenOf(spans, chat).map(s => s.attributes[ATTR.OPERATION_NAME]);
-      assert.deepEqual(kids, [OP.ASSISTANT_TEXT, OP.EXECUTE_TOOL], `${id}: text + tool under its chat span`);
+      assert.deepEqual(kids, ['execute_tool'], `${id}: execute_tool nests under its chat span`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('handlers: SessionEnd finalizes a still-open chat span with its text + usage (not an empty orphan)', async () => {
+test('handlers: SessionEnd finalizes a still-open chat span with its output + usage (not an empty orphan)', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
   const sid = 'sess-C';
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
 
-  const { tracer, exporter, provider } = setupTracer();
-  const d = makeDaemon(tracer);
+  const d = makeGenaiDaemon() as unknown as Driver;
   try {
-    await d.handleSessionStart(sid, { transcript_path: file, source: 'startup', cwd: '/x' });
-    await d.handleUserPromptSubmit(sid, { prompt: 'do the thing' });
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do the thing' });
 
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: {} });
+    await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: {} });
 
-    // No Stop — session ends mid-turn with the chat span still open.
-    await d.handleSessionEnd(sid, { reason: 'clear' });
-    await provider.forceFlush();
+    // No Stop - session ends mid-turn with the chat span still open.
+    await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
+    await flushWeave();
 
     const spans = exporter.getFinishedSpans();
     const chatA = chatByResponse(spans, 'msgA')[0];
     assert.ok(chatA, 'chat span for msgA was finalized at SessionEnd (has a response id)');
-    // Finalized, not an empty orphan: usage + text child are present.
+    // Finalized, not an empty orphan: usage + text output part are present.
     assert.equal(chatA.attributes[ATTR.USAGE_OUTPUT_TOKENS], 1508, 'usage recovered at SessionEnd');
-    const kids = childrenOf(spans, chatA).map(s => s.attributes[ATTR.OPERATION_NAME]);
-    assert.ok(kids.includes(OP.ASSISTANT_TEXT), 'assistant_text child recovered at SessionEnd');
+    const types = partsOf(chatA).map(p => p['type']);
+    assert.ok(types.includes('text'), 'assistant text output part recovered at SessionEnd');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
-
-function hrToNs(t: [number, number]): number {
-  return t[0] * 1e9 + t[1];
-}
