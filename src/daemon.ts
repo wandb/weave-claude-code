@@ -21,7 +21,7 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import { loadSettings, VERSION, type Settings } from './setup.js';
+import { loadSettings, VERSION, BUILD_VERSION, type Settings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import {
   parseSessionFd,
@@ -530,7 +530,7 @@ export class GlobalDaemon {
       // service.name has always mirrored the agent name; keep that coupling
       // so a custom agent_name renames the OTel service too.
       'service.name': this.agentName,
-      'service.version': VERSION,
+      'service.version': BUILD_VERSION,
       'wandb.entity': entity,
       'wandb.project': project,
     });
@@ -548,7 +548,7 @@ export class GlobalDaemon {
       spanProcessors: [new IntegrationBaggageSpanProcessor(), new BatchSpanProcessor(exporter)],
     });
     this.provider.register();
-    this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
+    this.tracer = this.provider.getTracer('weave-claude-code', BUILD_VERSION);
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -869,7 +869,7 @@ export class GlobalDaemon {
       prompt,
       cwd: session.cwd,
       source: session.source,
-      pluginVersion: VERSION,
+      pluginVersion: BUILD_VERSION,
       agentName: this.agentName,
       requestModel: session.initialRequestModel,
       displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
@@ -929,7 +929,7 @@ export class GlobalDaemon {
       const invokeAgentSpan = startInvokeAgentSpan(this.tracer, toolParent, {
         agentType: subagentType,
         conversationId: session.conversationId,
-        pluginVersion: VERSION,
+        pluginVersion: BUILD_VERSION,
         inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
         spawningToolCallId: toolUseId,
         displayName: toolDisplayName(toolName, toolInput),
@@ -1337,7 +1337,7 @@ export class GlobalDaemon {
         bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
           agentType,
           conversationId: session.conversationId,
-          pluginVersion: VERSION,
+          pluginVersion: BUILD_VERSION,
           displayName: `Agent: ${agentType}`,
         });
         bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
