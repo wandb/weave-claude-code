@@ -11,7 +11,6 @@ import {
   CONFIG_DIR,
   SETTINGS_FILE,
   MARKETPLACE_NAME,
-  PLUGIN_NAME,
   VERSION,
   InstallSource,
   MarketplaceStatus,
@@ -144,8 +143,8 @@ async function cmdInstall(
     process.exit(1);
   }
 
-  const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-  const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  const effectiveProject = resolveProject(settings).value;
+  const effectiveApiKey = resolveApiKey(settings).value;
 
   if (nonInteractive) {
     console.log('\n- Non-interactive install: skipping setup prompts');
@@ -242,6 +241,49 @@ function resolveAgentName(settings: Settings): { value: string; source: AgentNam
   return { value: DEFAULT_AGENT_NAME, source: AgentNameSource.Default };
 }
 
+/**
+ * Resolve the effective Weave project and where it came from, applying the
+ * env-over-settings precedence (`WEAVE_PROJECT` beats `settings.weave_project`).
+ * Shared by install, config, status, and restart so they report one value.
+ * `value` uses nullish coalescing and `source` uses truthiness, matching the
+ * per-site expressions this replaces.
+ */
+function resolveProject(settings: Settings): { value: string | null; source: WeaveProjectSource } {
+  const value = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+  const source = process.env['WEAVE_PROJECT']
+    ? WeaveProjectSource.EnvVar
+    : settings.weave_project
+      ? WeaveProjectSource.Settings
+      : WeaveProjectSource.NotSet;
+  return { value, source };
+}
+
+/**
+ * Resolve the effective W&B API key and where it came from, applying the
+ * env-over-settings precedence (`WANDB_API_KEY` beats `settings.wandb_api_key`).
+ * Shared by install, config, status, and restart so they report one value.
+ * `value` uses nullish coalescing and `source` uses truthiness, matching the
+ * per-site expressions this replaces.
+ */
+function resolveApiKey(settings: Settings): { value: string | null; source: ApiKeySource } {
+  const value = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  const source = process.env['WANDB_API_KEY']
+    ? ApiKeySource.EnvVar
+    : settings.wandb_api_key
+      ? ApiKeySource.Settings
+      : ApiKeySource.NotSet;
+  return { value, source };
+}
+
+/**
+ * Render the comma-joined list of missing required config for the "incomplete"
+ * status/restart messages. `apiKeyLabel` differs by call site (`wandb_api_key`
+ * for the config-oriented message, `WANDB_API_KEY` for the env-oriented one).
+ */
+function missingConfig(project: string | null, apiKey: string | null, apiKeyLabel: string): string {
+  return [!project && 'weave_project', !apiKey && apiKeyLabel].filter(Boolean).join(', ');
+}
+
 async function cmdConfig(args: string[]): Promise<void> {
   const action = args[0];
 
@@ -254,19 +296,8 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-    const projectSource: WeaveProjectSource = process.env['WEAVE_PROJECT']
-      ? WeaveProjectSource.EnvVar
-      : settings.weave_project
-        ? WeaveProjectSource.Settings
-        : WeaveProjectSource.NotSet;
-
-    const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-    const apiKeySource: ApiKeySource = process.env['WANDB_API_KEY']
-      ? ApiKeySource.EnvVar
-      : settings.wandb_api_key
-        ? ApiKeySource.Settings
-        : ApiKeySource.NotSet;
+    const { value: effectiveProject, source: projectSource } = resolveProject(settings);
+    const { value: effectiveApiKey, source: apiKeySource } = resolveApiKey(settings);
     const apiKeyDisplay = effectiveApiKey ? `${maskSecret(effectiveApiKey)} [${apiKeySource}]` : `(not set)`;
 
     console.log('Current configuration:');
@@ -308,11 +339,9 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
     if (key === 'weave_project') {
-      const effective = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-      console.log(effective ?? '(not set)');
+      console.log(resolveProject(settings).value ?? '(not set)');
     } else if (key === 'wandb_api_key') {
-      const effective = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-      console.log(effective ?? '(not set)');
+      console.log(resolveApiKey(settings).value ?? '(not set)');
     } else {
       console.log(value ?? '(not set)');
     }
@@ -327,11 +356,12 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const writableKeys = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug'];
-    if (!writableKeys.includes(key)) {
+    const writableKeys: readonly (keyof Settings)[] = ['weave_project', 'wandb_api_key', 'agent_name', 'daemon_socket', 'debug'];
+    if (!writableKeys.includes(key as keyof Settings)) {
       console.error(`Cannot set '${key}'. Writable keys: ${writableKeys.join(', ')}`);
       process.exit(1);
     }
+    const writableKey = key as keyof Settings;
 
     if (key === 'weave_project' && !value.includes('/')) {
       console.error(`Invalid format for weave_project: '${value}'\nExpected: entity/project (e.g. my-entity/my-project)`);
@@ -351,10 +381,19 @@ async function cmdConfig(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const coerced = key === 'debug' ? value === 'true' : value;
-    (settings as unknown as Record<string, unknown>)[key] = coerced;
+    // `debug` is the only boolean Settings field; every other writable key is a
+    // string. Split the assignment so each branch's value type matches the
+    // narrowed property type (no whole-object cast needed).
+    let coerced: string | boolean;
+    if (writableKey === 'debug') {
+      coerced = value === 'true';
+      settings.debug = coerced;
+    } else {
+      coerced = value;
+      settings[writableKey] = value;
+    }
     saveSettings(settings);
-    const displayValue = key === 'wandb_api_key' && typeof coerced === 'string'
+    const displayValue = writableKey === 'wandb_api_key' && typeof coerced === 'string'
       ? maskSecret(coerced)
       : coerced;
     console.log(`✓ Set ${key} = ${displayValue}`);
@@ -473,18 +512,17 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     return snap;
   }
 
-  // Env vars take precedence over settings.json for both project and key.
-  const effectiveProject = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
+  const { value: effectiveProject, source: projectSource } = resolveProject(settings);
   if (effectiveProject) {
     report.weave_project = effectiveProject;
-    report.weave_project_source = process.env['WEAVE_PROJECT'] ? WeaveProjectSource.EnvVar : WeaveProjectSource.Settings;
+    report.weave_project_source = projectSource;
   }
 
-  const effectiveApiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  const { value: effectiveApiKey, source: apiKeySource } = resolveApiKey(settings);
   if (effectiveApiKey) {
     report.api_key_configured = true;
     snap.api_key_masked = maskSecret(effectiveApiKey);
-    snap.api_key_source = process.env['WANDB_API_KEY'] ? ApiKeySource.EnvVar : ApiKeySource.Settings;
+    snap.api_key_source = apiKeySource;
   }
 
   report.agent_name = resolveAgentName(settings).value;
@@ -601,10 +639,11 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   } else if (socketState === SocketState.Stale) {
     console.log('Status: Daemon socket is stale — will auto-recover on next Claude Code hook');
   } else {
-    const missing = [
-      !report.weave_project && 'weave_project',
-      !report.api_key_configured && 'wandb_api_key',
-    ].filter(Boolean).join(', ');
+    const missing = missingConfig(
+      report.weave_project,
+      report.api_key_configured ? 'set' : null,
+      'wandb_api_key',
+    );
     console.log(`Status: Configuration incomplete — set ${missing} to start tracing`);
   }
 }
@@ -795,10 +834,10 @@ async function cmdRestart(): Promise<void> {
   }
 
   // Don't spawn a daemon that would just exit for lack of config (mirrors runDaemon).
-  const project = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-  const apiKey = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
+  const project = resolveProject(settings).value;
+  const apiKey = resolveApiKey(settings).value;
   if (!project || !apiKey) {
-    const missing = [!project && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
+    const missing = missingConfig(project, apiKey, 'WANDB_API_KEY');
     console.error(`⚠ Not starting daemon, missing configuration: ${missing}`);
     console.error('  Set it with: weave-claude-code config set weave_project ENTITY/PROJECT');
     process.exit(1);

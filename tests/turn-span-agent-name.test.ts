@@ -3,54 +3,51 @@
 // SPDX-PackageName: weave-claude-code
 
 // The top-level agent name is user-customizable (settings `agent_name` /
-// `WEAVE_AGENT_NAME`). The daemon resolves the effective value and passes it
-// to startTurnSpan, which must stamp it on BOTH the span name (`invoke_agent
-// <name>`, which drives Weave's Agents-view grouping) and the
-// `gen_ai.agent.name` attribute.
+// `WEAVE_AGENT_NAME`). The daemon resolves the effective value and passes it to
+// `weave.startTurn`, which the SDK stamps on the `gen_ai.agent.name` attribute
+// that drives Weave's Agents-view grouping. (The SDK always names the span
+// `invoke_agent`; the agent name lives in the attribute, not the span name.)
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import { startTurnSpan, ATTR, DEFAULT_AGENT_NAME } from '../src/genaiSpans.ts';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { ATTR, DEFAULT_AGENT_NAME } from '../src/genaiSpans.ts';
+import { flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-function setupTracer(): { tracer: ReturnType<BasicTracerProvider['getTracer']>; exporter: InMemorySpanExporter; provider: BasicTracerProvider } {
-  const exporter = new InMemorySpanExporter();
-  const provider = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(exporter)],
-  });
-  const tracer = provider.getTracer('test');
-  return { tracer, exporter, provider };
+interface Driver {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
 }
 
-function baseArgs(agentName: string) {
-  return {
-    sessionId: 'sess-1',
-    conversationId: 'conv-1',
-    turnNumber: 1,
-    prompt: 'hello',
-    cwd: '/tmp',
-    source: 'startup',
-    pluginVersion: '0.0.0-test',
-    agentName,
-  };
+function writeTranscript(sessionId: string, text: string): { file: string; dir: string } {
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-agentname-'));
+  const file = path.join(dir, `${sessionId}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n');
+  return { file, dir };
 }
 
-test('startTurnSpan: agentName drives the span name and gen_ai.agent.name', async () => {
-  const { tracer, exporter, provider } = setupTracer();
+test('turn span: agentName drives gen_ai.agent.name', async () => {
+  const exporter = await initWeaveInMemory();
 
   // A custom name and the default both flow through identically.
   for (const name of ['my-custom-agent', DEFAULT_AGENT_NAME]) {
-    startTurnSpan(tracer, baseArgs(name)).end();
-  }
-  await provider.forceFlush();
+    exporter.reset();
+    const sid = `sess-${name}`;
+    const { file, dir } = writeTranscript(sid, 'hello');
+    const d = makeGenaiDaemon(name) as unknown as Driver;
+    try {
+      await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/tmp' });
+      await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'hello' });
+      // The turn span only exports on end; SessionEnd finalizes an open turn.
+      await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
+      await flushWeave();
 
-  for (const name of ['my-custom-agent', DEFAULT_AGENT_NAME]) {
-    const span = exporter.getFinishedSpans().find(s => s.name === `invoke_agent ${name}`);
-    assert.ok(span, `span name must embed the agent name "${name}"`);
-    assert.equal(span.attributes[ATTR.AGENT_NAME], name);
+      const turnSpans = exporter.getFinishedSpans().filter(s => s.name === 'invoke_agent');
+      assert.equal(turnSpans.length, 1, 'exactly one turn span');
+      assert.equal(turnSpans[0].attributes[ATTR.AGENT_NAME], name, `gen_ai.agent.name must be "${name}"`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 });

@@ -17,14 +17,12 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/exporter-trace-otlp-proto": "^0.219.0",
-    "@opentelemetry/resources": "^2.7.1",
-    "@opentelemetry/sdk-trace-base": "^2.7.1",
-    "@opentelemetry/sdk-trace-node": "^2.7.1",
-    "@opentelemetry/semantic-conventions": "^1.41.1",
-    "uuidv7": "1.2.1"
+    "uuidv7": "1.2.1",
+    "weave": "^0.16.1"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.178",
+    "@opentelemetry/sdk-trace-base": "^2.7.1",
     "@types/node": "^18.19.0",
     "tsx": "^4.19.0",
     "typescript": "^6.0.2"

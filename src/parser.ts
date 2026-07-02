@@ -38,7 +38,7 @@ export interface ParsedSession {
   turns: Turn[];
 }
 
-export function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
+function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
   return {
     input_tokens: raw['input_tokens'] ?? 0,
     output_tokens: raw['output_tokens'] ?? 0,
@@ -47,7 +47,7 @@ export function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
   };
 }
 
-export function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
+function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
   return {
     input_tokens: a.input_tokens + b.input_tokens,
     output_tokens: a.output_tokens + b.output_tokens,
@@ -107,20 +107,19 @@ function buildSession(lines: unknown[]): ParsedSession {
   let prevTimestamp: string | undefined;
 
   for (const line of lines) {
-    const entry = line as Record<string, unknown>;
-    const message = entry['message'] as Record<string, unknown> | undefined;
-    const type = entry['type'] as string | undefined;
-    const role = (message?.['role'] as string | undefined) ?? type;
-    const timestamp = entry['timestamp'] as string | undefined;
+    const { message, type, role: rawRole, timestamp } = readTranscriptLine(line);
+    const role = rawRole ?? type;
 
     if (role === 'assistant') {
-      currentAssistantLines.push({ line: entry, prevTimestamp });
+      // `role === 'assistant'` implies the line is an object (it carried either
+      // a `message.role` or a top-level `type`), so the {} fallback is unreachable.
+      currentAssistantLines.push({ line: isObject(line) ? line : {}, prevTimestamp });
     } else if (role === 'user') {
       const rawContent = message?.['content'];
-      const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
       // A user message with text content marks the end of the previous turn.
-      const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
+      const hasText = typeof rawContent === 'string'
+        || (Array.isArray(rawContent) ? rawContent : []).some(isTextBlock);
       if (hasText && currentAssistantLines.length > 0) {
         turns.push(buildTurn(currentAssistantLines));
         currentAssistantLines = [];
@@ -139,16 +138,14 @@ function buildSession(lines: unknown[]): ParsedSession {
 
 function buildTurn(assistantLines: AssistantLine[]): Turn {
   const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
-    const message = line['message'] as Record<string, unknown> | undefined;
+    const { message } = readTranscriptLine(line);
     const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
     const usage = rawToUsageSummary(rawUsage);
     const reasoningTokens = typeof rawUsage['reasoning_tokens'] === 'number' ? rawUsage['reasoning_tokens'] : undefined;
     const model = (message?.['model'] ?? line['model']) as string | undefined;
     const rawContent = message?.['content'];
-    // `content` is either an array of blocks (the common assistant shape), a
-    // bare string (legacy single-text format), or missing. Fall back to [] for
-    // the missing / unknown case so downstream code sees a well-typed empty
-    // list instead of `undefined`.
+    // A bare-string `content` is the legacy single-text format; synthesize a
+    // text block so downstream sees a uniform block list (missing/other → []).
     const contentBlocks: unknown[] = Array.isArray(rawContent)
       ? (rawContent as unknown[])
       : typeof rawContent === 'string'
@@ -175,7 +172,7 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
     { input_tokens: 0, output_tokens: 0 },
   );
 
-  const model = calls.map(call => call.model).filter(Boolean).pop();
+  const model = calls.filter(call => call.model).at(-1)?.model;
 
   const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
 
@@ -194,9 +191,35 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
 type TextBlock = { type: 'text'; text: string };
 type ThinkingBlock = { type: 'thinking'; thinking: string };
 type RedactedThinkingBlock = { type: 'redacted_thinking'; data?: string };
+type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input?: unknown };
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
+}
+
+/** Structural shape of a single JSONL transcript line we care about. */
+type TranscriptLine = {
+  message?: Record<string, unknown>;
+  type?: string;
+  role?: string;
+  timestamp?: string;
+};
+
+/**
+ * Decode one raw JSONL transcript line into the fields the parser reads,
+ * narrowing each with a runtime check instead of an `as` cast. `role` is the
+ * raw `message.role` (callers fall back to `type` for lines that carry only a
+ * top-level `type`). Fields absent or of the wrong type come back undefined.
+ */
+function readTranscriptLine(line: unknown): TranscriptLine {
+  if (!isObject(line)) return {};
+  const message = isObject(line['message']) ? line['message'] : undefined;
+  return {
+    message,
+    type: typeof line['type'] === 'string' ? line['type'] : undefined,
+    role: typeof message?.['role'] === 'string' ? message['role'] : undefined,
+    timestamp: typeof line['timestamp'] === 'string' ? line['timestamp'] : undefined,
+  };
 }
 
 export function isTextBlock(block: unknown): block is TextBlock {
@@ -209,6 +232,11 @@ export function isThinkingBlock(block: unknown): block is ThinkingBlock {
 
 export function isRedactedThinkingBlock(block: unknown): block is RedactedThinkingBlock {
   return isObject(block) && block['type'] === 'redacted_thinking';
+}
+
+export function isToolUseBlock(block: unknown): block is ToolUseBlock {
+  return isObject(block) && block['type'] === 'tool_use'
+    && typeof block['id'] === 'string' && typeof block['name'] === 'string';
 }
 
 /**

@@ -2,45 +2,28 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Integration identity rides OTel Baggage onto EVERY span, not just the turn
-// root. The daemon stashes per-session baggage at SessionStart and activates it
-// for each event (in routeEvent); IntegrationBaggageSpanProcessor copies the
-// `weave.integration.*` entries onto every span at onStart. So a chat or
-// execute_tool span deep in a turn is filterable by integration just like the
+// Integration identity rides onto EVERY span (turn root and all children), not
+// just the turn root. The daemon builds per-session integration attributes at
+// SessionStart and installs them on the session's Conversation; the SDK copies
+// them onto every span it emits, and routeEvent re-installs the conversation for
+// each event (each runIsolated frame starts with fresh ambient state). So a chat
+// or execute_tool span deep in a turn is filterable by integration just like the
 // root. Assertions use the literal wire keys — those strings are the contract
 // the Weave backend reads into its queryable custom-attribute maps.
 //
-// This drives the real routeEvent entry point (not the handlers directly) so
-// the baggage context.with wrapping is exercised, and registers an
-// AsyncLocalStorage context manager the way production's provider.register()
-// does, so context.active() propagates across the handlers' awaits.
+// Driven through the real routeEvent entry point so the per-event conversation
+// re-install is exercised.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { context } from '@opentelemetry/api';
-import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import { GlobalDaemon } from '../src/daemon.ts';
-import { IntegrationBaggageSpanProcessor } from '../src/genaiSpans.ts';
 import { VERSION } from '../src/setup.ts';
+import { flushWeave, initWeaveInMemory, makeGenaiDaemon, spanParentId } from './helpers.ts';
 
-// Production installs this via NodeTracerProvider.register(); the test injects a
-// BasicTracerProvider, so set it up here or context.with won't propagate.
-context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
-
-function setupTracer() {
-  const exporter = new InMemorySpanExporter();
-  const provider = new BasicTracerProvider({
-    spanProcessors: [new IntegrationBaggageSpanProcessor(), new SimpleSpanProcessor(exporter)],
-  });
-  return { tracer: provider.getTracer('test'), exporter, provider };
+interface Driver {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
 }
 
 const USAGE = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0 };
@@ -64,22 +47,16 @@ function aLine(id: string, ts: string, block: Record<string, unknown>, stop?: st
   };
 }
 
-function makeDaemon(tracer: unknown) {
-  const logFile = path.join(os.tmpdir(), `wcp-integ-${process.pid}.log`);
-  const d = new GlobalDaemon('/tmp/unused-integ.sock', logFile, 'e/p', 'k', 'https://x', false, 'claude-code');
-  (d as unknown as { tracer: unknown }).tracer = tracer;
-  return d as unknown as { routeEvent(p: Record<string, unknown>): Promise<void> };
-}
-
-test('integration baggage stamps weave.integration.* on every span (turn, chat, tool, text)', async () => {
+test('integration identity stamps weave.integration.* on every span (turn, chat, tool)', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
   const sid = 'sess-bag';
   const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-integ-'));
   const file = path.join(dir, `${sid}.jsonl`);
   // First transcript line carries the CC CLI version (real CC transcripts do).
   fs.appendFileSync(file, JSON.stringify(userText('2026-01-01T00:00:00.000Z', 'do it', '1.2.3')) + '\n');
 
-  const { tracer, exporter, provider } = setupTracer();
-  const d = makeDaemon(tracer);
+  const d = makeGenaiDaemon() as unknown as Driver;
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
@@ -90,7 +67,7 @@ test('integration baggage stamps weave.integration.* on every span (turn, chat, 
     await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
     await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tool_1', tool_response: 'ok' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
-    await provider.forceFlush();
+    await flushWeave();
 
     const spans = exporter.getFinishedSpans();
     const ops = new Set(spans.map((s) => s.attributes['gen_ai.operation.name']));
@@ -98,11 +75,11 @@ test('integration baggage stamps weave.integration.* on every span (turn, chat, 
     assert.ok(ops.has('chat'), 'chat span present');
     assert.ok(ops.has('execute_tool'), 'tool span present');
 
-    // The baggage context.with wrapping must not disturb the trace tree: the
+    // The per-event conversation re-install must not disturb the trace tree: the
     // turn is still the root (no parent) and every span lives in its trace.
     const turn = spans.find((s) => s.attributes['gen_ai.operation.name'] === 'invoke_agent');
     assert.ok(turn, 'turn span present');
-    assert.equal(turn.parentSpanContext, undefined, 'turn span is a trace root');
+    assert.equal(spanParentId(turn), undefined, 'turn span is a trace root');
     for (const s of spans) {
       assert.equal(s.spanContext().traceId, turn.spanContext().traceId, `${s.name} shares the turn trace`);
     }

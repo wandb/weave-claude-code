@@ -6,53 +6,61 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
-import {
-  Baggage,
-  Span,
-  SpanStatusCode,
-  Tracer,
-  context as otelContext,
-  propagation,
-  diag,
-  DiagConsoleLogger,
-  DiagLogLevel,
-} from '@opentelemetry/api';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { resourceFromAttributes } from '@opentelemetry/resources';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import type { Attributes } from '@opentelemetry/api';
+import type {
+  HookInput,
+  SessionStartHookInput,
+  UserPromptSubmitHookInput,
+  PreToolUseHookInput,
+  PostToolUseHookInput,
+  PostToolUseFailureHookInput,
+  PermissionRequestHookInput,
+  SubagentStartHookInput,
+  SubagentStopHookInput,
+  TeammateIdleHookInput,
+  PreCompactHookInput,
+  StopHookInput,
+  SessionEndHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
+import * as weave from 'weave';
 import { loadSettings, VERSION, type Settings } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
-import {
-  parseSessionFd,
-  extractAssistantTextBlocks,
-  isTextBlock,
-  isThinkingBlock,
-  isRedactedThinkingBlock,
-} from './parser.js';
+import { parseSessionFd } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   DEFAULT_AGENT_NAME,
   CompactionAttrs,
-  IntegrationBaggageSpanProcessor,
-  createIntegrationBaggage,
-  startTurnSpan,
-  startToolSpan,
-  startInvokeAgentSpan,
-  startChatSpan,
-  finalizeChatSpan,
-  emitAssistantTextSpan,
-  emitThinkingSpan,
-  emitChatSpansFromAssistantCalls,
   addPermissionRequestEvent,
-  addPermissionResolvedEvent,
   setCompactionAttrs,
   toolDisplayName,
   promptSnippet,
   jsonStr,
-  parseTimestamp,
 } from './genaiSpans.js';
+import {
+  chatMessageKey,
+  callsForResponseKey,
+  findToolUseResponseKey,
+  parseIsoOrNow,
+  startChat,
+  openChatForGroup,
+  recordChat,
+} from './chatSpans.js';
+import {
+  resolvePermissionIfPending,
+  hashPrompt,
+  computeSubagentTranscriptPath,
+  extractUserMessageContent,
+  lastAssistantTextEndsWith,
+  readSubagentFirstLineWithRetry,
+  newSessionState,
+} from './sessionState.js';
+import type {
+  PendingToolCall,
+  SubagentTracker,
+  TeamMember,
+  SessionState,
+} from './sessionState.js';
 import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,261 +81,6 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   if (typeof payload !== 'object' || payload === null) return false;
   const cmd = (payload as Record<string, unknown>).command;
   return cmd === 'shutdown' || cmd === 'config-hash';
-}
-
-/** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
-type PendingToolCall = {
-  span: Span;
-  toolName: string;
-  toolInput: Record<string, unknown>;
-  /** True once a PermissionRequest event has been emitted for this tool. */
-  permissionRequested?: boolean;
-}
-
-/** Tracks the chat span currently open for a single assistant API response.
- *  Tool spans for that response parent here so the trace tree shows the
- *  model's interleaved text → tool_use → text order. The response's
- *  text/thinking children are emitted when the span is finalized (at the next
- *  response transition or at Stop), once all its split transcript lines are
- *  present. */
-type ActiveChatSpan = {
-  /** Response key (Anthropic `message.id`, or index fallback) this chat span
-   *  represents; see `chatMessageKey`. */
-  responseKey: string;
-  span: Span;
-}
-
-/** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
-function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
-  if (!pending.permissionRequested) return;
-  addPermissionResolvedEvent(pending.span, {
-    approved,
-    timestamp: new Date(),
-  });
-}
-
-/** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
- *  the subagent's SubagentStart by matching transcript content. */
-function hashPrompt(prompt: string): string {
-  return createHash('sha256').update(prompt, 'utf8').digest('hex');
-}
-
-/** Stable identity for an assistant API call within a turn. Anthropic returns
- *  a `message.id` on every response; that's the primary key. When it's
- *  missing (legacy transcripts), fall back to the index, which is stable
- *  within a single parse + turn. */
-function chatMessageKey(call: AssistantCallDetail, callIdx: number): string {
-  return call.responseId ?? `idx:${callIdx}`;
-}
-
-/** All calls belonging to one assistant API response, in transcript order.
- *  Claude Code splits a single response's thinking / text / tool_use blocks
- *  across separate transcript lines that share a `message.id`; the parser maps
- *  each line to its own `AssistantCallDetail`, so this regroups them by key. */
-function callsForResponseKey(
-  calls: AssistantCallDetail[],
-  key: string,
-): AssistantCallDetail[] {
-  const group: AssistantCallDetail[] = [];
-  for (let i = 0; i < calls.length; i++) {
-    if (chatMessageKey(calls[i], i) === key) group.push(calls[i]);
-  }
-  return group;
-}
-
-/** Find the response key of the assistant call whose content contains a
- *  `tool_use` block with `toolUseId`, or undefined if not found (transcript
- *  not flushed yet, or unknown id). */
-function findToolUseResponseKey(
-  calls: AssistantCallDetail[],
-  toolUseId: string,
-): string | undefined {
-  for (let ci = 0; ci < calls.length; ci++) {
-    for (const raw of calls[ci].contentBlocks) {
-      const b = raw as Record<string, unknown> | undefined;
-      if (b && typeof b === 'object' && b['type'] === 'tool_use' && b['id'] === toolUseId) {
-        return chatMessageKey(calls[ci], ci);
-      }
-    }
-  }
-  return undefined;
-}
-
-function parseIsoOrNow(ts: string | undefined): Date {
-  return parseTimestamp(ts) ?? new Date();
-}
-
-/**
- * Map a parent transcript path + subagent agent_id to the subagent's transcript
- * file. Claude Code writes subagent transcripts as siblings of the parent in a
- * `<session_id>/subagents/` subdirectory:
- *   parent:   <project_dir>/<session_id>.jsonl
- *   subagent: <project_dir>/<session_id>/subagents/agent-<agent_id>.jsonl
- */
-function computeSubagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
-  const projectDir = path.dirname(parentTranscriptPath);
-  const sessionDirName = path.basename(parentTranscriptPath, '.jsonl');
-  return path.join(projectDir, sessionDirName, 'subagents', `agent-${agentId}.jsonl`);
-}
-
-/** Pull the user-message content out of a transcript line. Returns the prompt
- *  string for `{type: 'user', message: {content: string|Array}}` lines, else
- *  undefined. Array-form content is joined across text blocks. */
-function extractUserMessageContent(line: Record<string, unknown> | undefined): string | undefined {
-  if (!line || line['type'] !== 'user') return undefined;
-  const msg = line['message'];
-  if (!msg || typeof msg !== 'object') return undefined;
-  const content = (msg as Record<string, unknown>)['content'];
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const parts: string[] = [];
-    for (const block of content) {
-      if (block && typeof block === 'object' && (block as Record<string, unknown>)['type'] === 'text') {
-        const t = (block as Record<string, unknown>)['text'];
-        if (typeof t === 'string') parts.push(t);
-      }
-    }
-    return parts.length > 0 ? parts.join('') : undefined;
-  }
-  return undefined;
-}
-
-/** True if the last assistant call's joined text ends with `suffix`,
- *  ignoring trailing whitespace on either side. */
-function lastAssistantTextEndsWith(
-  result: NonNullable<ReturnType<typeof parseSessionFd>>,
-  suffix: string,
-): boolean {
-  const call = result.turns.at(-1)?.assistantCalls().at(-1);
-  // Turn exists but parser saw no assistant calls (writer mid-flush).
-  if (!call) return false;
-  return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
-}
-
-/** Read the subagent transcript's first line, retrying briefly because Claude
- *  Code may not have flushed it yet when SubagentStart fires. Total wait
- *  bounded by the sum of `RETRY_DELAYS_MS`. */
-const SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS = [0, 50, 100, 150];
-async function readSubagentFirstLineWithRetry(
-  transcriptPath: string,
-): Promise<Record<string, unknown> | undefined> {
-  for (const delay of SUBAGENT_TRANSCRIPT_RETRY_DELAYS_MS) {
-    if (delay > 0) await new Promise(r => setTimeout(r, delay));
-    const line = readFirstTranscriptLine(transcriptPath);
-    if (line && line['type'] === 'user') return line;
-  }
-  return undefined;
-}
-
-/**
- * Tracks a subagent across hook events. Two shapes:
- *   (a) Matched — created at PreToolUse when an Agent tool with subagent_type
- *       is detected; carries `toolUseId`, `promptHash`, and a reference to
- *       the subagent's `invoke_agent` span. `agentId` is filled in at
- *       SubagentStart via content-based correlation: sha256(firing prompt) +
- *       subagent_type.
- *   (b) Orphan — created at SubagentStart when no tracker matches the firing
- *       prompt (the parent's Agent PreToolUse never fired, or its prompt
- *       differs from the subagent transcript's line 1). The `invoke_agent`
- *       span is created at SubagentStart with the current turn span as
- *       parent and no input messages (the firing prompt is unavailable).
- *
- * The subagent is its own `invoke_agent <subagent_type>` span, child of the
- * parent turn's `invoke_agent claude-code` span. Per the Weave Agents chat
- * view (`weave/trace_server/agents/chat_view.py`), nested `invoke_agent`
- * spans render as an `agent_start` lifecycle marker with the inner agent's
- * own assistant text — distinct from an `execute_tool` tool-call event.
- * The Agent tool call does NOT emit an `execute_tool` span; it emits this
- * `invoke_agent` span directly.
- */
-type SubagentTracker = {
-  subagentType: string;
-  detectedAt: Date;
-  toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
-  invokeAgentSpan?: Span;      // subagent's `invoke_agent` span; subagent chat/tool spans parent here
-  agentId?: string;
-  /** sha256 of the prompt passed to the Agent tool; matched against the
-   *  subagent's transcript line-1 user message at SubagentStart. */
-  promptHash?: string;
-  /** True once the invoke_agent span has been ended. Guards against
-   *  double-end when PostToolUse and SubagentStop both try to close it. */
-  ended?: boolean;
-  /** Subagent transcript path — stored at SubagentStart so TeammateIdle can
-   *  read all turns without relying on the payload's transcript_path (which
-   *  CC sets to the coordinator's path, not the subagent's). */
-  transcriptPath?: string;
-  /** Set on orphan trackers when SubagentStop fires before TeammateIdle.
-   *  Suppresses span closure at SubagentStop so TeammateIdle can close it
-   *  with full all-turns content. */
-  pendingTeammateIdle?: boolean;
-  /** Set when this Agent tool spawn carried a `team_name` (agent-teams model).
-   *  The teammate runs in its OWN session, so its TeammateIdle fires under a
-   *  different session_id and the per-session lookup misses. The invoke_agent
-   *  span is registered in GlobalDaemon.teamMembers and closed there (at the
-   *  teammate's TeammateIdle), NOT at the coordinator's PostToolUse(Agent). */
-  teamName?: string;
-}
-
-/** Cross-session team correlation. In agent-teams (TeamCreate) a teammate is an
- *  independent Claude session whose TeammateIdle fires under the teammate's own
- *  session_id, not the coordinator's — so the per-session SubagentTracking
- *  lookup misses. The coordinator's PreToolUse(Agent, team_name) is the one
- *  reliable anchor; we record its invoke_agent span here keyed by
- *  `${team_name}::${name}`.
- *
- *  Entries are stored as a FIFO queue per key (not a single value) because the
- *  SAME `${team}::${name}` can be spawned more than once in a run — e.g. the
- *  TARS triage flow re-spawns a specialist (Sonnet→Opus) for deeper work. Each
- *  spawn pushes its own TeamMember; each teammate's TeammateIdle consumes the
- *  oldest not-yet-emitted entry (FIFO), so re-spawns never overwrite a live span
- *  (which would leak it and mis-attribute the first teammate's transcript). This
- *  mirrors SubagentTracking.findPendingTeammateIdle for the per-session path. */
-type TeamMember = {
-  invokeAgentSpan: Span;
-  conversationId: string;
-  coordinatorTranscriptPath: string;
-  emitted: boolean;
-}
-
-type SessionState = {
-  sessionId: string;
-  /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
-   *  turns stitch with their pre-resume turns server-side. Equals `sessionId`
-   *  for fresh (non-forked) sessions. Resolved once at SessionStart by
-   *  walking `forkedFrom.sessionId` pointers across transcript files. */
-  conversationId: string;
-  transcript: TranscriptFile;
-  cwd: string;
-  source: string;
-  initialRequestModel?: string;
-  /** Integration identity (name, version, meta.*) as OTel Baggage, built once
-   *  at SessionStart. Activated for every event in `routeEvent` so each span
-   *  inherits it via `IntegrationBaggageSpanProcessor`. */
-  integrationBaggage: Baggage;
-
-  currentTurnSpan?: Span;
-
-  turnNumber: number;
-  totalToolCalls: number;
-  turnToolCalls: number;
-  toolCounts: Record<string, number>;
-
-  pendingToolCalls: Map<string, PendingToolCall>;
-  subagents: SubagentTracking;
-
-  /** Chat span currently open for an in-progress assistant API call. Tool
-   *  spans from PreToolUse parent here; finalized at Stop or on transition
-   *  to the next API call. Cleared at Stop. */
-  activeChatSpan?: ActiveChatSpan;
-  /** Response keys (see `chatMessageKey`) in the current turn for which a chat
-   *  span has been opened (open or already finalized). Stop uses this to
-   *  identify responses that need a chat span emitted from scratch (responses
-   *  with no tool_use blocks never triggered PreToolUse). Reset per turn. */
-  emittedChatSpanResponseKeys: Set<string>;
-
-  /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
-  pendingCompaction?: CompactionAttrs;
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -354,124 +107,6 @@ const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
 const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB per message
 
-/**
- * Per-session container that tracks subagents from PreToolUse (when an Agent
- * tool with subagent_type is detected) through SubagentStop. Single source of
- * truth for the tracker list, with intent-revealing lookup methods.
- */
-class SubagentTracking {
-  private trackers: SubagentTracker[] = [];
-
-  /** Add a pending tracker at PreToolUse, before SubagentStart correlates an agent_id. */
-  add(tracker: SubagentTracker): void {
-    this.trackers.push(tracker);
-  }
-
-  /**
-   * Find the unmatched tracker (no agent_id yet) matching `(promptHash,
-   * subagentType)`. FIFO across ties: the oldest pending tracker wins, so two
-   * back-to-back identical Agent calls still correlate in dispatch order.
-   * Returns undefined if no candidate qualifies.
-   */
-  findUnmatchedByContent(promptHash: string, subagentType: string): SubagentTracker | undefined {
-    let best: SubagentTracker | undefined;
-    for (const t of this.trackers) {
-      if (t.agentId) continue;
-      if (t.promptHash !== promptHash) continue;
-      if (t.subagentType !== subagentType) continue;
-      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
-    }
-    return best;
-  }
-
-  byAgentId(agentId: string): SubagentTracker | undefined {
-    return this.trackers.find(t => t.agentId === agentId);
-  }
-
-  /** Find a tracker awaiting TeammateIdle by its subagentType. Used to
-   *  correlate TeammateIdle(teammate_name) with the orphan tracker created
-   *  at SubagentStart. Returns the oldest pending match (FIFO). */
-  findPendingTeammateIdle(subagentType: string): SubagentTracker | undefined {
-    let best: SubagentTracker | undefined;
-    for (const t of this.trackers) {
-      if (!t.pendingTeammateIdle) continue;
-      if (t.subagentType !== subagentType) continue;
-      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
-    }
-    return best;
-  }
-
-  /** Lookup by spawning Agent tool's tool_use_id. Used at PostToolUse to find
-   *  the subagent's `invoke_agent` span when the matching toolUseId is not
-   *  in `pendingToolCalls` (because the Agent tool emits an invoke_agent
-   *  span instead of an execute_tool span). */
-  byToolUseId(toolUseId: string): SubagentTracker | undefined {
-    return this.trackers.find(t => t.toolUseId === toolUseId);
-  }
-
-  remove(tracker: SubagentTracker): void {
-    const idx = this.trackers.indexOf(tracker);
-    if (idx >= 0) this.trackers.splice(idx, 1);
-  }
-
-  size(): number {
-    return this.trackers.length;
-  }
-
-  all(): SubagentTracker[] {
-    return [...this.trackers];
-  }
-}
-
-/** Options for {@link newSessionState}. `turnNumber` seeds the turn counter: 0
- *  for a brand-new session, or the number of turns already on disk when
- *  reconstructing a session lost across a daemon restart (so the resumed turn
- *  keeps counting up instead of resetting to 1). */
-type NewSessionStateOptions = {
-  sessionId: string;
-  conversationId: string;
-  transcript: TranscriptFile;
-  cwd: string;
-  source: string;
-  initialRequestModel: string | undefined;
-  turnNumber: number;
-};
-
-/** Build a fresh SessionState. */
-function newSessionState(options: NewSessionStateOptions): SessionState {
-  const { sessionId, conversationId, transcript, cwd, source, initialRequestModel, turnNumber } =
-    options;
-  // Claude Code stamps its CLI version on each transcript line; capture it
-  // best-effort from the head line for the integration metadata. Absent when
-  // the writer hasn't flushed yet, the meta key is simply omitted. Built
-  // here (not at the SessionStart call site) so a session reconstructed after
-  // a daemon restart carries the same integration identity on its spans.
-  const headLine = readFirstTranscriptLine(transcript.resolvedPath);
-  const version = headLine?.['version'];
-  const claudeCodeAppVersion = typeof version === 'string' ? version : undefined;
-  const integrationBaggage = createIntegrationBaggage({
-    version: VERSION,
-    meta: { claude_code_app_version: claudeCodeAppVersion },
-  });
-
-  return {
-    sessionId,
-    conversationId,
-    transcript,
-    cwd,
-    source,
-    initialRequestModel,
-    integrationBaggage,
-    turnNumber,
-    totalToolCalls: 0,
-    turnToolCalls: 0,
-    toolCounts: {},
-    pendingToolCalls: new Map(),
-    subagents: new SubagentTracking(),
-    emittedChatSpanResponseKeys: new Set(),
-  };
-}
-
 export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
@@ -481,8 +116,8 @@ export class GlobalDaemon {
   private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
-  private provider: NodeTracerProvider | null = null;
-  private tracer: Tracer | null = null;
+  /** True once `weave.init` has completed. All span emission is gated on it. */
+  private tracingEnabled = false;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
    *  the coordinator's PreToolUse(Agent) to each teammate's TeammateIdle. The
    *  value is a FIFO queue: a re-spawned `${team}::${name}` appends rather than
@@ -500,16 +135,15 @@ export class GlobalDaemon {
   ) {}
 
   async start(): Promise<void> {
-    // Initialize the OTel tracer if Weave is configured
+    // Initialize the Weave SDK if Weave is configured
     if (this.weaveProject && this.apiKey) {
       try {
-        this.initTracer();
+        await this.initWeave();
         this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
         this.log('INFO', `View traces: https://wandb.ai/${this.weaveProject}/weave/agents`);
       } catch (err) {
         this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
-        this.provider = null;
-        this.tracer = null;
+        this.tracingEnabled = false;
       }
     } else {
       this.log('INFO', 'No weave_project / API key configured — tracing disabled');
@@ -604,7 +238,7 @@ export class GlobalDaemon {
 
   // ── tracer initialization ───────────────────────────────────────────────
 
-  private initTracer(): void {
+  private async initWeave(): Promise<void> {
     if (!this.weaveProject) throw new Error('weaveProject required to init tracer');
     if (!this.apiKey) throw new Error('apiKey required to init tracer');
 
@@ -613,34 +247,17 @@ export class GlobalDaemon {
       throw new Error(`Invalid weave_project format: '${this.weaveProject}' (expected entity/project)`);
     }
 
-    // Route OTel diagnostics into the daemon log so exporter errors surface.
-    if (this.debugEnabled) {
-      diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN);
-    }
+    // The Weave SDK has no programmatic apiKey/host in its Settings; it resolves
+    // both from the environment (weave login() would instead write a netrc
+    // entry, which is wrong for a background daemon). WF_TRACE_SERVER_URL points
+    // the OTLP exporter straight at our trace server; WANDB_API_KEY supplies the
+    // auth header. We deliberately do NOT set WANDB_BASE_URL (weave treats that
+    // as the API host and would derive a wrong trace URL from it).
+    process.env['WF_TRACE_SERVER_URL'] = this.baseUrl;
+    process.env['WANDB_API_KEY'] = this.apiKey;
 
-    const resource = resourceFromAttributes({
-      // service.name has always mirrored the agent name; keep that coupling
-      // so a custom agent_name renames the OTel service too.
-      'service.name': this.agentName,
-      'service.version': VERSION,
-      'wandb.entity': entity,
-      'wandb.project': project,
-    });
-
-    const exporter = new OTLPTraceExporter({
-      url: `${this.baseUrl}/agents/otel/v1/traces`,
-      headers: { 'wandb-api-key': this.apiKey },
-    });
-
-    this.provider = new NodeTracerProvider({
-      resource,
-      // IntegrationBaggageSpanProcessor runs first so it stamps the integration
-      // identity (from the active session baggage) onto every span before the
-      // batch processor exports it.
-      spanProcessors: [new IntegrationBaggageSpanProcessor(), new BatchSpanProcessor(exporter)],
-    });
-    this.provider.register();
-    this.tracer = this.provider.getTracer('weave-claude-code', VERSION);
+    await weave.init(this.weaveProject);
+    this.tracingEnabled = true;
   }
 
   // ── connection handling ───────────────────────────────────────────────────
@@ -722,91 +339,95 @@ export class GlobalDaemon {
   // ── event routing ─────────────────────────────────────────────────────────
 
   private async routeEvent(payload: HookPayload): Promise<void> {
-    const eventName = payload['hook_event_name'] as string | undefined;
-    const sessionId = payload['session_id'] as string | undefined;
-    const agentId = payload['agent_id'] as string | undefined;
-
+    // The socket delivers raw hook JSON; trust it against the SDK's hook schema
+    // once here so the dispatch and handlers work with typed, discriminated
+    // inputs instead of re-casting every field.
+    const input = payload as HookInput;
+    const sessionId = input.session_id;
     if (!sessionId) {
       this.log('ERROR', 'Missing session_id in payload');
       return;
     }
 
-    this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
+    this.log('INFO', `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`);
 
-    // Activate the session's integration baggage for the whole event so every
-    // span created while handling it inherits the integration identity (copied
-    // on by IntegrationBaggageSpanProcessor). The session and its baggage don't
-    // exist until SessionStart runs, so that one event dispatches unwrapped — it
-    // creates no spans anyway.
-    const session = this.sessions.get(sessionId);
-    const eventContext = session
-      ? propagation.setBaggage(otelContext.active(), session.integrationBaggage)
-      : otelContext.active();
-    await otelContext.with(eventContext, () =>
-      this.dispatchEvent(eventName, sessionId, agentId, payload),
-    );
+    // Each event runs in its own isolated context so ambient GenAI state (the
+    // conversation, and any turn/LLM the SDK's factories consult) never leaks
+    // across events. The SDK copies the conversation's `attributes` onto each
+    // span at creation, but runIsolated gives every frame a fresh empty state,
+    // so re-install the session's conversation here; otherwise the integration
+    // identity would only land on spans created in the SessionStart frame. The
+    // session (and its conversation) don't exist until SessionStart runs, so
+    // that one event runs without a re-install; it creates no child spans.
+    await weave.runIsolated(async () => {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        weave.startConversation({
+          conversationId: session.conversationId,
+          agentName: this.agentName,
+          attributes: session.integrationAttrs,
+        });
+      }
+      await this.dispatchEvent(input, sessionId);
+    });
   }
 
-  /** Run the handler for a single hook event. Split out from `routeEvent` so
-   *  the latter can run it inside the session's baggage context. */
-  private async dispatchEvent(
-    eventName: string | undefined,
-    sessionId: string,
-    agentId: string | undefined,
-    payload: HookPayload,
-  ): Promise<void> {
+  /** Run the handler for a single hook event, narrowing `input` to the event's
+   *  variant via the discriminant. Split out from `routeEvent` so the latter can
+   *  run it inside the isolated per-event context. */
+  private async dispatchEvent(input: HookInput, sessionId: string): Promise<void> {
     try {
-      switch (eventName) {
+      switch (input.hook_event_name) {
         case 'SessionStart':
-          await this.handleSessionStart(sessionId, payload);
+          await this.handleSessionStart(sessionId, input);
           break;
         case 'UserPromptSubmit':
-          await this.handleUserPromptSubmit(sessionId, payload);
+          await this.handleUserPromptSubmit(sessionId, input);
           break;
         case 'PreToolUse':
-          await this.handlePreToolUse(sessionId, agentId, payload);
+          await this.handlePreToolUse(sessionId, input);
           break;
         case 'PermissionRequest':
-          await this.handlePermissionRequest(sessionId, payload);
+          await this.handlePermissionRequest(sessionId, input);
           break;
         case 'PostToolUse':
-          await this.handlePostToolUse(sessionId, payload);
+          await this.handlePostToolUse(sessionId, input);
           break;
         case 'PostToolUseFailure':
-          await this.handlePostToolUseFailure(sessionId, payload);
+          await this.handlePostToolUseFailure(sessionId, input);
           break;
         case 'SubagentStart':
-          await this.handleSubagentStart(sessionId, payload);
+          await this.handleSubagentStart(sessionId, input);
           break;
         case 'SubagentStop':
-          await this.handleSubagentStop(sessionId, payload);
+          await this.handleSubagentStop(sessionId, input);
           break;
         case 'TeammateIdle':
-          await this.handleTeammateIdle(sessionId, payload);
+          await this.handleTeammateIdle(sessionId, input);
           break;
         case 'PreCompact':
-          await this.handlePreCompact(sessionId, payload);
+          await this.handlePreCompact(sessionId, input);
           break;
         case 'Stop':
-          await this.handleStop(sessionId, payload);
+          await this.handleStop(sessionId, input);
           break;
         case 'SessionEnd':
-          await this.handleSessionEnd(sessionId, payload);
+          await this.handleSessionEnd(sessionId, input);
           break;
         default:
           break;
       }
     } catch (err) {
-      this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
+      this.log('ERROR', `Error handling ${input.hook_event_name}: ${err}`);
     }
   }
 
   // ── event handlers ────────────────────────────────────────────────────────
 
-  private async handleSessionStart(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSessionStart(sessionId: string, input: SessionStartHookInput): Promise<void> {
     if (this.sessions.has(sessionId)) return; // idempotent
 
-    const rawPath = payload['transcript_path'] as string | undefined;
+    const rawPath = input.transcript_path;
     if (!rawPath) {
       this.log('ERROR', `Missing transcript_path for session ${sessionId}`);
       return;
@@ -820,24 +441,34 @@ export class GlobalDaemon {
       return;
     }
 
-    const source = (payload['source'] as string | undefined) ?? 'unknown';
-    const initialRequestModel = payload['model'] as string | undefined;
-    const cwd = (payload['cwd'] as string | undefined) ?? '';
+    const source = input.source;
+    const initialRequestModel = input.model;
+    const cwd = input.cwd;
 
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
-    this.sessions.set(
+    const session = newSessionState({
       sessionId,
-      newSessionState({
-        sessionId,
+      conversationId,
+      transcript,
+      cwd,
+      source,
+      initialRequestModel,
+      turnNumber: 0,
+    });
+
+    // Install the conversation for this SessionStart frame; routeEvent
+    // re-installs it for every later event (each runIsolated frame is fresh).
+    // The SDK copies the integration identity onto every span created under it.
+    if (this.tracingEnabled) {
+      weave.startConversation({
         conversationId,
-        transcript,
-        cwd,
-        source,
-        initialRequestModel,
-        turnNumber: 0,
-      }),
-    );
+        agentName: this.agentName,
+        attributes: session.integrationAttrs,
+      });
+    }
+
+    this.sessions.set(sessionId, session);
 
     const resumed = conversationId !== sessionId;
     this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
@@ -933,12 +564,12 @@ export class GlobalDaemon {
    */
   private async getOrReconstructSession(
     sessionId: string,
-    payload: HookPayload,
+    input: HookInput,
   ): Promise<SessionState | undefined> {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
 
-    const rawPath = payload['transcript_path'] as string | undefined;
+    const rawPath = input.transcript_path;
     if (!rawPath) return undefined;
 
     let transcript: TranscriptFile;
@@ -949,9 +580,12 @@ export class GlobalDaemon {
       return undefined;
     }
 
-    const source = (payload['source'] as string | undefined) ?? 'reconstructed';
-    const cwd = (payload['cwd'] as string | undefined) ?? '';
-    const initialRequestModel = payload['model'] as string | undefined;
+    // source/model aren't on every hook variant (this reconstructs from a
+    // UserPromptSubmit), so read them best-effort off the raw record.
+    const raw = input as Record<string, unknown>;
+    const source = (raw['source'] as string | undefined) ?? 'reconstructed';
+    const cwd = input.cwd;
+    const initialRequestModel = raw['model'] as string | undefined;
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
     // Seed the turn counter from the turns already on disk so numbering
@@ -973,6 +607,16 @@ export class GlobalDaemon {
       turnNumber: priorTurns,
     });
     this.sessions.set(sessionId, session);
+    // Install the conversation for the current event frame. routeEvent's
+    // re-install ran before this session existed, so without this the spans this
+    // event emits would miss the integration identity (matches handleSessionStart).
+    if (this.tracingEnabled) {
+      weave.startConversation({
+        conversationId,
+        agentName: this.agentName,
+        attributes: session.integrationAttrs,
+      });
+    }
     this.log(
       'INFO',
       `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
@@ -980,109 +624,110 @@ export class GlobalDaemon {
     return session;
   }
 
-  private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
     // Reconstruct the session if this daemon never saw its SessionStart (e.g. it
     // idled out mid-session and a fresh daemon took over) so the rest of the
     // session stays traced instead of dropping with "Unknown session".
-    const session = await this.getOrReconstructSession(sessionId, payload);
+    const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) {
       this.log('ERROR', `Unknown session (no transcript_path to reconstruct): ${sessionId}`);
       return;
     }
-    if (!this.tracer) return;
+    if (!this.tracingEnabled) return;
 
-    const prompt = (payload['prompt'] as string | undefined) ?? '';
+    const prompt = input.prompt;
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurnSpan ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
     );
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
     session.emittedChatSpanResponseKeys.clear();
-    const turnSpan = startTurnSpan(this.tracer, {
-      sessionId: session.sessionId,
-      conversationId: session.conversationId,
-      turnNumber: session.turnNumber,
-      prompt,
-      cwd: session.cwd,
-      source: session.source,
-      pluginVersion: VERSION,
+    // The turn is the root of its own trace; the Weave Agents backend stitches
+    // turns into a conversation via `gen_ai.conversation.id` (inherited from the
+    // ambient conversation re-installed in routeEvent). Session-level metadata
+    // (cwd, source, plugin.version) is stamped on every turn so it's queryable
+    // without a separate session-level span.
+    // conversationId is inherited from the ambient conversation (re-installed in
+    // routeEvent), which stamps `gen_ai.conversation.id` on the turn and its
+    // children.
+    const turn = weave.startTurn({
       agentName: this.agentName,
-      requestModel: session.initialRequestModel,
-      displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+      startTime: new Date(),
     });
-    session.currentTurnSpan = turnSpan;
+    const attrs: Attributes = {
+      [ATTR.AGENT_VERSION]: VERSION,
+      [ATTR.WEAVE_SESSION_ID]: session.sessionId,
+      [ATTR.WEAVE_CWD]: session.cwd,
+      [ATTR.WEAVE_SOURCE]: session.source,
+      [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
+      [ATTR.WEAVE_TURN_NUMBER]: session.turnNumber,
+      [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]),
+      [ATTR.WEAVE_DISPLAY_NAME]: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+    };
+    if (session.initialRequestModel) attrs[ATTR.REQUEST_MODEL] = session.initialRequestModel;
+    turn.setAttributes(attrs);
+    session.currentTurn = turn;
 
     // Drain compaction attrs buffered while no turn was open.
     if (session.pendingCompaction) {
-      setCompactionAttrs(turnSpan, session.pendingCompaction);
+      setCompactionAttrs(turn, session.pendingCompaction);
       session.pendingCompaction = undefined;
     }
 
-
-    this.log(
-      'INFO',
-      `Created turn span (turn ${session.turnNumber}) trace_id=${turnSpan.spanContext().traceId}`,
-    );
+    this.log('INFO', `Created turn span (turn ${session.turnNumber})`);
   }
 
-  private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
+  private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.tracingEnabled) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
-    const toolName = payload['tool_name'] as string | undefined;
+    const agentId = input.agent_id;
+    const toolUseId = input.tool_use_id;
+    const toolName = input.tool_name;
     if (!toolUseId || !toolName) return;
 
-    const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
-
-    // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
-    // a subagent, else the current turn span.
-    const parentSpan = agentId
-      ? session.subagents.byAgentId(agentId)?.invokeAgentSpan ?? session.currentTurnSpan
-      : session.currentTurnSpan;
-    if (!parentSpan) {
-      this.log('ERROR', `PreToolUse: no parent span for session=${sessionId} tool=${toolName}`);
-      return;
-    }
-
-    // For the main agent, parent the tool span under its assistant response's
-    // chat span; subagents keep flat parenting under their invoke_agent span.
-    const toolParent = this.resolveMainAgentToolParent(session, agentId, toolUseId, parentSpan);
+    // tool_input is per-tool JSON the SDK types as `unknown`; narrow to index it.
+    const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
 
     // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
-    // span, NOT an `execute_tool Agent` span. The Weave Agents chat view renders
-    // nested invoke_agent spans as their own `agent_start` lifecycle marker; an
-    // execute_tool wrapper here would mis-render the subagent dispatch as a
-    // generic tool call. The Agent tool's PostToolUse closes this span with the
-    // subagent's final return as `gen_ai.output.messages`.
+    // span (a SubAgent marker), NOT an `execute_tool Agent` span. The Weave
+    // Agents chat view renders nested invoke_agent spans as their own
+    // `agent_start` lifecycle marker; an execute_tool wrapper here would
+    // mis-render the subagent dispatch as a generic tool call. The Agent tool's
+    // PostToolUse closes this span with the subagent's final return.
     //
     // `promptHash` lets SubagentStart correlate this tracker to the right
     // subagent deterministically by reading the subagent transcript's line 1
     // (the firing prompt) and matching by sha256 + subagent_type.
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
+      if (!session.currentTurn) {
+        this.log('ERROR', `PreToolUse(Agent): no current turn for session=${sessionId}`);
+        return;
+      }
       const subagentType = toolInput['subagent_type'] as string;
-      const prompt = typeof toolInput['prompt'] === 'string' ? (toolInput['prompt'] as string) : '';
-      const invokeAgentSpan = startInvokeAgentSpan(this.tracer, toolParent, {
-        agentType: subagentType,
-        conversationId: session.conversationId,
-        pluginVersion: VERSION,
-        inputMessages: prompt ? [{ role: 'user', content: prompt }] : undefined,
-        spawningToolCallId: toolUseId,
-        displayName: toolDisplayName(toolName, toolInput),
-      });
+      const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
+      const subAgent = session.currentTurn.startSubagent({ name: subagentType, startTime: new Date() });
+      const subAttrs: Attributes = {
+        [ATTR.AGENT_VERSION]: VERSION,
+        [ATTR.CONVERSATION_ID]: session.conversationId,
+        [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: toolUseId,
+        [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput),
+      };
+      if (prompt) subAttrs[ATTR.INPUT_MESSAGES] = jsonStr([{ role: 'user', content: prompt }]);
+      subAgent.setAttributes(subAttrs);
       // Agent-teams: when the Agent tool carries a `team_name`, the teammate
       // runs as its own session and TeammateIdle fires under the teammate's
-      // session_id. Register the invoke_agent span in the cross-session team
-      // map so TeammateIdle can find it regardless of which session fires it.
-      const teamName = typeof toolInput['team_name'] === 'string' ? (toolInput['team_name'] as string) : undefined;
-      const memberName = (typeof toolInput['name'] === 'string' && toolInput['name']) ? (toolInput['name'] as string) : subagentType;
+      // session_id. Register the SubAgent in the cross-session team map so
+      // TeammateIdle can find it regardless of which session fires it.
+      const teamName = typeof toolInput['team_name'] === 'string' ? toolInput['team_name'] : undefined;
+      const memberName = (typeof toolInput['name'] === 'string' && toolInput['name']) ? toolInput['name'] : subagentType;
       session.subagents.add({
         toolUseId,
         subagentType,
         detectedAt: new Date(),
-        invokeAgentSpan,
+        subAgent,
         promptHash: hashPrompt(prompt),
         teamName,
       });
@@ -1094,9 +739,10 @@ export class GlobalDaemon {
         const key = `${teamName}::${memberName}`;
         const queue = this.teamMembers.get(key) ?? [];
         queue.push({
-          invokeAgentSpan,
+          subAgent,
           conversationId: session.conversationId,
           coordinatorTranscriptPath: session.transcript.resolvedPath,
+          integrationAttrs: session.integrationAttrs,
           emitted: false,
         });
         this.teamMembers.set(key, queue);
@@ -1105,54 +751,50 @@ export class GlobalDaemon {
       return;
     }
 
-    const toolSpan = startToolSpan(this.tracer, toolParent, {
-      toolName,
-      toolUseId,
-      toolInput,
-      displayName: toolDisplayName(toolName, toolInput),
+    // Parent for the tool span. A SubAgent is a leaf (it can't parent tools), so
+    // a subagent's own tools nest directly under the turn and carry the
+    // subagent's `gen_ai.agent.name` so the Agents view groups them. For the
+    // main agent, nest under the active response's chat span (advanced from the
+    // transcript), falling back to the turn when the machine can't advance yet.
+    const subagentType = agentId ? session.subagents.byAgentId(agentId)?.subagentType : undefined;
+    const parent: weave.Turn | weave.LLM | undefined = agentId
+      ? session.currentTurn
+      : this.advanceMainAgentChatSpan(session, toolUseId) ?? session.currentTurn;
+    if (!parent) {
+      this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
+      return;
+    }
+
+    const tool = parent.startTool({
+      name: toolName,
+      args: jsonStr(toolInput),
+      toolCallId: toolUseId,
+      startTime: new Date(),
     });
-    session.pendingToolCalls.set(toolUseId, { span: toolSpan, toolName, toolInput });
+    const toolAttrs: Attributes = { [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput) };
+    if (subagentType) toolAttrs[ATTR.AGENT_NAME] = subagentType;
+    tool.setAttributes(toolAttrs);
+    session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
   }
 
   /**
-   * Open (or reuse) the chat span for the assistant API response that produced
-   * `toolUseId`, so the tool span can parent under it. Reads the transcript to
-   * find which response the tool_use belongs to; on a transition to a new
-   * response, finalizes the previous chat span first. Returns the chat span,
-   * or `undefined` if the transcript can't be located / parsed yet (caller
-   * falls back to the turn span).
+   * Advance the chat-span state machine for the main agent: find the assistant
+   * response that produced `toolUseId`, ensure its `chat` span (an LLM) is open,
+   * and return it so the tool span nests under it. Reads the transcript to map
+   * the tool_use to its response; on a transition to a new response, finalizes
+   * the previous chat span first. Returns the LLM, or `undefined` if the
+   * transcript can't be located / parsed yet or the response has no model yet
+   * (LLMInit.model is required); the caller then falls back to the turn span.
    *
-   * Text/thinking children are NOT emitted here; they're emitted when the
-   * chat span is finalized (next transition or Stop), once all of the
-   * response's split transcript lines are present and can be stamped with
-   * their real timestamps. (Claude Code writes each content block as its own
-   * transcript line sharing a `message.id`; at PreToolUse the trailing lines
-   * may not be flushed yet.)
+   * The response's text/thinking blocks are NOT set here; they become
+   * `gen_ai.output.messages` parts when the chat span is finalized (next
+   * transition or Stop), once all of the response's split transcript lines are
+   * present. (Claude Code writes each content block as its own transcript line
+   * sharing a `message.id`; at PreToolUse the trailing lines may not be flushed
+   * yet.)
    */
-  /**
-   * Parent span for a tool span emitted from PreToolUse. For the main agent,
-   * advance the chat-span machine — find the assistant response containing this
-   * tool_use, ensure its `chat` span is open, and return it so the tool span
-   * nests under it. (The response's text/thinking children are emitted when the chat
-   * span is finalized, not here.) Falls back to `fallback` (the turn span) when
-   * the machine can't advance yet, e.g. the transcript writer hasn't flushed
-   * the assistant message. Subagents keep flat parenting under their
-   * invoke_agent span — their chat spans are emitted at SubagentStop /
-   * TeammateIdle, where the full transcript is available — so they return
-   * `fallback` unchanged.
-   */
-  private resolveMainAgentToolParent(
-    session: SessionState,
-    agentId: string | undefined,
-    toolUseId: string,
-    fallback: Span,
-  ): Span {
-    if (agentId) return fallback;
-    return this.advanceMainAgentChatSpan(session, toolUseId) ?? fallback;
-  }
-
-  private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): Span | undefined {
-    if (!this.tracer || !session.currentTurnSpan) return undefined;
+  private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): weave.LLM | undefined {
+    if (!this.tracingEnabled || !session.currentTurn) return undefined;
 
     // Re-parses the whole transcript per main-agent PreToolUse: O(size) per
     // tool call. Off CC's critical path (async daemon), so no editor latency;
@@ -1165,7 +807,7 @@ export class GlobalDaemon {
     }
     const parsed = parseSessionFd(fd);
     if (!parsed) return undefined;
-    const lastTurn = parsed.turns[parsed.turns.length - 1];
+    const lastTurn = parsed.turns.at(-1);
     if (!lastTurn) return undefined;
     const calls = lastTurn.assistantCalls();
     const key = findToolUseResponseKey(calls, toolUseId);
@@ -1176,113 +818,75 @@ export class GlobalDaemon {
     }
 
     // Transition to a new API response: finalize the previous chat span first.
-    if (session.activeChatSpan && session.activeChatSpan.responseKey !== key) {
+    if (session.activeChat && session.activeChat.responseKey !== key) {
       this.finalizeActiveChatSpan(session, calls);
     }
 
-    if (!session.activeChatSpan) {
+    if (!session.activeChat) {
       // key came from findToolUseResponseKey above, so the group is non-empty.
       const group = callsForResponseKey(calls, key);
-      const first = group[0];
-      const span = startChatSpan(this.tracer, session.currentTurnSpan, {
-        conversationId: session.conversationId,
-        model: group.map(c => c.model).find(Boolean),
-        startedAt: parseIsoOrNow(first.prevTimestamp ?? first.timestamp),
-      });
-      session.activeChatSpan = { responseKey: key, span };
+      // If the writer hasn't flushed the model yet, fall back to the turn span
+      // (matching the undefined-transcript path); the response's chat span is
+      // emitted at Stop once the model is present.
+      const llm = openChatForGroup(session.currentTurn, group);
+      if (!llm) return undefined;
+      session.activeChat = { responseKey: key, llm };
       session.emittedChatSpanResponseKeys.add(key);
     }
 
-    return session.activeChatSpan.span;
+    return session.activeChat.llm;
   }
 
-  /** Finalize `session.activeChatSpan` from the current transcript and clear it. */
+  /** Finalize `session.activeChat` from the current transcript and clear it. */
   private finalizeActiveChatSpan(session: SessionState, calls: AssistantCallDetail[]): void {
-    const active = session.activeChatSpan;
+    const active = session.activeChat;
     if (!active) return;
-    this.emitChatSpanForResponse(session, calls, active.responseKey, active.span);
-    session.activeChatSpan = undefined;
+    this.emitChatSpanForResponse(session, calls, active.responseKey, active.llm);
+    session.activeChat = undefined;
   }
 
   /**
-   * Emit a complete chat span for one assistant API response `key`. Emits each
-   * of the response's split transcript lines' text/thinking blocks as children
-   * stamped with that line's timestamp, so they sort into transcript order
-   * among the sibling `execute_tool` spans, which carry live PreToolUse times
-   * on the same wall clock. Usage is taken once from the response (the split
+   * Emit a complete chat span (LLM) for one assistant API response `key`. The
+   * response's ordered text / thinking / tool_use blocks become
+   * `gen_ai.output.messages` parts, so the model's natural interleave shows on
+   * the single chat span (the tools it called nest under this span as their own
+   * `execute_tool` children). Usage is taken once from the response (the split
    * lines duplicate the message usage, so it must not be summed), then the span
-   * is ended. Reuses `existingSpan` when the span was already opened during
+   * is ended. Reuses `existingLlm` when the span was already opened during
    * PreToolUse; otherwise opens a fresh one under the turn span.
    */
   private emitChatSpanForResponse(
     session: SessionState,
     calls: AssistantCallDetail[],
     key: string,
-    existingSpan?: Span,
+    existingLlm?: weave.LLM,
   ): void {
-    if (!this.tracer || !session.currentTurnSpan) return;
+    if (!this.tracingEnabled || !session.currentTurn) return;
     // `key` always comes from a real call (findToolUseResponseKey /
     // chatMessageKey) and transcripts are append-only, so the group is never
     // empty.
     const group = callsForResponseKey(calls, key);
-
-    const model = group.map(c => c.model).find(Boolean);
-    const span = existingSpan ?? startChatSpan(this.tracer, session.currentTurnSpan, {
-      conversationId: session.conversationId,
-      model,
-      startedAt: parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp),
-    });
-
-    for (const call of group) {
-      this.emitContentBlocks(span, call.contentBlocks, parseIsoOrNow(call.timestamp), session.conversationId);
-    }
-
-    // Usage is identical across the response's split lines (each carries the
-    // full message usage), so take it from the last line, which also carries
-    // the stop_reason, rather than summing.
-    const last = group[group.length - 1];
-    const finishReason = group.map(c => c.finishReason).find(Boolean);
-    const parts = group.flatMap(c => c.contentBlocks);
-    finalizeChatSpan(span, {
-      usage: last.usage,
-      reasoningTokens: last.reasoningTokens,
-      responseId: last.responseId,
-      finishReasons: finishReason ? [finishReason] : undefined,
-      model,
-      outputMessages: parts.length ? [{ role: 'assistant', parts }] : undefined,
-      endedAt: parseIsoOrNow(last.timestamp),
-    });
+    // A response with no model yet can't open a chat span (LLMInit.model is
+    // required); skip it rather than guess a model.
+    const llm = existingLlm ?? openChatForGroup(session.currentTurn, group);
+    if (!llm) return;
+    recordChat(llm, group, session.conversationId);
     session.emittedChatSpanResponseKeys.add(key);
   }
 
-  /** Emit `assistant_text` / `thinking` spans for the text/thinking blocks in
-   *  `blocks`, each stamped at `ts`. tool_use blocks are skipped; they render
-   *  as their own live `execute_tool` spans. */
-  private emitContentBlocks(
-    parent: Span,
-    blocks: unknown[],
-    ts: Date,
-    conversationId: string,
-  ): void {
-    if (!this.tracer) return;
-    for (const block of blocks) {
-      if (isTextBlock(block) && block.text.trim()) {
-        emitAssistantTextSpan(this.tracer, parent, { conversationId, text: block.text, startedAt: ts, endedAt: ts });
-      } else if (isThinkingBlock(block) && block.thinking.trim()) {
-        emitThinkingSpan(this.tracer, parent, { conversationId, text: block.thinking, startedAt: ts, endedAt: ts });
-      } else if (isRedactedThinkingBlock(block)) {
-        // Reasoning withheld by safety filtering: the `data` blob is encrypted,
-        // so surface a placeholder thinking span to keep it in transcript order.
-        emitThinkingSpan(this.tracer, parent, { conversationId, text: '[redacted]', startedAt: ts, endedAt: ts });
-      }
-    }
+  /** Record one completed tool call in the session's total, per-turn, and
+   *  per-tool-name counters (all bumped together whenever a tool finishes). */
+  private countToolCall(session: SessionState, toolName: string): void {
+    session.totalToolCalls += 1;
+    session.turnToolCalls += 1;
+    session.toolCounts[toolName] = (session.toolCounts[toolName] ?? 0) + 1;
   }
 
-  private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolName = payload['tool_name'] as string | undefined;
+    const toolName = input.tool_name;
     if (!toolName) return;
 
     // Correlate to a pending tool call by tool_name + tool_input. Record the
@@ -1290,7 +894,7 @@ export class GlobalDaemon {
     // once we know whether it was approved.
     let pending: PendingToolCall | undefined;
     for (const call of session.pendingToolCalls.values()) {
-      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, payload['tool_input'])) {
+      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, input.tool_input)) {
         pending = call;
         break;
       }
@@ -1301,38 +905,36 @@ export class GlobalDaemon {
     }
 
     pending.permissionRequested = true;
-    addPermissionRequestEvent(pending.span, {
-      suggestions: payload['permission_suggestions'],
+    addPermissionRequestEvent(pending.tool, {
+      suggestions: input.permission_suggestions,
       timestamp: new Date(),
     });
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
 
-  private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
+    const toolUseId = input.tool_use_id;
     if (!toolUseId) return;
 
     // Subagent dispatch: the matching span is the subagent's invoke_agent
-    // span (not a pendingToolCall), so we close it here with the subagent's
+    // marker (not a pendingToolCall), so we close it here with the subagent's
     // final assistant text as `gen_ai.output.messages`.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
+    if (subagentTracker?.subAgent) {
       if (subagentTracker.teamName) {
         // Agent-teams: the Agent tool returns immediately (teammate runs async
         // in its own session). Do NOT close the invoke_agent span — it would
         // end empty before the teammate works. The team map owns it now.
         session.subagents.remove(subagentTracker);
       } else {
-        this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+        this.closeSubagent(subagentTracker, input.tool_response, /*failure*/ false);
         session.subagents.remove(subagentTracker);
       }
-      session.totalToolCalls += 1;
-      session.turnToolCalls += 1;
-      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      this.countToolCall(session, 'Agent');
       return;
     }
 
@@ -1341,29 +943,27 @@ export class GlobalDaemon {
 
     resolvePermissionIfPending(pending, true);
 
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
-    pending.span.end();
+    pending.tool.result = jsonStr(input.tool_response);
+    pending.tool.end();
 
     session.pendingToolCalls.delete(toolUseId);
-    session.totalToolCalls += 1;
-    session.turnToolCalls += 1;
-    session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
+    this.countToolCall(session, pending.toolName);
   }
 
-  private async handlePostToolUseFailure(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
+    const toolUseId = input.tool_use_id;
     if (!toolUseId) return;
 
-    const error = payload['error'] ?? payload['tool_response'];
+    const error = input.error;
 
     // Subagent dispatch failed (rare). Close the invoke_agent span with ERROR
     // status; subagent chat spans, if any reached SubagentStop, are already
     // attached as children.
     const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.invokeAgentSpan) {
+    if (subagentTracker?.subAgent) {
       if (subagentTracker.teamName) {
         // Agent-teams: the team map owns this span (closed at the teammate's
         // TeammateIdle, cross-session). Closing it here would end it early and
@@ -1371,12 +971,10 @@ export class GlobalDaemon {
         // just drop the per-session tracker; the queue entry lives on.
         session.subagents.remove(subagentTracker);
       } else {
-        this.closeSubagentInvokeAgentSpan(subagentTracker, error, /*failure*/ true);
+        this.closeSubagent(subagentTracker, error, /*failure*/ true);
         session.subagents.remove(subagentTracker);
       }
-      session.totalToolCalls += 1;
-      session.turnToolCalls += 1;
-      session.toolCounts['Agent'] = (session.toolCounts['Agent'] ?? 0) + 1;
+      this.countToolCall(session, 'Agent');
       return;
     }
 
@@ -1385,57 +983,50 @@ export class GlobalDaemon {
 
     resolvePermissionIfPending(pending, false);
 
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(error));
-    pending.span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(error));
-    pending.span.setStatus({ code: SpanStatusCode.ERROR, message: typeof error === 'string' ? error : 'tool failed' });
-    pending.span.end();
+    pending.tool.result = error;
+    pending.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(error) });
+    // The SDK records the exception + ERROR status from `error`.
+    pending.tool.end({ error: new Error(error) });
 
     session.pendingToolCalls.delete(toolUseId);
-    session.totalToolCalls += 1;
-    session.turnToolCalls += 1;
-    session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
+    this.countToolCall(session, pending.toolName);
   }
 
   /**
-   * Close a subagent's `invoke_agent` span. Idempotent — guarded by
+   * Close a subagent's `invoke_agent` marker span. Idempotent: guarded by
    * `tracker.ended` so PostToolUse and SubagentStop can both safely call this
    * regardless of order. Sets `gen_ai.output.messages` from the canonical
    * tool return string when available; marks the span ERROR on failure.
    */
-  private closeSubagentInvokeAgentSpan(
+  private closeSubagent(
     tracker: SubagentTracker,
     output: unknown,
     failure: boolean,
   ): void {
-    const span = tracker.invokeAgentSpan;
-    if (!span || tracker.ended) return;
+    const sub = tracker.subAgent;
+    if (!sub || tracker.ended) return;
 
     if (output !== undefined && output !== null && output !== '') {
       const outputText = typeof output === 'string' ? output : jsonStr(output);
-      span.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        jsonStr([{ role: 'assistant', content: outputText }]),
-      );
+      sub.setAttributes({ [ATTR.OUTPUT_MESSAGES]: jsonStr([{ role: 'assistant', content: outputText }]) });
     }
     if (failure) {
-      span.setAttribute(ATTR.ERROR_TYPE, this.errorTypeFor(output));
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: typeof output === 'string' ? output : 'subagent failed',
-      });
+      sub.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(output) });
+      sub.end({ error: new Error(typeof output === 'string' ? output : 'subagent failed') });
+    } else {
+      sub.end();
     }
-    span.end();
     tracker.ended = true;
   }
 
-  private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.tracingEnabled) return;
 
-    const agentId = payload['agent_id'] as string | undefined;
+    const agentId = input.agent_id;
     if (!agentId) return;
 
-    const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
+    const agentType = input.agent_type;
 
     // Content-based deterministic correlation: SubagentStart carries no
     // pointer back to the parent's `tool_use_id`, so we read the subagent's
@@ -1471,33 +1062,33 @@ export class GlobalDaemon {
         transcriptPath: subagentPath,
         pendingTeammateIdle: true,
       };
-      if (session.currentTurnSpan) {
-        bestTracker.invokeAgentSpan = startInvokeAgentSpan(this.tracer, session.currentTurnSpan, {
-          agentType,
-          conversationId: session.conversationId,
-          pluginVersion: VERSION,
-          displayName: `Agent: ${agentType}`,
+      if (session.currentTurn) {
+        bestTracker.subAgent = session.currentTurn.startSubagent({ name: agentType, startTime: new Date() });
+        bestTracker.subAgent.setAttributes({
+          [ATTR.AGENT_VERSION]: VERSION,
+          [ATTR.CONVERSATION_ID]: session.conversationId,
+          [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
+          [ATTR.WEAVE_ORPHAN_REASON]: reason,
         });
-        bestTracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, reason);
       }
       session.subagents.add(bestTracker);
     }
 
     bestTracker.agentId = agentId;
-    if (bestTracker.invokeAgentSpan) {
+    if (bestTracker.subAgent) {
       // Stamp the runtime agent_id on the subagent's invoke_agent span — the
       // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
-      bestTracker.invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
+      bestTracker.subAgent.setAttributes({ [ATTR.AGENT_ID]: agentId });
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
   }
 
-  private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracer) return;
+    if (!session || !this.tracingEnabled) return;
 
-    const agentId = payload['agent_id'] as string | undefined;
+    const agentId = input.agent_id;
     if (!agentId) return;
 
     const tracker = session.subagents.byAgentId(agentId);
@@ -1506,12 +1097,12 @@ export class GlobalDaemon {
       return;
     }
 
-    // Chat spans for the subagent's LLM calls parent under the subagent's
-    // own invoke_agent span. For orphan trackers without an invoke_agent
-    // span (no current turn at SubagentStart), fall back to the turn span.
-    const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
+    // The subagent marker (SubAgent) is a leaf and can't parent chat spans, so
+    // the subagent's LLM calls are emitted under the current turn and tagged
+    // with the subagent's `gen_ai.agent.name` so the Agents view groups them.
+    const chatParent = session.currentTurn;
 
-    const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
+    const agentTranscriptPath = input.agent_transcript_path;
     let model: string | undefined;
     let lastAssistantText: string | undefined;
     if (agentTranscriptPath && chatParent) {
@@ -1525,16 +1116,16 @@ export class GlobalDaemon {
         // and the user prompt that fires the subagent appears on line 1.
         // Emitting chat spans from earlier turns would mis-attribute the
         // parent's LLM call to this subagent invocation.
-        const lastTurn = parsed?.turns[parsed.turns.length - 1];
+        const lastTurn = parsed?.turns.at(-1);
         model = lastTurn?.primaryModel();
         lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          emitChatSpansFromAssistantCalls(
-            this.tracer,
+          this.emitChatSpansUnderTurn(
             chatParent,
             session.conversationId,
             lastTurn.assistantCalls(),
+            tracker.subagentType,
           );
         }
       } catch (err) {
@@ -1544,11 +1135,11 @@ export class GlobalDaemon {
       }
     }
 
-    if (tracker.invokeAgentSpan) {
+    if (tracker.subAgent) {
       // Stamp the model the subagent actually ran on (Claude Code's
       // SubagentStart payload doesn't carry the model; the transcript does).
       if (model) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+        tracker.subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
       }
       // Orphan path: no PostToolUse will fire, so close the invoke_agent
       // span here — unless TeammateIdle is expected to follow (FleetView/
@@ -1558,7 +1149,7 @@ export class GlobalDaemon {
       // canonical tool_response and remove the tracker; if we removed the
       // tracker here, byToolUseId at PostToolUse would miss it.
       if (!tracker.ended && !tracker.toolUseId && !tracker.pendingTeammateIdle) {
-        this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+        this.closeSubagent(tracker, lastAssistantText, /*failure*/ false);
       }
     }
 
@@ -1575,8 +1166,8 @@ export class GlobalDaemon {
     }
   }
 
-  private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
-    if (!this.tracer) return;
+  private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
+    if (!this.tracingEnabled) return;
     // FAIL-OPEN on a missing session: in the agent-teams model this hook fires
     // under the TEAMMATE's session_id, which may not be registered with this
     // daemon (only the coordinator is). `session` is therefore OPTIONAL for the
@@ -1597,8 +1188,8 @@ export class GlobalDaemon {
     //
     // Note: CC docs incorrectly listed agent_id / agent_type — those fields do
     // not appear in practice.
-    const agentType = (payload['teammate_name'] as string | undefined) ?? 'teammate';
-    const teamName = (payload['team_name'] as string | undefined) ?? '?';
+    const agentType = input.teammate_name;
+    const teamName = input.team_name;
 
     // ── Cross-session team path (agent-teams / TeamCreate model) ─────────
     // The coordinator's PreToolUse(Agent, team_name) registered the invoke_agent
@@ -1616,9 +1207,15 @@ export class GlobalDaemon {
         return;
       }
       member.emitted = true;
-      const idleTranscript = session?.transcript.resolvedPath ?? (payload['transcript_path'] as string | undefined);
+      const idleTranscript = session?.transcript.resolvedPath ?? input.transcript_path;
       const teammateTranscriptPath = this.resolveTeammateTranscript(member.coordinatorTranscriptPath, agentType, idleTranscript);
-      this.emitTeammateTranscript(member.invokeAgentSpan, member.conversationId, teammateTranscriptPath);
+      this.emitTeammateTurnTrace(
+        member.subAgent,
+        member.conversationId,
+        member.integrationAttrs,
+        agentType,
+        teammateTranscriptPath,
+      );
       // Remove the consumed entry; drop the key once its queue drains.
       const idx = queue.indexOf(member);
       if (idx >= 0) queue.splice(idx, 1);
@@ -1644,7 +1241,7 @@ export class GlobalDaemon {
     }
     const tracker = session.subagents.findPendingTeammateIdle(agentType);
 
-    if (!tracker?.invokeAgentSpan) {
+    if (!tracker?.subAgent) {
       this.log('DEBUG', `TeammateIdle: no pending tracker for ${agentType} team=${teamName} — skipping`);
       return;
     }
@@ -1655,44 +1252,17 @@ export class GlobalDaemon {
 
     this.log('DEBUG', `TeammateIdle: agent=${agentType} team=${teamName} transcript=${transcriptPath ?? '(none)'}`);
 
-    let model: string | undefined;
-    let lastAssistantText: string | undefined;
-    let agentTranscript: TranscriptFile | undefined;
-    try {
-      if (!transcriptPath) throw new Error('no transcript path stored at SubagentStart');
-      agentTranscript = new TranscriptFile(transcriptPath);
-      const parsed = parseSessionFd(agentTranscript.getFd());
-      if (parsed) {
-        // Emit chat spans for ALL turns. Teammates are independent top-level
-        // sessions — every turn is their own work. SubagentStop only emitted
-        // the last turn; we replace that with full coverage here.
-        for (const turn of parsed.turns) {
-          emitChatSpansFromAssistantCalls(
-            this.tracer,
-            tracker.invokeAgentSpan,
-            session.conversationId,
-            turn.assistantCalls(),
-          );
-        }
-        const lastTurn = parsed.turns[parsed.turns.length - 1];
-        model = lastTurn?.primaryModel();
-        lastAssistantText = lastTurn?.textBlocks().join('\n');
-      }
-    } catch (err) {
-      this.log('DEBUG', `TeammateIdle: could not parse transcript ${transcriptPath}: ${err}`);
-    } finally {
-      agentTranscript?.close();
-    }
-
-    if (model) tracker.invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
-    if (lastAssistantText) {
-      tracker.invokeAgentSpan.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        JSON.stringify([{ role: 'assistant', content: lastAssistantText }]),
-      );
-    }
-
-    this.closeSubagentInvokeAgentSpan(tracker, lastAssistantText, /*failure*/ false);
+    // Emit ALL turns from the teammate transcript under a fresh teammate turn
+    // trace (the coordinator turn that spawned it has already closed). Teammates
+    // are independent top-level sessions: every turn is their own work.
+    const model = this.emitTeammateTurnTrace(
+      tracker.subAgent,
+      session.conversationId,
+      session.integrationAttrs,
+      agentType,
+      transcriptPath,
+    );
+    tracker.ended = true;
     session.subagents.remove(tracker);
 
     this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${transcriptPath ?? '(no transcript)'}`);
@@ -1733,13 +1303,40 @@ export class GlobalDaemon {
     return idleTranscriptPath;
   }
 
-  /** Parse a teammate's transcript and emit its chat spans under the given
-   *  invoke_agent span, then end it. Used by the cross-session team path. */
-  private emitTeammateTranscript(
-    invokeAgentSpan: Span,
+  /**
+   * Emit one `chat` span (LLM) per assistant call under `turn`, reconstructing
+   * each from transcript data (backdated start/end times, usage, ordered output
+   * parts). `agentName`, when set, tags each span with `gen_ai.agent.name` so
+   * the Agents view groups a subagent's/teammate's calls under that agent.
+   */
+  private emitChatSpansUnderTurn(
+    turn: weave.Turn,
     conversationId: string,
-    transcriptPath: string | undefined,
+    calls: AssistantCallDetail[],
+    agentName?: string,
   ): void {
+    for (const c of calls) {
+      if (!c.model) continue;
+      const llm = startChat(turn, c.model, parseIsoOrNow(c.prevTimestamp ?? c.timestamp));
+      recordChat(llm, [c], conversationId, agentName);
+    }
+  }
+
+  /**
+   * Emit a teammate's whole transcript as its OWN turn trace, then close the
+   * teammate's SubAgent marker. TeammateIdle fires after the coordinator turn
+   * that spawned the teammate has already closed, so the teammate can't nest
+   * under it; instead it gets a fresh root `invoke_agent` turn (stamped with the
+   * integration identity, which it won't inherit cross-session) with the
+   * teammate's chat spans as children. Returns the teammate's model, if known.
+   */
+  private emitTeammateTurnTrace(
+    subAgent: weave.SubAgent,
+    conversationId: string,
+    integrationAttrs: Attributes,
+    agentType: string,
+    transcriptPath: string | undefined,
+  ): string | undefined {
     let model: string | undefined;
     let lastAssistantText: string | undefined;
     let t: TranscriptFile | undefined;
@@ -1747,41 +1344,58 @@ export class GlobalDaemon {
       if (!transcriptPath) throw new Error('no teammate transcript path');
       t = new TranscriptFile(transcriptPath);
       const parsed = parseSessionFd(t.getFd());
-      if (parsed && this.tracer) {
-        for (const turn of parsed.turns) {
-          emitChatSpansFromAssistantCalls(this.tracer, invokeAgentSpan, conversationId, turn.assistantCalls());
+      if (parsed) {
+        // No ambient conversation cross-session, so stamp the conversation id
+        // and integration identity onto the teammate's own turn root explicitly.
+        const turn = weave.startTurn({ agentName: agentType, startTime: new Date() });
+        turn.setAttributes({
+          ...integrationAttrs,
+          [ATTR.AGENT_VERSION]: VERSION,
+          [ATTR.CONVERSATION_ID]: conversationId,
+        });
+        for (const parsedTurn of parsed.turns) {
+          this.emitChatSpansUnderTurn(turn, conversationId, parsedTurn.assistantCalls(), agentType);
         }
-        const lastTurn = parsed.turns[parsed.turns.length - 1];
+        turn.end();
+        const lastTurn = parsed.turns.at(-1);
         model = lastTurn?.primaryModel();
         lastAssistantText = lastTurn?.textBlocks().join('\n');
       }
     } catch (err) {
-      this.log('DEBUG', `emitTeammateTranscript: could not parse ${transcriptPath}: ${err}`);
+      this.log('DEBUG', `emitTeammateTurnTrace: could not parse ${transcriptPath}: ${err}`);
     } finally {
       t?.close();
     }
-    if (model) invokeAgentSpan.setAttribute(ATTR.RESPONSE_MODEL, model);
+    if (model) subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
     if (lastAssistantText) {
-      invokeAgentSpan.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        JSON.stringify([{ role: 'assistant', content: lastAssistantText }]),
-      );
+      subAgent.setAttributes({
+        [ATTR.OUTPUT_MESSAGES]: jsonStr([{ role: 'assistant', content: lastAssistantText }]),
+      });
     }
-    invokeAgentSpan.end();
+    subAgent.end();
+    return model;
   }
 
-  private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePreCompact(sessionId: string, input: PreCompactHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    // The SDK's PreCompactHookInput exposes trigger/custom_instructions; the
+    // Weave Agents backend wants a compaction summary + item counts, which live
+    // CC payloads carry but the SDK type doesn't declare, so read them off the
+    // raw record.
+    const raw = input as Record<string, unknown>;
+    const summary = raw['summary'] ?? raw['compaction_summary'];
+    const itemsBefore = raw['items_before'];
+    const itemsAfter = raw['items_after'];
     const attrs: CompactionAttrs = {
-      summary: (payload['summary'] as string | undefined) ?? (payload['compaction_summary'] as string | undefined),
-      itemsBefore: typeof payload['items_before'] === 'number' ? (payload['items_before'] as number) : undefined,
-      itemsAfter: typeof payload['items_after'] === 'number' ? (payload['items_after'] as number) : undefined,
+      summary: typeof summary === 'string' ? summary : undefined,
+      itemsBefore: typeof itemsBefore === 'number' ? itemsBefore : undefined,
+      itemsAfter: typeof itemsAfter === 'number' ? itemsAfter : undefined,
     };
 
-    if (session.currentTurnSpan) {
-      setCompactionAttrs(session.currentTurnSpan, attrs);
+    if (session.currentTurn) {
+      setCompactionAttrs(session.currentTurn, attrs);
       this.log('INFO', `PreCompact attached to active turn ${session.turnNumber} (session ${sessionId})`);
     } else {
       // Buffer until the next UserPromptSubmit opens a turn span.
@@ -1790,35 +1404,34 @@ export class GlobalDaemon {
     }
   }
 
-  private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleStop(sessionId: string, input: StopHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session?.currentTurnSpan || !this.tracer) return;
+    if (!session?.currentTurn || !this.tracingEnabled) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
-    // flush — otherwise the final chat span drops when the read races the writer.
-    const rawFinalMessage = payload['last_assistant_message'];
-    const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
+    // flush; otherwise the final chat span drops when the read races the writer.
+    const finalAssistantMessage = input.last_assistant_message;
     const parsedSession = await this.parseSessionFileWithRetry(
       session.transcript,
       finalAssistantMessage,
     );
-    const currentTurn = parsedSession?.turns[parsedSession.turns.length - 1];
+    const currentTurn = parsedSession?.turns.at(-1);
     const model = currentTurn?.primaryModel();
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
     // Finalize the chat-span state machine for this turn.
-    //   - The active chat span (open during PreToolUse) gets its trailing
-    //     text/thinking children plus its usage attrs, then ends.
+    //   - The active chat span (open during PreToolUse) gets its output parts
+    //     plus its usage attrs, then ends.
     //   - Assistant calls that never triggered a PreToolUse (final text-only
     //     message, or any other tool-less call) get a fresh chat span emitted
-    //     here with their full content as children.
+    //     here with their full content as output parts.
     if (currentTurn) {
       const calls = currentTurn.assistantCalls();
-      if (session.activeChatSpan) {
+      if (session.activeChat) {
         this.finalizeActiveChatSpan(session, calls);
       }
       // Emit a chat span for every response that never opened one during
@@ -1831,40 +1444,35 @@ export class GlobalDaemon {
     }
 
     const parsedTexts = currentTurn?.textBlocks() ?? [];
-    const lastMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
+    const lastMessage = input.last_assistant_message ?? '';
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
+    const turnAttrs: Attributes = { [ATTR.WEAVE_TURN_TOOL_COUNT]: session.turnToolCalls };
     if (assistantMessages.length) {
-      session.currentTurnSpan.setAttribute(
-        ATTR.OUTPUT_MESSAGES,
-        jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m }))),
-      );
+      turnAttrs[ATTR.OUTPUT_MESSAGES] = jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m })));
     }
-
     // Aggregate finish reasons from per-call detail
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {
-      session.currentTurnSpan.setAttribute(ATTR.RESPONSE_FINISH_REASONS, finishReasons);
+      turnAttrs[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
     }
-
     if (model) {
-      session.currentTurnSpan.setAttribute(ATTR.REQUEST_MODEL, model);
+      turnAttrs[ATTR.REQUEST_MODEL] = model;
     }
-
-    session.currentTurnSpan.setAttribute(ATTR.WEAVE_TURN_TOOL_COUNT, session.turnToolCalls);
-    session.currentTurnSpan.end();
-    session.currentTurnSpan = undefined;
+    session.currentTurn.setAttributes(turnAttrs);
+    session.currentTurn.end();
+    session.currentTurn = undefined;
 
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
 
-  private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSessionEnd(sessionId: string, input: SessionEndHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
     this.finalizeSession(session, 'session_ended');
@@ -1894,54 +1502,52 @@ export class GlobalDaemon {
     // Close any pending tool calls that were never completed
     for (const [toolUseId, pending] of session.pendingToolCalls) {
       resolvePermissionIfPending(pending, false);
-      pending.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
-      pending.span.setStatus({ code: SpanStatusCode.ERROR, message: 'tool did not complete before shutdown' });
-      pending.span.end();
+      pending.tool.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+      pending.tool.end({ error: new Error('tool did not complete before shutdown') });
       this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
     }
     session.pendingToolCalls.clear();
 
     // Finalize a chat span left open mid-turn (Stop never fired) from the
-    // now-flushed transcript, like Stop does, so its text + usage aren't lost.
+    // now-flushed transcript, like Stop does, so its output + usage aren't lost.
     // Bare orphan close only if the parse fails or the turn span is gone.
-    if (session.activeChatSpan) {
+    if (session.activeChat) {
       let finalized = false;
-      if (session.currentTurnSpan) {
+      if (session.currentTurn) {
         let parsed: ParsedSession | null = null;
         try {
           parsed = parseSessionFd(session.transcript.getFd());
         } catch {
           parsed = null;
         }
-        const lastTurn = parsed?.turns[parsed.turns.length - 1];
+        const lastTurn = parsed?.turns.at(-1);
         if (lastTurn) {
           this.finalizeActiveChatSpan(session, lastTurn.assistantCalls());
           finalized = true;
         }
       }
-      if (session.activeChatSpan) {
-        session.activeChatSpan.span.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
-        session.activeChatSpan.span.end();
-        session.activeChatSpan = undefined;
+      if (session.activeChat) {
+        session.activeChat.llm.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+        session.activeChat.llm.end();
+        session.activeChat = undefined;
       }
       this.log('DEBUG', finalized ? `Finalized active chat span` : `Closed orphaned chat span`);
     }
 
     // Close the current turn (root) span if still open
-    if (session.currentTurnSpan) {
-      session.currentTurnSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
-      session.currentTurnSpan.end();
-      session.currentTurnSpan = undefined;
+    if (session.currentTurn) {
+      session.currentTurn.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+      session.currentTurn.end();
+      session.currentTurn = undefined;
       this.log('DEBUG', `Closed orphaned turn span`);
     }
 
     // Close any subagent invoke_agent spans that didn't receive PostToolUse
     // or SubagentStop. Without this they'd leak open and never export.
     for (const tracker of session.subagents.all()) {
-      if (tracker.invokeAgentSpan && !tracker.ended) {
-        tracker.invokeAgentSpan.setAttribute(ATTR.WEAVE_ORPHAN_REASON, orphanReason);
-        tracker.invokeAgentSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'subagent did not complete before shutdown' });
-        tracker.invokeAgentSpan.end();
+      if (tracker.subAgent && !tracker.ended) {
+        tracker.subAgent.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+        tracker.subAgent.end({ error: new Error('subagent did not complete before shutdown') });
         tracker.ended = true;
       }
       this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
@@ -1992,7 +1598,7 @@ export class GlobalDaemon {
    *  timeout so in-flight work isn't cut off mid-flight (see checkInactivity). */
   private hasInFlightWork(): boolean {
     for (const s of this.sessions.values()) {
-      if (s.currentTurnSpan) return true;
+      if (s.currentTurn) return true;
       if (s.pendingToolCalls.size > 0) return true;
       if (s.subagents.size() > 0) return true;
     }
@@ -2012,9 +1618,9 @@ export class GlobalDaemon {
    * `shutdown` so it can be exercised in tests without terminating the process.
    *
    * Order matters: open sessions are finalized (their root turn spans ended)
-   * BEFORE `provider.shutdown()` flushes, so those roots make the final export
-   * batch instead of being dropped — the fix for rootless traces left behind
-   * when the daemon exits mid-turn.
+   * BEFORE `weave.flushOTel()` runs, so those roots make the final export batch
+   * instead of being dropped: the fix for rootless traces left behind when the
+   * daemon exits mid-turn.
    */
   private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
@@ -2024,7 +1630,7 @@ export class GlobalDaemon {
     // mid-triage) so they flush as ended spans instead of leaking.
     for (const [, queue] of this.teamMembers) {
       for (const m of queue) {
-        if (!m.emitted) { try { m.invokeAgentSpan.end(); } catch { /* best effort */ } }
+        if (!m.emitted) { try { m.subAgent.end(); } catch { /* best effort */ } }
       }
     }
     this.teamMembers.clear();
@@ -2033,11 +1639,11 @@ export class GlobalDaemon {
     for (const session of this.sessions.values()) {
       this.finalizeSession(session, 'daemon_shutdown');
     }
-    if (this.provider) {
+    if (this.tracingEnabled) {
       try {
-        await this.provider.shutdown();
+        await weave.flushOTel();
       } catch (err) {
-        this.log('ERROR', `Error shutting down OTel provider: ${err}`);
+        this.log('ERROR', `Error flushing Weave SDK: ${err}`);
       }
     }
     for (const session of this.sessions.values()) {
