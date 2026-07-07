@@ -15,8 +15,9 @@ import { fileURLToPath } from 'node:url';
 import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import * as weave from 'weave';
 
-import { MARKETPLACE_NAME } from '../src/setup.ts';
+import { MARKETPLACE_NAME, type Settings } from '../src/setup.ts';
 import { GlobalDaemon } from '../src/daemon.ts';
+import { resolveApiKey, resolveProject } from '../src/config.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -125,14 +126,18 @@ let genaiExporter: InMemorySpanExporter | undefined;
  */
 export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   if (!genaiExporter) {
-    // weave.init() resolves a W&B API key from WANDB_API_KEY/~/.netrc and throws
-    // without one, even though the custom span processor keeps this fully offline
-    // (project 'e/p' is entity-qualified, so init never hits the network). Seed a
-    // fake key so the in-process bridge stays hermetic on CI (no netrc); mirrors
-    // startTestDaemon's wandb_api_key.
-    process.env.WANDB_API_KEY ??= 'fake-key-for-test';
+    // weave.init() resolves a key from WANDB_API_KEY/~/.netrc and throws without
+    // one, even offline. Resolve project + key the way the daemon does (fake
+    // creds so the bridge stays hermetic on CI) and export the key for init.
+    const settings: Settings = {
+      log_file: '', daemon_socket: '', weave_project: 'e/p', wandb_api_key: 'fake-key-for-test',
+      agent_name: null, debug: false, installed_at: '', version: '0.0.0-test',
+    };
+    process.env.WANDB_API_KEY = resolveApiKey(settings).value ?? '';
     genaiExporter = new InMemorySpanExporter();
-    await weave.init('e/p', { genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) } });
+    await weave.init(resolveProject(settings).value ?? 'e/p', {
+      genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) },
+    });
   }
   return genaiExporter;
 }

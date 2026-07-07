@@ -26,7 +26,16 @@ import {
   type PluginSource,
 } from './setup.js';
 import { prompt, sendToSocket, requestFromSocket, probeUnixSocket, SocketState } from './utils.js';
-import { runDaemon, resolveDaemonConfig, daemonConfigFingerprint } from './daemon.js';
+import { runDaemon } from './daemon.js';
+import {
+  resolveProject,
+  resolveApiKey,
+  resolveAgentName,
+  resolveDaemonConfig,
+  daemonConfigFingerprint,
+  WeaveProjectSource,
+  ApiKeySource,
+} from './config.js';
 import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 
 // ---------------------------------------------------------------------------
@@ -218,63 +227,6 @@ function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
 }
 
-/** Where the effective agent name came from. Parallels `WeaveProjectSource` /
- *  `ApiKeySource`; has no `NotSet` member because agent_name always resolves
- *  to the built-in default. */
-enum AgentNameSource {
-  EnvVar = 'WEAVE_AGENT_NAME env var',
-  Settings = 'settings.json',
-  Default = 'default',
-}
-
-/**
- * Resolve the effective top-level agent name and where it came from. Mirrors
- * the env-over-settings precedence used for `weave_project`, with the
- * hardcoded `DEFAULT_AGENT_NAME` as the final fallback. Shared by
- * `config show` and `config get` so both report the same value.
- */
-function resolveAgentName(settings: Settings): { value: string; source: AgentNameSource } {
-  const fromEnv = process.env['WEAVE_AGENT_NAME']?.trim();
-  if (fromEnv) return { value: fromEnv, source: AgentNameSource.EnvVar };
-  const fromSettings = settings.agent_name?.trim();
-  if (fromSettings) return { value: fromSettings, source: AgentNameSource.Settings };
-  return { value: DEFAULT_AGENT_NAME, source: AgentNameSource.Default };
-}
-
-/**
- * Resolve the effective Weave project and where it came from, applying the
- * env-over-settings precedence (`WEAVE_PROJECT` beats `settings.weave_project`).
- * Shared by install, config, status, and restart so they report one value.
- * `value` uses nullish coalescing and `source` uses truthiness, matching the
- * per-site expressions this replaces.
- */
-function resolveProject(settings: Settings): { value: string | null; source: WeaveProjectSource } {
-  const value = process.env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-  const source = process.env['WEAVE_PROJECT']
-    ? WeaveProjectSource.EnvVar
-    : settings.weave_project
-      ? WeaveProjectSource.Settings
-      : WeaveProjectSource.NotSet;
-  return { value, source };
-}
-
-/**
- * Resolve the effective W&B API key and where it came from, applying the
- * env-over-settings precedence (`WANDB_API_KEY` beats `settings.wandb_api_key`).
- * Shared by install, config, status, and restart so they report one value.
- * `value` uses nullish coalescing and `source` uses truthiness, matching the
- * per-site expressions this replaces.
- */
-function resolveApiKey(settings: Settings): { value: string | null; source: ApiKeySource } {
-  const value = process.env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-  const source = process.env['WANDB_API_KEY']
-    ? ApiKeySource.EnvVar
-    : settings.wandb_api_key
-      ? ApiKeySource.Settings
-      : ApiKeySource.NotSet;
-  return { value, source };
-}
-
 /**
  * Render the comma-joined list of missing required config for the "incomplete"
  * status/restart messages. `apiKeyLabel` differs by call site (`wandb_api_key`
@@ -407,18 +359,6 @@ async function cmdConfig(args: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
-
-/** Where a configured value (project, API key) came from at gather time. */
-export enum WeaveProjectSource {
-  EnvVar = 'WEAVE_PROJECT env var',
-  Settings = 'settings.json',
-  NotSet = 'not set',
-}
-export enum ApiKeySource {
-  EnvVar = 'WANDB_API_KEY env var',
-  Settings = 'settings.json',
-  NotSet = 'not set',
-}
 
 /** Whether settings.json could be read at gather time. */
 export enum ConfigState {

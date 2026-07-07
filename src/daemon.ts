@@ -5,7 +5,6 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
 import type { Attributes } from '@opentelemetry/api';
 import type {
   HookInput,
@@ -23,13 +22,12 @@ import type {
   SessionEndHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import * as weave from 'weave';
-import { loadSettings, VERSION, type Settings } from './setup.js';
+import { loadSettings, VERSION } from './setup.js';
 import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
-  DEFAULT_AGENT_NAME,
   CompactionAttrs,
   addPermissionRequestEvent,
   setCompactionAttrs,
@@ -37,6 +35,7 @@ import {
   promptSnippet,
   jsonStr,
 } from './genaiSpans.js';
+import { resolveDaemonConfig, daemonConfigFingerprint } from './config.js';
 import {
   chatMessageKey,
   callsForResponseKey,
@@ -1709,45 +1708,6 @@ export class GlobalDaemon {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config resolution and fingerprinting
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** The config the daemon loads at startup and holds for its lifetime. */
-type DaemonConfig = {
-  weaveProject: string | null;
-  apiKey: string | null;
-  baseUrl: string;
-  agentName: string;
-  debug: boolean;
-}
-
-/** Resolve the effective daemon config from settings + env, applying the same
- *  env-over-settings precedence the daemon uses at startup. */
-export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv): DaemonConfig {
-  return {
-    weaveProject: env['WEAVE_PROJECT'] ?? settings.weave_project ?? null,
-    apiKey: env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null,
-    baseUrl: (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, ''),
-    // `||` (not `??`) so an empty/whitespace value falls through to the default
-    // rather than producing a blank `invoke_agent ` span name.
-    agentName: env['WEAVE_AGENT_NAME']?.trim() || settings.agent_name?.trim() || DEFAULT_AGENT_NAME,
-    debug: !!env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true,
-  };
-}
-
-/** Hex chars kept from the config hash. 16 (64 bits) is ample to detect a
- *  config change while keeping the value compact for logs and the socket reply. */
-const CONFIG_FINGERPRINT_LENGTH = 16;
-
-/** Short, stable hash of a daemon config. The API key is hashed, not exposed,
- *  so the fingerprint is safe to send over the socket. */
-export function daemonConfigFingerprint(c: DaemonConfig): string {
-  return createHash('sha256')
-    .update(JSON.stringify([c.weaveProject, c.apiKey, c.baseUrl, c.agentName, c.debug]))
-    .digest('hex')
-    .slice(0, CONFIG_FINGERPRINT_LENGTH);
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point (invoked by `weave-claude-code daemon`)
