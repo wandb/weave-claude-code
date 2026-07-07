@@ -77,11 +77,11 @@ export function openChatForGroup(turn: weave.Turn, group: AssistantCallDetail[])
 }
 
 /**
- * Populate a chat (LLM) span from the assistant calls that make up one response,
- * then end it. Split transcript lines share the response's usage, so it is taken
- * once from the last line (which also carries the stop_reason), not summed.
- * `agentName`, when set, tags the span so the Agents view groups a
- * subagent's/teammate's calls under that agent.
+ * Populate a chat (LLM) span from the assistant calls of one response, then end
+ * it. Split lines share the response's usage, so take it once from the last line
+ * (which carries stop_reason), not summed. `agentName` tags the span so the
+ * Agents view groups a subagent's/teammate's calls under it; conversation.id is
+ * inherited from the parent turn.
  */
 export function recordChat(
   llm: weave.LLM,
@@ -91,13 +91,18 @@ export function recordChat(
 ): void {
   const last = group.at(-1)!;
   const parts = contentBlocksToParts(group.flatMap(c => c.contentBlocks));
-  if (parts.length) llm.outputMessages = [{ role: 'assistant', parts }];
-  llm.usage = buildUsage(last.usage, last.reasoningTokens);
-  const attrs: Attributes = { [ATTR.CONVERSATION_ID]: conversationId, [ATTR.OUTPUT_TYPE]: 'text' };
-  if (agentName) attrs[ATTR.AGENT_NAME] = agentName;
-  if (last.responseId) attrs[ATTR.RESPONSE_ID] = last.responseId;
   const finishReason = group.map(c => c.finishReason).find(Boolean);
-  if (finishReason) attrs[ATTR.RESPONSE_FINISH_REASONS] = [finishReason];
+  llm.record({
+    ...(parts.length ? { outputMessages: [{ role: 'assistant', parts }] } : {}),
+    usage: buildUsage(last.usage, last.reasoningTokens),
+    outputType: 'text',
+    ...(last.responseId ? { responseId: last.responseId } : {}),
+    ...(finishReason ? { finishReasons: [finishReason] } : {}),
+  });
+  // agent.name, and conversation.id for cross-session teammate spans (no ambient
+  // conversation to inherit from), aren't on record()'s surface — set directly.
+  const attrs: Attributes = { [ATTR.CONVERSATION_ID]: conversationId };
+  if (agentName) attrs[ATTR.AGENT_NAME] = agentName;
   llm.setAttributes(attrs);
   llm.end({ endTime: parseIsoOrNow(last.timestamp) });
 }

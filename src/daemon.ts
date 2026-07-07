@@ -644,20 +644,17 @@ export class GlobalDaemon {
     session.turnNumber += 1;
     session.turnToolCalls = 0;
     session.emittedChatSpanResponseKeys.clear();
-    // The turn is the root of its own trace; the Weave Agents backend stitches
-    // turns into a conversation via `gen_ai.conversation.id` (inherited from the
-    // ambient conversation re-installed in routeEvent). Session-level metadata
-    // (cwd, source, plugin.version) is stamped on every turn so it's queryable
-    // without a separate session-level span.
-    // conversationId is inherited from the ambient conversation (re-installed in
-    // routeEvent), which stamps `gen_ai.conversation.id` on the turn and its
-    // children.
+    // The turn is the root of its own trace; the backend stitches turns into a
+    // conversation via gen_ai.conversation.id, inherited from the ambient
+    // conversation (re-installed per event in routeEvent). Session metadata is
+    // stamped per-turn so it's queryable without a session-level span.
     const turn = weave.startTurn({
       agentName: this.agentName,
+      agentVersion: VERSION,
+      ...(session.initialRequestModel ? { model: session.initialRequestModel } : {}),
       startTime: new Date(),
     });
-    const attrs: Attributes = {
-      [ATTR.AGENT_VERSION]: VERSION,
+    turn.setAttributes({
       [ATTR.WEAVE_SESSION_ID]: session.sessionId,
       [ATTR.WEAVE_CWD]: session.cwd,
       [ATTR.WEAVE_SOURCE]: session.source,
@@ -665,9 +662,7 @@ export class GlobalDaemon {
       [ATTR.WEAVE_TURN_NUMBER]: session.turnNumber,
       [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]),
       [ATTR.WEAVE_DISPLAY_NAME]: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
-    };
-    if (session.initialRequestModel) attrs[ATTR.REQUEST_MODEL] = session.initialRequestModel;
-    turn.setAttributes(attrs);
+    });
     session.currentTurn = turn;
 
     // Drain compaction attrs buffered while no turn was open.
@@ -708,10 +703,8 @@ export class GlobalDaemon {
       }
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
-      const subAgent = session.currentTurn.startSubagent({ name: subagentType, startTime: new Date() });
+      const subAgent = session.currentTurn.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
       const subAttrs: Attributes = {
-        [ATTR.AGENT_VERSION]: VERSION,
-        [ATTR.CONVERSATION_ID]: session.conversationId,
         [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: toolUseId,
         [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput),
       };
@@ -1063,10 +1056,8 @@ export class GlobalDaemon {
         pendingTeammateIdle: true,
       };
       if (session.currentTurn) {
-        bestTracker.subAgent = session.currentTurn.startSubagent({ name: agentType, startTime: new Date() });
+        bestTracker.subAgent = session.currentTurn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
         bestTracker.subAgent.setAttributes({
-          [ATTR.AGENT_VERSION]: VERSION,
-          [ATTR.CONVERSATION_ID]: session.conversationId,
           [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
           [ATTR.WEAVE_ORPHAN_REASON]: reason,
         });
@@ -1076,9 +1067,8 @@ export class GlobalDaemon {
 
     bestTracker.agentId = agentId;
     if (bestTracker.subAgent) {
-      // Stamp the runtime agent_id on the subagent's invoke_agent span — the
-      // chat view uses `gen_ai.agent.id` to label the subagent's subtree.
-      bestTracker.subAgent.setAttributes({ [ATTR.AGENT_ID]: agentId });
+      // The chat view uses gen_ai.agent.id to label the subagent's subtree.
+      bestTracker.subAgent.record({ agentId });
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
@@ -1121,12 +1111,7 @@ export class GlobalDaemon {
         lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          this.emitChatSpansUnderTurn(
-            chatParent,
-            session.conversationId,
-            lastTurn.assistantCalls(),
-            tracker.subagentType,
-          );
+          this.emitChatSpansUnderTurn(chatParent, session.conversationId, lastTurn.assistantCalls(), tracker.subagentType);
         }
       } catch (err) {
         this.log('DEBUG', `SubagentStop: could not parse transcript: ${err}`);
@@ -1304,10 +1289,10 @@ export class GlobalDaemon {
   }
 
   /**
-   * Emit one `chat` span (LLM) per assistant call under `turn`, reconstructing
-   * each from transcript data (backdated start/end times, usage, ordered output
-   * parts). `agentName`, when set, tags each span with `gen_ai.agent.name` so
-   * the Agents view groups a subagent's/teammate's calls under that agent.
+   * Emit one chat span (LLM) per assistant call under `turn`, reconstructed from
+   * transcript data (backdated times, usage, ordered output parts). `agentName`
+   * tags each span so the Agents view groups a subagent's/teammate's calls under
+   * that agent; conversation.id is inherited from `turn`.
    */
   private emitChatSpansUnderTurn(
     turn: weave.Turn,
@@ -1345,14 +1330,10 @@ export class GlobalDaemon {
       t = new TranscriptFile(transcriptPath);
       const parsed = parseSessionFd(t.getFd());
       if (parsed) {
-        // No ambient conversation cross-session, so stamp the conversation id
-        // and integration identity onto the teammate's own turn root explicitly.
-        const turn = weave.startTurn({ agentName: agentType, startTime: new Date() });
-        turn.setAttributes({
-          ...integrationAttrs,
-          [ATTR.AGENT_VERSION]: VERSION,
-          [ATTR.CONVERSATION_ID]: conversationId,
-        });
+        // No ambient conversation cross-session: stamp conversation.id and the
+        // integration identity (a custom attr map) onto the teammate turn root.
+        const turn = weave.startTurn({ agentName: agentType, agentVersion: VERSION, startTime: new Date() });
+        turn.setAttributes({ ...integrationAttrs, [ATTR.CONVERSATION_ID]: conversationId });
         for (const parsedTurn of parsed.turns) {
           this.emitChatSpansUnderTurn(turn, conversationId, parsedTurn.assistantCalls(), agentType);
         }
