@@ -125,6 +125,12 @@ let genaiExporter: InMemorySpanExporter | undefined;
  */
 export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   if (!genaiExporter) {
+    // weave.init() resolves a W&B API key from WANDB_API_KEY/~/.netrc and throws
+    // without one, even though the custom span processor keeps this fully offline
+    // (project 'e/p' is entity-qualified, so init never hits the network). Seed a
+    // fake key so the in-process bridge stays hermetic on CI (no netrc); mirrors
+    // startTestDaemon's wandb_api_key.
+    process.env.WANDB_API_KEY ??= 'fake-key-for-test';
     genaiExporter = new InMemorySpanExporter();
     await weave.init('e/p', { genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) } });
   }
