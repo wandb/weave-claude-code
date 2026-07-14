@@ -74,13 +74,12 @@ suite('weave-claude-code status (pretty)', () => {
     const r = await runStatus(home);
     assert.equal(r.code, 0, `expected exit 0 on happy path; stdout=${r.stdout}`);
 
-    assert.match(r.stdout, /✓ Configuration: /);
-    assert.match(r.stdout, /✓ Weave project: fake-entity\/fake-project \(from settings\.json\)/);
-    assert.match(r.stdout, /✓ W&B API key: .+ \(from settings\.json\)/);
-    assert.match(r.stdout, /Daemon socket: .+ \(not running\)/);
-    assert.match(r.stdout, /- Log file: .+ \(not created yet\)/);
-    assert.match(r.stdout, /Status: Ready to trace/);
-    assert.match(r.stdout, /View traces: https:\/\/wandb\.ai\/fake-entity\/fake-project\/weave\/agents/);
+    assert.match(r.stdout, /Weave Claude Code — ready to trace/);
+    assert.match(r.stdout, /✓ Project\s+fake-entity\/fake-project\s+\(settings\.json\)/);
+    assert.match(r.stdout, /✓ API key\s+.+\(settings\.json\)/);
+    assert.match(r.stdout, /Daemon\s+○ not running/);
+    assert.match(r.stdout, /- Log\s+.+\(not created yet\)/);
+    assert.match(r.stdout, /wandb\.ai\/fake-entity\/fake-project\/weave\/agents/);
   });
 
   test('prints the configured agent name', async () => {
@@ -88,7 +87,7 @@ suite('weave-claude-code status (pretty)', () => {
     writeSettings(home, { agent_name: 'goober' });
 
     const r = await runStatus(home);
-    assert.match(r.stdout, /✓ Agent name: goober\n/);
+    assert.match(r.stdout, /✓ Agent\s+goober/);
   });
 
   test('falls back to the default agent name when unset', async () => {
@@ -96,7 +95,7 @@ suite('weave-claude-code status (pretty)', () => {
     writeSettings(home); // no agent_name key, mirrors settings written before the field existed
 
     const r = await runStatus(home);
-    assert.match(r.stdout, /✓ Agent name: claude-code\n/);
+    assert.match(r.stdout, /✓ Agent\s+claude-code/);
   });
 
   test('missing settings file: prints "Configuration: not found" and exits non-zero', async () => {
@@ -105,10 +104,11 @@ suite('weave-claude-code status (pretty)', () => {
     const r = await runStatus(home);
     assert.notEqual(r.code, 0, `expected non-zero exit when settings is missing; stdout=${r.stdout}`);
 
-    assert.match(r.stdout, /✗ Configuration: not found at .+\.weave-claude-code\/settings\.json/);
-    assert.match(r.stdout, /Run: weave-claude-code install/);
-    // Other status lines should be suppressed: gather returns early before probing.
-    assert.doesNotMatch(r.stdout, /Daemon socket:/);
+    assert.match(r.stdout, /Weave Claude Code — not configured/);
+    assert.match(r.stdout, /No config at .+\.weave-claude-code\/settings\.json/);
+    assert.match(r.stdout, /weave-claude-code install/);
+    // Other status sections should be suppressed: gather returns early before probing.
+    assert.doesNotMatch(r.stdout, /Daemon/);
   });
 
   test('unreadable settings file: prints "Configuration: failed to read" and exits non-zero', async () => {
@@ -120,8 +120,8 @@ suite('weave-claude-code status (pretty)', () => {
     const r = await runStatus(home);
     assert.notEqual(r.code, 0, `expected non-zero exit when settings is unreadable; stdout=${r.stdout}`);
 
-    assert.match(r.stdout, /✗ Configuration: failed to read/);
-    assert.doesNotMatch(r.stdout, /Daemon socket:/);
+    assert.match(r.stdout, /config unreadable/);
+    assert.doesNotMatch(r.stdout, /Daemon/);
   });
 
   test('missing weave_project: prints ✗ and "Configuration incomplete" summary', async () => {
@@ -131,9 +131,9 @@ suite('weave-claude-code status (pretty)', () => {
     const r = await runStatus(home);
     assert.equal(r.code, 0, `expected exit 0 (config-incomplete is not fatal); stdout=${r.stdout}`);
 
-    assert.match(r.stdout, /✗ Weave project: not configured/);
-    assert.match(r.stdout, /Status: Configuration incomplete .* weave_project/);
-    assert.doesNotMatch(r.stdout, /Status: Ready to trace/);
+    assert.match(r.stdout, /✗ Project\s+not set/);
+    assert.match(r.stdout, /Set [^\n]*weave_project to start tracing/);
+    assert.doesNotMatch(r.stdout, /ready to trace/);
   });
 
   test('missing wandb_api_key: prints ✗ and "Configuration incomplete" summary', async () => {
@@ -143,9 +143,9 @@ suite('weave-claude-code status (pretty)', () => {
     const r = await runStatus(home);
     assert.equal(r.code, 0, `expected exit 0 (config-incomplete is not fatal); stdout=${r.stdout}`);
 
-    assert.match(r.stdout, /✗ W&B API key: not configured/);
-    assert.match(r.stdout, /Status: Configuration incomplete .* wandb_api_key/);
-    assert.doesNotMatch(r.stdout, /Status: Ready to trace/);
+    assert.match(r.stdout, /✗ API key\s+not set/);
+    assert.match(r.stdout, /Set [^\n]*wandb_api_key to start tracing/);
+    assert.doesNotMatch(r.stdout, /ready to trace/);
   });
 });
 
@@ -239,7 +239,7 @@ const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
     name: 'github source',
     setup: () => ({
       seed: { source: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
-      expectInPretty: 'Source: github wandb/weave-claude-code @ v0.2.7',
+      expectInPretty: 'github wandb/weave-claude-code @ v0.2.7',
       expectJson: { type: 'github', repo: 'wandb/weave-claude-code', ref: 'v0.2.7' },
     }),
   },
@@ -253,7 +253,7 @@ const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
       );
       return {
         seed: { source: 'directory', path: dir },
-        expectInPretty: `Source: directory ${dir} @ v1.2.3`,
+        expectInPretty: `directory ${dir} @ v1.2.3`,
         expectJson: { type: 'directory', path: dir, version: '1.2.3' },
       };
     },
@@ -265,7 +265,7 @@ const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
       // Intentionally no package.json; version should fall back to null.
       return {
         seed: { source: 'directory', path: dir },
-        expectInPretty: `Source: directory ${dir}`,
+        expectInPretty: `directory ${dir}`,
         expectNotInPretty: `${dir} @`,
         expectJson: { type: 'directory', path: dir, version: null },
       };
@@ -275,7 +275,7 @@ const PLUGIN_SOURCE_CASES: ReadonlyArray<PluginSourceCase> = [
     name: 'not registered',
     setup: () => ({
       seed: null,
-      expectInPretty: 'Source: not registered',
+      expectInPretty: 'not registered',
       expectJson: null,
     }),
   },
@@ -318,8 +318,8 @@ suite('weave-claude-code status (running daemon identity)', () => {
       assert.ok(d.path && /cli\.(ts|js)$/.test(d.path), `daemon entry path should resolve to cli.(ts|js); got ${d.path}`);
 
       const pretty = (await runStatus(daemon.home)).stdout;
-      assert.match(pretty, /Running: pid \d+ \(v/);
-      assert.match(pretty, /From: \//);
+      assert.match(pretty, /✓ Process\s+pid \d+ \(v/);
+      assert.match(pretty, /✓ From\s+\S*cli\.(ts|js)/);
     } finally {
       await daemon.stop();
     }
