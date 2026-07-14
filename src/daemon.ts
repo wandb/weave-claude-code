@@ -289,6 +289,20 @@ type TeamMember = {
   emitted: boolean;
 }
 
+/** One instruction file surfaced by the `InstructionsLoaded` hook. Accumulated
+ *  per session (deduped by path) and stamped as `gen_ai.system_instructions` on
+ *  each turn root. */
+type LoadedInstruction = { filePath: string; content: string };
+
+/** Append `item` to `list` in place, replacing any existing entry with the same
+ *  filePath so a reloaded file (e.g. `load_reason=compact`) updates rather than
+ *  duplicates. Preserves each file's first-seen position. */
+function upsertInstruction(list: LoadedInstruction[], item: LoadedInstruction): void {
+  const idx = list.findIndex((i) => i.filePath === item.filePath);
+  if (idx >= 0) list[idx] = item;
+  else list.push(item);
+}
+
 type SessionState = {
   sessionId: string;
   /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
@@ -327,6 +341,11 @@ type SessionState = {
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
+
+  /** Instruction files (global/project CLAUDE.md, .claude/rules, @-imports)
+   *  captured from InstructionsLoaded, in load order, deduped by path. Stamped
+   *  on every turn root as `gen_ai.system_instructions`. */
+  systemInstructions: LoadedInstruction[];
 
 }
 
@@ -469,6 +488,7 @@ function newSessionState(options: NewSessionStateOptions): SessionState {
     pendingToolCalls: new Map(),
     subagents: new SubagentTracking(),
     emittedChatSpanResponseKeys: new Set(),
+    systemInstructions: [],
   };
 }
 
@@ -481,6 +501,11 @@ export class GlobalDaemon {
   private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
+  /** InstructionsLoaded files that arrived before their session existed (the
+   *  hook can fire before SessionStart — verified in daemon logs). Drained into
+   *  the session at SessionStart / reconstruction, then discarded. Keyed by
+   *  session_id and cleared once the session exists (also on SessionEnd). */
+  private pendingInstructions = new Map<string, LoadedInstruction[]>();
   private provider: NodeTracerProvider | null = null;
   private tracer: Tracer | null = null;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
@@ -760,6 +785,10 @@ export class GlobalDaemon {
         case 'SessionStart':
           await this.handleSessionStart(sessionId, payload);
           break;
+        case 'InstructionsLoaded':
+          // Purely in-memory accumulation; no async work to await.
+          this.handleInstructionsLoaded(sessionId, payload);
+          break;
         case 'UserPromptSubmit':
           await this.handleUserPromptSubmit(sessionId, payload);
           break;
@@ -826,18 +855,17 @@ export class GlobalDaemon {
 
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
-    this.sessions.set(
+    const session = newSessionState({
       sessionId,
-      newSessionState({
-        sessionId,
-        conversationId,
-        transcript,
-        cwd,
-        source,
-        initialRequestModel,
-        turnNumber: 0,
-      }),
-    );
+      conversationId,
+      transcript,
+      cwd,
+      source,
+      initialRequestModel,
+      turnNumber: 0,
+    });
+    this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
 
     const resumed = conversationId !== sessionId;
     this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
@@ -973,11 +1001,64 @@ export class GlobalDaemon {
       turnNumber: priorTurns,
     });
     this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
     this.log(
       'INFO',
       `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
     );
     return session;
+  }
+
+  /**
+   * Capture a loaded instruction file (global/project CLAUDE.md, .claude/rules,
+   * @-import) from the InstructionsLoaded hook and accumulate it on the session
+   * for `gen_ai.system_instructions`. The hook fires per file at session start
+   * and lazily mid-session; its order relative to SessionStart is NOT guaranteed
+   * (verified in daemon logs — a file can load before SessionStart), so
+   * instructions that arrive before the session exists are buffered and drained
+   * when it is created (handleSessionStart / getOrReconstructSession).
+   *
+   * We deliberately do NOT reconstruct the session from this event:
+   * handleSessionStart is idempotent, so a premature reconstruct here would turn
+   * the real SessionStart into a no-op and lose its source/model.
+   *
+   * Only instructions loaded while THIS daemon is running are captured. A session
+   * reconstructed by a fresh daemon after a restart starts with none and picks up
+   * only files that (re)load afterward (e.g. load_reason=compact).
+   */
+  private handleInstructionsLoaded(sessionId: string, payload: HookPayload): void {
+    const filePath = payload['file_path'] as string | undefined;
+    const content = payload['file_content'] as string | undefined;
+    const loadReason = (payload['load_reason'] as string | undefined) ?? 'unknown';
+    if (!filePath || !content) {
+      this.log('DEBUG', `InstructionsLoaded ignored (missing file_path/file_content): session=${sessionId}`);
+      return;
+    }
+
+    const instruction: LoadedInstruction = { filePath, content };
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      upsertInstruction(session.systemInstructions, instruction);
+    } else {
+      // Session not set up yet — buffer until SessionStart / reconstruct drains it.
+      const pending = this.pendingInstructions.get(sessionId) ?? [];
+      upsertInstruction(pending, instruction);
+      this.pendingInstructions.set(sessionId, pending);
+    }
+    this.log(
+      'DEBUG',
+      `InstructionsLoaded: session=${sessionId} reason=${loadReason} file=${path.basename(filePath)} bytes=${content.length}${session ? '' : ' (buffered)'}`,
+    );
+  }
+
+  /** Move any instructions buffered before this session existed into its state,
+   *  then discard the buffer. */
+  private drainPendingInstructions(session: SessionState): void {
+    const pending = this.pendingInstructions.get(session.sessionId);
+    this.pendingInstructions.delete(session.sessionId);
+    if (!pending?.length) return;
+    for (const instruction of pending) upsertInstruction(session.systemInstructions, instruction);
+    this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
   private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
@@ -1011,6 +1092,7 @@ export class GlobalDaemon {
       agentName: this.agentName,
       requestModel: session.initialRequestModel,
       displayName: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
+      systemInstructions: session.systemInstructions.map((i) => i.content),
     });
     session.currentTurnSpan = turnSpan;
 
@@ -1859,6 +1941,9 @@ export class GlobalDaemon {
   }
 
   private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
+    // Discard any never-drained instruction buffer (e.g. a session that emitted
+    // InstructionsLoaded but never SessionStart) so the map can't leak.
+    this.pendingInstructions.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
