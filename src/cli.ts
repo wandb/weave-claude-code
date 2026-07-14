@@ -413,6 +413,11 @@ interface StatusReport {
   /** True when a daemon is alive but loaded an older config than settings.json
    *  now resolves to, so a restart is needed to pick up the change. */
   config_drift: boolean;
+  /** Identity the live daemon reported for itself: its pid, version, and the
+   *  resolved entry script it's executing. All null when no daemon is alive or
+   *  it predates identity reporting. Lets you confirm which build is actually
+   *  running (e.g. a linked local dev build vs the published install). */
+  daemon: { pid: number | null; version: string | null; path: string | null };
   ready_to_trace: boolean;
   view_traces_url: string | null;
 }
@@ -443,6 +448,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
     config_drift: false,
+    daemon: { pid: null, version: null, path: null },
     ready_to_trace: false,
     view_traces_url: null,
   };
@@ -502,11 +508,16 @@ async function gatherStatus(): Promise<StatusSnapshot> {
   if (report.daemon_socket.state === SocketState.Alive) {
     try {
       const reply = await requestFromSocket(settings.daemon_socket, JSON.stringify({ command: 'config-hash' }));
-      const running = (JSON.parse(reply) as Record<string, unknown>)['config_hash'];
+      const parsed = JSON.parse(reply) as Record<string, unknown>;
+      const running = parsed['config_hash'];
       const current = daemonConfigFingerprint(resolveDaemonConfig(settings, process.env));
       report.config_drift = typeof running === 'string' && running !== current;
+      // Runtime identity the daemon reports about itself (absent on older daemons).
+      if (typeof parsed['pid'] === 'number') report.daemon.pid = parsed['pid'];
+      if (typeof parsed['version'] === 'string') report.daemon.version = parsed['version'];
+      if (typeof parsed['path'] === 'string') report.daemon.path = parsed['path'];
     } catch {
-      // Daemon did not reply with a fingerprint; cannot determine drift.
+      // Daemon did not reply; cannot determine drift or identity.
     }
   }
 
@@ -580,6 +591,13 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   const { path: socketPath, state: socketState } = report.daemon_socket;
   if (socketState === SocketState.Alive) {
     console.log(`✓ Daemon socket: ${socketPath} (alive)`);
+    if (report.daemon.pid !== null) {
+      const versionLabel = report.daemon.version ? `v${report.daemon.version}` : 'version unknown';
+      console.log(`  Running: pid ${report.daemon.pid} (${versionLabel})`);
+    }
+    if (report.daemon.path) {
+      console.log(`  From: ${report.daemon.path}`);
+    }
   } else if (socketState === SocketState.Stale) {
     console.log(`✗ Daemon socket: ${socketPath} (stale — file exists but no listener)`);
     console.log(`  Auto-recovers on next Claude Code session — no action needed.`);

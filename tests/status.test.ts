@@ -13,7 +13,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { writeKnownMarketplace } from './helpers.ts';
+import { startTestDaemon, writeKnownMarketplace } from './helpers.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -161,7 +161,7 @@ suite('weave-claude-code status --json', () => {
     // Required top-level fields per the documented schema.
     for (const key of [
       'version', 'settings_file', 'cli_path', 'weave_project', 'weave_project_source',
-      'api_key_configured', 'agent_name', 'plugin_source', 'daemon_socket', 'log_file', 'ready_to_trace',
+      'api_key_configured', 'agent_name', 'plugin_source', 'daemon_socket', 'daemon', 'log_file', 'ready_to_trace',
       'view_traces_url',
     ]) {
       assert.ok(key in parsed, `missing required field: ${key}`);
@@ -299,5 +299,36 @@ suite('weave-claude-code status (plugin source)', () => {
       const parsed = JSON.parse(json.stdout) as { plugin_source: unknown };
       assert.deepEqual(parsed.plugin_source, expectJson, `case "${c.name}" (json)`);
     }
+  });
+});
+
+// A live daemon reports its own identity (pid, version, resolved entry script)
+// over the config-hash control reply; status surfaces it so you can tell which
+// build is actually running (e.g. a linked local dev build). Uses the real
+// daemon harness — the identity reported is the daemon's, not the CLI's.
+suite('weave-claude-code status (running daemon identity)', () => {
+  test('reports the live daemon pid, version, and entry path', async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const parsed = JSON.parse((await runStatus(daemon.home, ['--json'])).stdout) as Record<string, unknown>;
+      const d = parsed['daemon'] as { pid: number | null; version: string | null; path: string | null };
+      assert.equal(typeof d.pid, 'number', `daemon pid should be reported; got ${JSON.stringify(d)}`);
+      assert.ok((d.pid ?? 0) > 0, 'daemon pid should be positive');
+      assert.equal(typeof d.version, 'string', 'daemon version should be reported');
+      assert.ok(d.path && /cli\.(ts|js)$/.test(d.path), `daemon entry path should resolve to cli.(ts|js); got ${d.path}`);
+
+      const pretty = (await runStatus(daemon.home)).stdout;
+      assert.match(pretty, /Running: pid \d+ \(v/);
+      assert.match(pretty, /From: \//);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test('reports null daemon identity when no daemon is running', async () => {
+    const home = fs.mkdtempSync(path.join(scratch, 'no-daemon-identity-'));
+    writeSettings(home);
+    const parsed = JSON.parse((await runStatus(home, ['--json'])).stdout) as Record<string, unknown>;
+    assert.deepEqual(parsed['daemon'], { pid: null, version: null, path: null });
   });
 });

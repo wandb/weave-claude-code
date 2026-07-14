@@ -61,7 +61,8 @@ import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
 /** Inbound control message sent directly to the socket (not a hook event).
  *  `shutdown` stops the daemon; `config-hash` asks it to reply with the
- *  fingerprint of the config it loaded (used by `status` for drift detection). */
+ *  fingerprint of the config it loaded (used by `status` for drift detection)
+ *  plus the daemon's runtime identity (pid, version, entry path). */
 type ControlMessage = {
   command: 'shutdown' | 'config-hash';
 }
@@ -472,6 +473,19 @@ function newSessionState(options: NewSessionStateOptions): SessionState {
   };
 }
 
+/** Absolute real path of the daemon's own entry script, resolving the npm bin
+ *  symlink to the actual dist/cli.js (or src/cli.ts under tsx). Lets `status`
+ *  report which build the running daemon is executing. Falls back to the raw
+ *  argv path if it can't be resolved. */
+function daemonEntryPath(): string {
+  const entry = process.argv[1] ?? '';
+  try {
+    return fs.realpathSync(entry);
+  } catch {
+    return entry;
+  }
+}
+
 export class GlobalDaemon {
   private server?: net.Server;
   private running = false;
@@ -693,7 +707,16 @@ export class GlobalDaemon {
 
       if (isControlMessage(payload)) {
         if (payload.command === 'config-hash') {
-          socket.end(JSON.stringify({ config_hash: this.configFingerprint() }));
+          // Reply carries the config fingerprint (for drift detection) plus the
+          // daemon's runtime identity, so `status` can show which build is
+          // actually running (pid + version + resolved entry script) rather than
+          // just where the CLI symlink currently points.
+          socket.end(JSON.stringify({
+            config_hash: this.configFingerprint(),
+            pid: process.pid,
+            version: VERSION,
+            path: daemonEntryPath(),
+          }));
         } else {
           socket.end();
           void this.shutdown('control message');
