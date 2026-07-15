@@ -294,11 +294,6 @@ type TeamMember = {
  *  each turn root. */
 type LoadedInstruction = { filePath: string; content: string };
 
-/** Defensive cap on instruction-file content: real files are a few KB, so this
- *  only stops a pathologically large one from bloating every turn root. Beyond
- *  it we keep a truncated prefix. */
-const MAX_INSTRUCTION_FILE_CHARS = 128 * 1024;
-
 /** Append `item` to `list` in place, replacing any existing entry with the same
  *  filePath so a reloaded file (e.g. `load_reason=compact`) updates rather than
  *  duplicates. Preserves each file's first-seen position. */
@@ -1046,9 +1041,6 @@ export class GlobalDaemon {
     } catch (err) {
       this.log('DEBUG', `InstructionsLoaded: unreadable ${filePath}: ${err}`);
       return;
-    }
-    if (content.length > MAX_INSTRUCTION_FILE_CHARS) {
-      content = content.slice(0, MAX_INSTRUCTION_FILE_CHARS) + '\n[truncated]';
     }
 
     const instruction: LoadedInstruction = { filePath, content };
