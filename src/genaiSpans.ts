@@ -263,10 +263,8 @@ type TurnSpanArgs = {
   requestModel?: string;
   displayName?: string;
   /** Loaded instruction-file contents (global/project CLAUDE.md, .claude/rules,
-   *  @-imports) surfaced by the InstructionsLoaded hook, in load order. Stamped
-   *  as `gen_ai.system_instructions` (one text part per file) when non-empty.
-   *  The base Claude Code system prompt is never exposed to hooks, so this
-   *  captures only the user/project instructions appended to it. */
+   *  @-imports) in load order, stamped as `gen_ai.system_instructions` (one text
+   *  part per file) when non-empty. */
   systemInstructions?: string[];
 };
 

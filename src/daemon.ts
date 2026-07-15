@@ -294,10 +294,9 @@ type TeamMember = {
  *  each turn root. */
 type LoadedInstruction = { filePath: string; content: string };
 
-/** Defensive cap on instruction-file content read from disk. Real instruction
- *  files (CLAUDE.md, .claude/rules, @-imports) are a few KB; this only guards a
- *  pathologically large file from bloating every turn root's
- *  `gen_ai.system_instructions`. Beyond it we keep a truncated prefix. */
+/** Defensive cap on instruction-file content: real files are a few KB, so this
+ *  only stops a pathologically large one from bloating every turn root. Beyond
+ *  it we keep a truncated prefix. */
 const MAX_INSTRUCTION_FILE_CHARS = 128 * 1024;
 
 /** Append `item` to `list` in place, replacing any existing entry with the same
@@ -508,9 +507,8 @@ export class GlobalDaemon {
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
   /** InstructionsLoaded files that arrived before their session existed (the
-   *  hook can fire before SessionStart — verified in daemon logs). Drained into
-   *  the session at SessionStart / reconstruction, then discarded. Keyed by
-   *  session_id and cleared once the session exists (also on SessionEnd). */
+   *  hook can fire before SessionStart). Keyed by session_id; drained into the
+   *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
   private pendingInstructions = new Map<string, LoadedInstruction[]>();
   private provider: NodeTracerProvider | null = null;
   private tracer: Tracer | null = null;
@@ -1017,28 +1015,22 @@ export class GlobalDaemon {
   }
 
   /**
-   * Capture a loaded instruction file (global/project CLAUDE.md, .claude/rules,
-   * @-import) from the InstructionsLoaded hook and accumulate it on the session
-   * for `gen_ai.system_instructions`. The hook is observability-only: it carries
-   * `file_path` (plus memory_type/load_reason/globs) but NOT the file contents,
-   * so we read the file from disk ourselves. The read is synchronous so a
-   * session-start burst accumulates in arrival (= load) order; concurrent async
-   * reads could finish out of order, and these are small local files off Claude
-   * Code's hot path.
+   * Capture one instruction file (global/project CLAUDE.md, .claude/rules,
+   * @-import) from InstructionsLoaded for `gen_ai.system_instructions`.
    *
-   * The hook fires per file at session start and lazily mid-session; its order
-   * relative to SessionStart is NOT guaranteed (verified in daemon logs — a file
-   * can load before SessionStart), so instructions that arrive before the
-   * session exists are buffered and drained when it is created
-   * (handleSessionStart / getOrReconstructSession).
+   * The hook is observability-only and gives `file_path`, not contents, so we
+   * read the file ourselves. The read is synchronous to keep a session-start
+   * burst in load order (async reads could reorder); the files are small and
+   * local, off Claude Code's hot path.
    *
-   * We deliberately do NOT reconstruct the session from this event:
-   * handleSessionStart is idempotent, so a premature reconstruct here would turn
-   * the real SessionStart into a no-op and lose its source/model.
+   * The hook's order vs SessionStart is not guaranteed (a file can load first),
+   * so instructions arriving before the session exists are buffered and drained
+   * on creation. We do not reconstruct here: handleSessionStart is idempotent,
+   * so a premature reconstruct would no-op the real one and lose its source/model.
    *
-   * Only instructions loaded while THIS daemon is running are captured. A session
-   * reconstructed by a fresh daemon after a restart starts with none and picks up
-   * only files that (re)load afterward (e.g. load_reason=compact).
+   * Only files loaded while this daemon runs are captured; a session
+   * reconstructed after a restart starts empty and picks up only files that
+   * (re)load afterward (e.g. load_reason=compact).
    */
   private handleInstructionsLoaded(sessionId: string, payload: HookPayload): void {
     const filePath = payload['file_path'] as string | undefined;
@@ -1064,7 +1056,7 @@ export class GlobalDaemon {
     if (session) {
       upsertInstruction(session.systemInstructions, instruction);
     } else {
-      // Session not set up yet — buffer until SessionStart / reconstruct drains it.
+      // Session not set up yet; buffer until SessionStart / reconstruct drains it.
       const pending = this.pendingInstructions.get(sessionId) ?? [];
       upsertInstruction(pending, instruction);
       this.pendingInstructions.set(sessionId, pending);
