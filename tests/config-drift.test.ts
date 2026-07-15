@@ -21,7 +21,7 @@ import { resolveDaemonConfig, daemonConfigFingerprint } from '../src/daemon.ts';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
 const CLI = path.join(REPO_ROOT, 'src', 'cli.ts');
-const WARNING = /⚠ Daemon is running an older config\. Run: weave-claude-code restart/;
+const WARNING = /⚠ Config\s+daemon on an older config/;
 const STRIP = ['WEAVE_PROJECT', 'WANDB_API_KEY', 'WEAVE_AGENT_NAME', 'WANDB_BASE_URL', 'WEAVE_CLAUDE_DEBUG'];
 
 let scratch: string;
