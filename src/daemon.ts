@@ -1516,16 +1516,81 @@ export class GlobalDaemon {
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
   }
 
+  /** The session's open turn span, opening a fresh one if a restart left the
+   *  session without a turn, so a subagent recovered at SubagentStop has a parent. */
+  private getOrReconstructTurnSpan(session: SessionState): Span | undefined {
+    if (session.currentTurnSpan) return session.currentTurnSpan;
+    if (!this.tracer) return undefined;
+    const turnNumber = session.turnNumber || 1;
+    const turnSpan = startTurnSpan(this.tracer, {
+      sessionId: session.sessionId,
+      conversationId: session.conversationId,
+      turnNumber,
+      prompt: '',
+      cwd: session.cwd,
+      source: session.source,
+      pluginVersion: VERSION,
+      agentName: this.agentName,
+      requestModel: session.initialRequestModel,
+      displayName: `Turn ${turnNumber} (reconstructed)`,
+    });
+    session.currentTurnSpan = turnSpan;
+    this.log(
+      'INFO',
+      `Reconstructed turn span (turn ${turnNumber}) after restart trace_id=${turnSpan.spanContext().traceId}`,
+    );
+    return turnSpan;
+  }
+
+  /** Rebuild a subagent tracker when SubagentStop finds none: the subagent started
+   *  under a daemon that has since restarted. Opens an invoke_agent span under the
+   *  turn so the normal emit path records it instead of dropping it. */
+  private recoverSubagentTracker(
+    session: SessionState,
+    agentId: string,
+    payload: HookPayload,
+  ): SubagentTracker | undefined {
+    if (!this.tracer) return undefined;
+    const turnSpan = this.getOrReconstructTurnSpan(session);
+    if (!turnSpan) return undefined;
+    // Type comes from the SubagentStop payload's agent_type; 'unknown' if absent.
+    const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
+    const invokeAgentSpan = startInvokeAgentSpan(this.tracer, turnSpan, {
+      agentType,
+      conversationId: session.conversationId,
+      pluginVersion: VERSION,
+      displayName: `Agent: ${agentType}`,
+    });
+    invokeAgentSpan.setAttribute(ATTR.AGENT_ID, agentId);
+    invokeAgentSpan.setAttribute(
+      ATTR.WEAVE_ORPHAN_REASON,
+      'recovered at SubagentStop after daemon restart (no tracker)',
+    );
+    const tracker: SubagentTracker = {
+      subagentType: agentType,
+      detectedAt: new Date(),
+      agentId,
+      invokeAgentSpan,
+      transcriptPath: computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId),
+    };
+    session.subagents.add(tracker);
+    this.log('INFO', `SubagentStop: recovered subagent agentId=${agentId} type=${agentType} after restart`);
+    return tracker;
+  }
+
   private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
-    const session = this.sessions.get(sessionId);
+    // Reconstruct the session if a restart lost it (see getOrReconstructSession).
+    const session = await this.getOrReconstructSession(sessionId, payload);
     if (!session || !this.tracer) return;
 
     const agentId = payload['agent_id'] as string | undefined;
     if (!agentId) return;
 
-    const tracker = session.subagents.byAgentId(agentId);
+    // No tracker: the subagent started under a since-restarted daemon. Recover it.
+    const tracker = session.subagents.byAgentId(agentId)
+      ?? this.recoverSubagentTracker(session, agentId, payload);
     if (!tracker) {
-      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId}`);
+      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId} and none recoverable`);
       return;
     }
 
@@ -1534,7 +1599,11 @@ export class GlobalDaemon {
     // span (no current turn at SubagentStart), fall back to the turn span.
     const chatParent = tracker.invokeAgentSpan ?? session.currentTurnSpan;
 
-    const agentTranscriptPath = payload['agent_transcript_path'] as string | undefined;
+    // Fall back to the stored or agentId-derived path when the payload omits it.
+    const agentTranscriptPath =
+      (payload['agent_transcript_path'] as string | undefined) ??
+      tracker.transcriptPath ??
+      computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     let model: string | undefined;
     let lastAssistantText: string | undefined;
     if (agentTranscriptPath && chatParent) {
