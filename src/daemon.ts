@@ -294,6 +294,12 @@ type TeamMember = {
  *  each turn root. */
 type LoadedInstruction = { filePath: string; content: string };
 
+/** Defensive cap on instruction-file content read from disk. Real instruction
+ *  files (CLAUDE.md, .claude/rules, @-imports) are a few KB; this only guards a
+ *  pathologically large file from bloating every turn root's
+ *  `gen_ai.system_instructions`. Beyond it we keep a truncated prefix. */
+const MAX_INSTRUCTION_FILE_CHARS = 128 * 1024;
+
 /** Append `item` to `list` in place, replacing any existing entry with the same
  *  filePath so a reloaded file (e.g. `load_reason=compact`) updates rather than
  *  duplicates. Preserves each file's first-seen position. */
@@ -786,7 +792,8 @@ export class GlobalDaemon {
           await this.handleSessionStart(sessionId, payload);
           break;
         case 'InstructionsLoaded':
-          // Purely in-memory accumulation; no async work to await.
+          // Reads the instruction file synchronously off the hook's file_path;
+          // no async work to await.
           this.handleInstructionsLoaded(sessionId, payload);
           break;
         case 'UserPromptSubmit':
@@ -1012,11 +1019,18 @@ export class GlobalDaemon {
   /**
    * Capture a loaded instruction file (global/project CLAUDE.md, .claude/rules,
    * @-import) from the InstructionsLoaded hook and accumulate it on the session
-   * for `gen_ai.system_instructions`. The hook fires per file at session start
-   * and lazily mid-session; its order relative to SessionStart is NOT guaranteed
-   * (verified in daemon logs — a file can load before SessionStart), so
-   * instructions that arrive before the session exists are buffered and drained
-   * when it is created (handleSessionStart / getOrReconstructSession).
+   * for `gen_ai.system_instructions`. The hook is observability-only: it carries
+   * `file_path` (plus memory_type/load_reason/globs) but NOT the file contents,
+   * so we read the file from disk ourselves. The read is synchronous so a
+   * session-start burst accumulates in arrival (= load) order; concurrent async
+   * reads could finish out of order, and these are small local files off Claude
+   * Code's hot path.
+   *
+   * The hook fires per file at session start and lazily mid-session; its order
+   * relative to SessionStart is NOT guaranteed (verified in daemon logs — a file
+   * can load before SessionStart), so instructions that arrive before the
+   * session exists are buffered and drained when it is created
+   * (handleSessionStart / getOrReconstructSession).
    *
    * We deliberately do NOT reconstruct the session from this event:
    * handleSessionStart is idempotent, so a premature reconstruct here would turn
@@ -1028,11 +1042,21 @@ export class GlobalDaemon {
    */
   private handleInstructionsLoaded(sessionId: string, payload: HookPayload): void {
     const filePath = payload['file_path'] as string | undefined;
-    const content = payload['file_content'] as string | undefined;
     const loadReason = (payload['load_reason'] as string | undefined) ?? 'unknown';
-    if (!filePath || !content) {
-      this.log('DEBUG', `InstructionsLoaded ignored (missing file_path/file_content): session=${sessionId}`);
+    if (!filePath) {
+      this.log('DEBUG', `InstructionsLoaded ignored (missing file_path): session=${sessionId}`);
       return;
+    }
+
+    let content: string;
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch (err) {
+      this.log('DEBUG', `InstructionsLoaded: unreadable ${filePath}: ${err}`);
+      return;
+    }
+    if (content.length > MAX_INSTRUCTION_FILE_CHARS) {
+      content = content.slice(0, MAX_INSTRUCTION_FILE_CHARS) + '\n[truncated]';
     }
 
     const instruction: LoadedInstruction = { filePath, content };

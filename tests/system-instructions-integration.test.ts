@@ -4,7 +4,9 @@
 
 // The daemon captures instruction files from the InstructionsLoaded hook and
 // stamps them on every turn root as `gen_ai.system_instructions`. The hook
-// fires per file, and its order relative to SessionStart is NOT guaranteed
+// carries only file_path (not the contents), so the daemon reads each file from
+// disk — these tests write real files and let the daemon read them back. The
+// hook fires per file, and its order relative to SessionStart is NOT guaranteed
 // (verified in daemon logs: a file can load before SessionStart), so
 // instructions arriving before the session exists are buffered and drained when
 // the session is created. These tests drive the real routeEvent entry point (as
@@ -56,8 +58,16 @@ function seedTranscript(sid: string): { dir: string; file: string } {
   return { dir, file };
 }
 
-function instructionsLoaded(sid: string, filePath: string, content: string, loadReason: string) {
-  return { hook_event_name: 'InstructionsLoaded', session_id: sid, file_path: filePath, file_content: content, load_reason: loadReason };
+/** Build an InstructionsLoaded payload the way Claude Code does: content-free,
+ *  carrying only the path. `content` is written to a real file under `dir` keyed
+ *  by `logicalPath`, so re-loading the same logical path rewrites the same file
+ *  (exercising dedup) and the daemon reads the content back from disk. */
+function makeInstructionsLoader(dir: string) {
+  return (sid: string, logicalPath: string, content: string, loadReason: string) => {
+    const filePath = path.join(dir, logicalPath.replace(/[/\\]/g, '_'));
+    fs.writeFileSync(filePath, content);
+    return { hook_event_name: 'InstructionsLoaded', session_id: sid, file_path: filePath, load_reason: loadReason };
+  };
 }
 
 function turnRoots(spans: ReadableSpan[]): ReadableSpan[] {
@@ -70,11 +80,12 @@ test('buffers InstructionsLoaded fired before SessionStart, then accumulates in 
   const { tracer, exporter, provider } = setupTracer();
   const d = makeDaemon(tracer);
   try {
+    const loadInstr = makeInstructionsLoader(dir);
     // Global CLAUDE.md loads BEFORE SessionStart (the real, non-deterministic order).
-    await d.routeEvent(instructionsLoaded(sid, '/home/u/.claude/CLAUDE.md', 'GLOBAL', 'session_start'));
+    await d.routeEvent(loadInstr(sid, '/home/u/.claude/CLAUDE.md', 'GLOBAL', 'session_start'));
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     // Project CLAUDE.md loads AFTER SessionStart.
-    await d.routeEvent(instructionsLoaded(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
+    await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
     await provider.forceFlush();
@@ -99,10 +110,11 @@ test('re-loading the same file replaces its content rather than duplicating', as
   const { tracer, exporter, provider } = setupTracer();
   const d = makeDaemon(tracer);
   try {
+    const loadInstr = makeInstructionsLoader(dir);
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
-    await d.routeEvent(instructionsLoaded(sid, '/x/CLAUDE.md', 'V1', 'session_start'));
+    await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'V1', 'session_start'));
     // Same path reloads (e.g. after compaction) with new content.
-    await d.routeEvent(instructionsLoaded(sid, '/x/CLAUDE.md', 'V2', 'compact'));
+    await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'V2', 'compact'));
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
     await provider.forceFlush();
@@ -124,7 +136,8 @@ test('stamps system instructions on every turn root (no session span to hang the
   const { tracer, exporter, provider } = setupTracer();
   const d = makeDaemon(tracer);
   try {
-    await d.routeEvent(instructionsLoaded(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
+    const loadInstr = makeInstructionsLoader(dir);
+    await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'turn one' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
