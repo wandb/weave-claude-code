@@ -474,6 +474,11 @@ function newSessionState(options: NewSessionStateOptions): SessionState {
 
 export class GlobalDaemon {
   private server?: net.Server;
+  /** Inode of the socket file this daemon bound, recorded at listen() time. On
+   *  shutdown we unlink the socket only if it still has this inode, so a
+   *  slow-draining daemon never deletes a successor that already reclaimed the
+   *  path (which would orphan the successor and spawn a duplicate daemon). */
+  private ownedSocketInode: number | null = null;
   private running = false;
   private lastActivity = Date.now();
   /** Inactivity shutdown threshold. Overridable via WEAVE_INACTIVITY_MS (ms) for
@@ -531,11 +536,10 @@ export class GlobalDaemon {
     // mistake for a live daemon. Routing SIGHUP through shutdown() unlinks it.
     process.on('SIGHUP',  () => void this.shutdown('SIGHUP'));
     // Belt-and-suspenders: catch any non-signal exit (uncaught exception,
-    // process.exit from elsewhere) and remove the inode. Does NOT cover SIGKILL
-    // or OOM — the hook handler's probe handles those at next event.
-    process.on('exit', () => {
-      try { if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath); } catch { /* nothing more we can do */ }
-    });
+    // process.exit from elsewhere) and release our socket inode. Ownership-checked
+    // so we never delete a successor's socket. Does NOT cover SIGKILL or OOM —
+    // the hook handler's probe handles those at next event.
+    process.on('exit', () => this.releaseOwnedSocket());
 
     // Check at most every 60s, but more frequently when the timeout is short
     // (env-overridden for tests) so a low WEAVE_INACTIVITY_MS is honored promptly.
@@ -555,6 +559,19 @@ export class GlobalDaemon {
     });
   }
 
+  /** Unlink the socket file only if it is still the one THIS daemon bound (same
+   *  inode), then relinquish the claim. A slow drain must never delete a
+   *  successor daemon that already reclaimed the path — that orphans the
+   *  successor and makes the next hook cold-start a duplicate. */
+  private releaseOwnedSocket(): void {
+    const owned = this.ownedSocketInode;
+    this.ownedSocketInode = null;
+    if (owned === null) return;
+    try {
+      if (fs.statSync(this.socketPath).ino === owned) fs.unlinkSync(this.socketPath);
+    } catch { /* already gone or unreadable — nothing to release */ }
+  }
+
   /** Create a fresh server and listen once, resolving on success and rejecting
    *  on the first listen error. A new server per attempt — one that errored on
    *  listen cannot be reused. Socket is owner-only (umask 0o077). */
@@ -571,6 +588,8 @@ export class GlobalDaemon {
         process.umask(prevUmask);
         server.removeListener('error', onError);
         this.server = server;
+        // Remember which inode we bound so shutdown only unlinks our own socket.
+        try { this.ownedSocketInode = fs.statSync(this.socketPath).ino; } catch { this.ownedSocketInode = null; }
         resolve();
       });
     });
@@ -2019,6 +2038,11 @@ export class GlobalDaemon {
   private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
+    // Release the socket now, right after we stop accepting — NOT after the
+    // (possibly slow) provider.shutdown() flush below. Otherwise a daemon spawned
+    // during that window binds this path and our late unlink would delete its
+    // live socket. Ownership-checked so we only remove the file we bound.
+    this.releaseOwnedSocket();
     // Backstop: close any queued team-member invoke_agent spans whose teammate
     // never emitted a TeammateIdle (e.g. teammate crashed, or daemon exits
     // mid-triage) so they flush as ended spans instead of leaking.
@@ -2042,9 +2066,6 @@ export class GlobalDaemon {
     }
     for (const session of this.sessions.values()) {
       session.transcript.close();
-    }
-    if (fs.existsSync(this.socketPath)) {
-      fs.unlinkSync(this.socketPath);
     }
   }
 
