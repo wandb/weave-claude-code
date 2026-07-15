@@ -262,6 +262,10 @@ type TurnSpanArgs = {
   agentName: string;
   requestModel?: string;
   displayName?: string;
+  /** Loaded instruction-file contents (global/project CLAUDE.md, .claude/rules,
+   *  @-imports) in load order, stamped as `gen_ai.system_instructions` (one text
+   *  part per file) when non-empty. */
+  systemInstructions?: string[];
 };
 
 /**
@@ -285,6 +289,11 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
   };
   if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
   if (args.displayName) attrs[ATTR.WEAVE_DISPLAY_NAME] = args.displayName;
+  if (args.systemInstructions?.length) {
+    attrs[ATTR.SYSTEM_INSTRUCTIONS] = jsonStr(
+      args.systemInstructions.map((content) => ({ type: 'text', content })),
+    );
+  }
 
   // `weave.integration.*` is not set here — it rides the active session baggage
   // and is stamped on this span (and all children) by
