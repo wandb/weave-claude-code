@@ -1362,6 +1362,10 @@ export class GlobalDaemon {
       responseId: last.responseId,
       finishReasons: finishReason ? [finishReason] : undefined,
       model,
+      // Input is the prefix the response's first line saw; split lines share
+      // the same input, so keying off group[0] avoids counting earlier split
+      // lines of this same response.
+      inputMessages: group[0].inputMessages?.length ? group[0].inputMessages : undefined,
       outputMessages: parts.length ? [{ role: 'assistant', parts }] : undefined,
       endedAt: parseIsoOrNow(last.timestamp),
     });

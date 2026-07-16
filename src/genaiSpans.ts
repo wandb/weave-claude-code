@@ -618,6 +618,7 @@ export function emitChatSpansFromAssistantCalls(
       reasoningTokens: c.reasoningTokens,
       responseId: c.responseId,
       finishReasons: c.finishReason ? [c.finishReason] : undefined,
+      inputMessages: c.inputMessages?.length ? c.inputMessages : undefined,
       outputMessages: c.contentBlocks.length
         ? [{ role: 'assistant', content: assistantBlocksToText(c.contentBlocks), parts: c.contentBlocks }]
         : undefined,

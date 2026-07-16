@@ -25,6 +25,20 @@ export interface AssistantCallDetail {
   contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
   responseId?: string;          // provider message id
   finishReason?: string;        // stop_reason / finish_reason if present
+  inputMessages?: NormalizedMessage[]; // running conversation prefix sent to this call (this turn)
+}
+
+/**
+ * A conversation message normalized for `gen_ai.input.messages`. Mirrors the
+ * output-message shape emitted for assistant responses (`{role, content,
+ * parts}`) so the Weave chat view renders inputs and outputs uniformly.
+ * `parts` carries the raw content blocks (text, tool_use, tool_result, …);
+ * `content` is the flattened text, empty for tool-result-only messages.
+ */
+export interface NormalizedMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  parts?: unknown[];
 }
 
 export interface Turn {
@@ -99,12 +113,22 @@ function readUtf8FromFd(fd: number): string {
 interface AssistantLine {
   line: Record<string, unknown>;
   prevTimestamp?: string;
+  /** Snapshot of the conversation prefix sent to this assistant call — every
+   *  user/assistant message earlier in the same turn, in transcript order. */
+  inputMessages: NormalizedMessage[];
 }
 
 function buildSession(lines: unknown[]): ParsedSession {
   const turns: Turn[] = [];
   let currentAssistantLines: AssistantLine[] = [];
   let prevTimestamp: string | undefined;
+  // Running conversation prefix for the current turn: the user prompt that
+  // opened it, plus each assistant response and tool-result message since.
+  // Reset at every turn boundary so a chat span's `gen_ai.input.messages`
+  // reflects what the model actually received within that turn. Prior turns
+  // are recoverable via `gen_ai.conversation.id` stitching, so we don't carry
+  // them here (which would make every later chat span grow without bound).
+  let history: NormalizedMessage[] = [];
 
   for (const line of lines) {
     const entry = line as Record<string, unknown>;
@@ -114,7 +138,12 @@ function buildSession(lines: unknown[]): ParsedSession {
     const timestamp = entry['timestamp'] as string | undefined;
 
     if (role === 'assistant') {
-      currentAssistantLines.push({ line: entry, prevTimestamp });
+      // Snapshot the prefix BEFORE this response joins the history so the span
+      // records its true input. Split lines of one API response each append
+      // separately; consumers key off the response's first line, so the minor
+      // duplication that implies never reaches a span's own input.
+      currentAssistantLines.push({ line: entry, prevTimestamp, inputMessages: [...history] });
+      history.push(normalizeMessage('assistant', message?.['content']));
     } else if (role === 'user') {
       const rawContent = message?.['content'];
       const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
@@ -124,7 +153,11 @@ function buildSession(lines: unknown[]): ParsedSession {
       if (hasText && currentAssistantLines.length > 0) {
         turns.push(buildTurn(currentAssistantLines));
         currentAssistantLines = [];
+        history = [];
       }
+      // Add the user message (turn-opening prompt or mid-turn tool_result) to
+      // the prefix the next assistant call will see.
+      history.push(normalizeMessage('user', rawContent));
     }
 
     if (timestamp) prevTimestamp = timestamp;
@@ -137,8 +170,23 @@ function buildSession(lines: unknown[]): ParsedSession {
   return { turns };
 }
 
+/**
+ * Normalize a transcript message's `content` into a `NormalizedMessage`.
+ * `content` is a bare string (legacy), an array of content blocks, or missing.
+ * Text is flattened via `extractAssistantTextBlocks` (which also reads the
+ * `{type:'text'}` blocks user messages use); the raw blocks are preserved as
+ * `parts` so tool_use / tool_result payloads survive.
+ */
+function normalizeMessage(role: 'user' | 'assistant', rawContent: unknown): NormalizedMessage {
+  if (typeof rawContent === 'string') return { role, content: rawContent };
+  if (Array.isArray(rawContent)) {
+    return { role, content: extractAssistantTextBlocks(rawContent).join('\n'), parts: rawContent };
+  }
+  return { role, content: '' };
+}
+
 function buildTurn(assistantLines: AssistantLine[]): Turn {
-  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
+  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp, inputMessages }) => {
     const message = line['message'] as Record<string, unknown> | undefined;
     const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
     const usage = rawToUsageSummary(rawUsage);
@@ -167,6 +215,7 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
       contentBlocks,
       responseId,
       finishReason: stopReason,
+      inputMessages,
     };
   });
 
