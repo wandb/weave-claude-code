@@ -56,7 +56,7 @@ function makeTranscript(sessionId: string): { file: string; append: (line: unkno
 interface Harness {
   handleSessionStart(s: string, p: Record<string, unknown>): Promise<void>;
   handleUserPromptSubmit(s: string, p: Record<string, unknown>): Promise<void>;
-  handlePreToolUse(s: string, a: string | undefined, p: Record<string, unknown>): Promise<void>;
+  handlePreToolUse(s: string, p: Record<string, unknown>): Promise<void>;
   handlePostToolUse(s: string, p: Record<string, unknown>): Promise<void>;
   handleSessionEnd(s: string, p: Record<string, unknown>): Promise<void>;
   drain(reason: string): Promise<void>;
@@ -77,7 +77,7 @@ async function openTurnWithOneCompletedTool(d: Harness, sid: string, append: (l:
   await d.handleUserPromptSubmit(sid, { prompt: 'do the thing' });
   append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'reading' }));
   append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Read', input: {} }, 'tool_use'));
-  await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Read', tool_input: { file_path: '/foo' } });
+  await d.handlePreToolUse(sid, { tool_use_id: 'tool_1', tool_name: 'Read', tool_input: { file_path: '/foo' } });
   await d.handlePostToolUse(sid, { tool_use_id: 'tool_1', tool_response: 'ok' });
 }
 
@@ -124,7 +124,7 @@ test('daemon shutdown ends an open subagent invoke_agent span under the same tra
     // Agent tool with subagent_type opens a nested invoke_agent span that a
     // mid-flight shutdown would otherwise leave open.
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'tool_use', id: 'agent_1', name: 'Agent', input: { subagent_type: 'code-reviewer', prompt: 'review' } }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'agent_1', tool_name: 'Agent', tool_input: { subagent_type: 'code-reviewer', prompt: 'review' } });
+    await d.handlePreToolUse(sid, { tool_use_id: 'agent_1', tool_name: 'Agent', tool_input: { subagent_type: 'code-reviewer', prompt: 'review' } });
 
     await d.drain('SIGTERM');
     await provider.forceFlush();
