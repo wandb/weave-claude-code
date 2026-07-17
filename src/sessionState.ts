@@ -20,12 +20,9 @@ export type PendingToolCall = {
   permissionRequested?: boolean;
 }
 
-/** Tracks the chat span (LLM) currently open for a single assistant API
- *  response. Tool spans the model called parent here so the trace tree shows
- *  them nested under the response. The response's text/thinking blocks become
- *  ordered `gen_ai.output.messages` parts on this span, set when it is
- *  finalized (at the next response transition or at Stop), once all its split
- *  transcript lines are present. */
+/** The chat span (LLM) open for the in-flight assistant response; its tool
+ *  spans parent here. Content lands when it is finalized (next response
+ *  transition, or Stop), once all its transcript lines are flushed. */
 type ActiveChat = {
   /** Response key (Anthropic `message.id`, or index fallback) this chat span
    *  represents; see `chatMessageKey`. */
@@ -42,7 +39,7 @@ export function resolvePermissionIfPending(pending: PendingToolCall, approved: b
   });
 }
 
-/** sha256 of the firing prompt, used to correlate an `Agent` PreToolUse with
+/** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
  *  the subagent's SubagentStart by matching transcript content. */
 export function hashPrompt(prompt: string): string {
   return sha256Hex(prompt);
@@ -126,14 +123,12 @@ export async function readSubagentFirstLineWithRetry(
 }
 
 /**
- * Tracks a subagent (its own `invoke_agent` span under the parent turn, chat and
- * tool spans nested beneath) across hook events. Two shapes:
- *   (a) Matched: created at PreToolUse from the spawning Agent tool; `agentId`
- *       is filled in at SubagentStart by content correlation (sha256(firing
- *       prompt) + subagent_type).
- *   (b) Orphan: created at SubagentStart when no tracker matches (the parent's
- *       Agent PreToolUse never fired), with no input messages.
- * (Marker, not execute_tool: see the Agent-dispatch branch in handlePreToolUse.)
+ * Tracks a subagent across hook events. Matched trackers are created at
+ * PreToolUse(Agent) and correlated to an agent_id at SubagentStart by
+ * sha256(firing prompt) + type; orphans are created at SubagentStart when
+ * nothing matches. Either way the subagent is its own `invoke_agent` span
+ * under the turn, with its chat/tool spans nested beneath it (why a marker
+ * and not `execute_tool`: see handlePreToolUse's Agent-dispatch branch).
  */
 export type SubagentTracker = {
   subagentType: string;
@@ -147,29 +142,23 @@ export type SubagentTracker = {
   /** True once the invoke_agent span has been ended. Guards against
    *  double-end when PostToolUse and SubagentStop both try to close it. */
   ended?: boolean;
-  /** Subagent transcript path, stored at SubagentStart so TeammateIdle can
-   *  read all turns without relying on the payload's transcript_path (which
-   *  CC sets to the coordinator's path, not the subagent's). */
+  /** Stored at SubagentStart; TeammateIdle's own transcript_path is the
+   *  coordinator's, so this is the reliable copy. */
   transcriptPath?: string;
-  /** Set on orphan trackers when SubagentStop fires before TeammateIdle.
-   *  Suppresses span closure at SubagentStop so TeammateIdle can close it
-   *  with full all-turns content. */
+  /** Orphan awaiting TeammateIdle: SubagentStop leaves the span open so
+   *  TeammateIdle can close it with full all-turns content. */
   pendingTeammateIdle?: boolean;
-  /** Set when this Agent tool spawn carried a `team_name`. The teammate runs in
-   *  its own session, so its TeammateIdle fires under a different session_id and
-   *  the per-session lookup misses; the invoke_agent span is registered in
-   *  GlobalDaemon.teamMembers and closed there, not at PostToolUse(Agent). */
+  /** Set for `team_name` spawns: the marker is owned by
+   *  GlobalDaemon.teamMembers and closed at the teammate's TeammateIdle,
+   *  NOT at the coordinator's PostToolUse(Agent). */
   teamName?: string;
 }
 
-/** Cross-session team correlation. A team teammate runs as its own Claude
- *  session whose TeammateIdle fires under the teammate's session_id, not the
- *  coordinator's, so the per-session SubagentTracking lookup misses. The
- *  coordinator's PreToolUse(Agent, team_name) is the one reliable anchor; its
- *  invoke_agent span is recorded here keyed by `${team_name}::${name}`. Stored
- *  as a FIFO queue per key because the same key can be spawned more than once in
- *  a run; each TeammateIdle consumes the oldest not-yet-emitted entry so
- *  re-spawns don't overwrite a live span. */
+/** One queued team-member spawn. A teammate is an independent session whose
+ *  TeammateIdle fires under its OWN session_id, so the coordinator's
+ *  PreToolUse(Agent, team_name) is the only reliable anchor: it queues the
+ *  marker in GlobalDaemon.teamMembers (FIFO per `${team}::${name}` — the same
+ *  name can be re-spawned; overwriting would leak the first, still-open span). */
 export type TeamMember = {
   subAgent: weave.SubAgent;
   /** Coordinator's Conversation handle. The teammate's own turn trace starts
@@ -182,7 +171,7 @@ export type TeamMember = {
 
 export type SessionState = {
   sessionId: string;
-  /** Root ancestor's session id, used as `gen_ai.conversation.id` so resumed
+  /** Root ancestor's session id — used as `gen_ai.conversation.id` so resumed
    *  turns stitch with their pre-resume turns server-side. Equals `sessionId`
    *  for fresh (non-forked) sessions. Resolved once at SessionStart by
    *  walking `forkedFrom.sessionId` pointers across transcript files. */
@@ -192,12 +181,9 @@ export type SessionState = {
   source: string;
   initialRequestModel?: string;
 
-  /** The session's Conversation handle. Seeds `gen_ai.conversation.id`, the
-   *  agent identity, and the integration attributes (name, version, meta.*,
-   *  built at session creation) onto every turn started from it, and via the
-   *  handle chain onto all child spans. No ambient state involved, so events in
-   *  separate `runIsolated` frames still inherit everything. Unset when tracing
-   *  is disabled. */
+  /** Conversation handle: seeds conversation.id, agent identity, and the
+   *  integration attributes onto every turn (and, via the handle chain, all
+   *  children) regardless of runIsolated frame. Unset when tracing is off. */
   conversation?: weave.Conversation;
 
   currentTurn?: weave.Turn;
@@ -214,10 +200,8 @@ export type SessionState = {
    *  Tool spans from PreToolUse parent here; finalized at Stop or on transition
    *  to the next API call. Cleared at Stop. */
   activeChat?: ActiveChat;
-  /** Response keys (see `chatMessageKey`) in the current turn for which a chat
-   *  span has been opened (open or already finalized). Stop uses this to
-   *  identify responses that need a chat span emitted from scratch (responses
-   *  with no tool_use blocks never triggered PreToolUse). Reset per turn. */
+  /** Response keys with a chat span already opened this turn; Stop emits
+   *  fresh spans for the rest (tool-less responses never hit PreToolUse). */
   emittedChatSpanResponseKeys: Set<string>;
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
@@ -242,12 +226,8 @@ export class SubagentTracking {
     this.trackers.push(tracker);
   }
 
-  /**
-   * Find the unmatched tracker (no agent_id yet) matching `(promptHash,
-   * subagentType)`. FIFO across ties: the oldest pending tracker wins, so two
-   * back-to-back identical Agent calls still correlate in dispatch order.
-   * Returns undefined if no candidate qualifies.
-   */
+  /** Oldest unmatched tracker (no agent_id yet) for `(promptHash, type)` —
+   *  FIFO so back-to-back identical Agent calls correlate in dispatch order. */
   findUnmatchedByContent(promptHash: string, subagentType: string): SubagentTracker | undefined {
     let best: SubagentTracker | undefined;
     for (const t of this.trackers) {
@@ -263,9 +243,7 @@ export class SubagentTracking {
     return this.trackers.find(t => t.agentId === agentId);
   }
 
-  /** Find a tracker awaiting TeammateIdle by its subagentType. Used to
-   *  correlate TeammateIdle(teammate_name) with the orphan tracker created
-   *  at SubagentStart. Returns the oldest pending match (FIFO). */
+  /** Oldest tracker awaiting TeammateIdle for this subagentType (FIFO). */
   findPendingTeammateIdle(subagentType: string): SubagentTracker | undefined {
     let best: SubagentTracker | undefined;
     for (const t of this.trackers) {
@@ -276,10 +254,7 @@ export class SubagentTracking {
     return best;
   }
 
-  /** Lookup by spawning Agent tool's tool_use_id. Used at PostToolUse to find
-   *  the subagent's `invoke_agent` span when the matching toolUseId is not
-   *  in `pendingToolCalls` (because the Agent tool emits an invoke_agent
-   *  span instead of an execute_tool span). */
+  /** Lookup by the spawning Agent tool's tool_use_id (PostToolUse settle). */
   byToolUseId(toolUseId: string): SubagentTracker | undefined {
     return this.trackers.find(t => t.toolUseId === toolUseId);
   }
@@ -320,11 +295,8 @@ type NewSessionStateOptions = {
 export function newSessionState(options: NewSessionStateOptions): SessionState {
   const { sessionId, conversationId, transcript, cwd, source, initialRequestModel, turnNumber } =
     options;
-  // Claude Code stamps its CLI version on each transcript line; capture it
-  // best-effort from the head line for the integration metadata. Absent when
-  // the writer hasn't flushed yet, the meta key is simply omitted. Built
-  // here (not at the SessionStart call site) so a session reconstructed after
-  // a daemon restart carries the same integration identity on its spans.
+  // Best-effort CC CLI version from the transcript head line; built here so a
+  // reconstructed session carries the same integration identity.
   const headLine = readFirstTranscriptLine(transcript.resolvedPath);
   const version = headLine?.['version'];
   const claudeCodeAppVersion = typeof version === 'string' ? version : undefined;

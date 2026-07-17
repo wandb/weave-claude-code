@@ -2,25 +2,19 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Attribute-key constants, formatting helpers, and thin span-shaping helpers
-// typed against the `weave` SDK. Span construction/lifecycle lives with the
-// SDK handles: conversations start in sessionState.ts, turns/tools/subagents
-// in daemon.ts, and chat (LLM) spans via chatSpans.ts.
+// Attribute-key constants and formatting helpers. Span construction lives
+// with the SDK handles: conversations start in sessionState.ts, everything
+// else in daemon.ts.
 
 import type { Attributes } from '@opentelemetry/api';
 import type { MessagePart, Tool, Turn, Usage } from 'weave';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
 import type { UsageSummary } from './parser.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Attribute keys
-//
-// Canonical `gen_ai.*` keys come from the OTel GenAI semantic conventions
-// (https://github.com/open-telemetry/semantic-conventions-genai). `weave.*` keys are
-// Claude-Code-specific extensions with no semconv equivalent. Compaction keys
-// (`weave.compaction.*`) match the Weave Agents backend's semconv exactly -
-// the backend extracts them into dedicated span columns.
-// ─────────────────────────────────────────────────────────────────────────────
+// Attribute keys: `gen_ai.*` from the OTel GenAI semconv
+// (https://github.com/open-telemetry/semantic-conventions-genai); `weave.*`
+// are Claude-Code-specific extensions the backend routes into its queryable
+// custom-attribute maps (compaction keys get dedicated columns).
 
 export const ATTR = {
   // GenAI semconv - classification
@@ -60,21 +54,15 @@ export const ATTR = {
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
-  // Integration identity - attributes the trace to the emitting integration
-  // (this plugin) so the Weave Agents backend can group/filter by integration
-  // alongside peers (weave-openclaw, the playground's `weave.source`). Distinct
-  // from `gen_ai.agent.name`, which is user-overridable and changes per
-  // subagent. These are non-semconv `weave.*` keys, so the backend routes them
-  // into its queryable custom-attribute maps. Installed on the session's
-  // conversation so the SDK copies them onto every span; `meta.*` keys (built
-  // with WEAVE_INTEGRATION_META_PREFIX) carry free-form per-session context.
+  // Integration identity: attributes the trace to this plugin, alongside
+  // peers like weave-openclaw. Unlike gen_ai.agent.name it is not
+  // user-overridable and never changes per subagent. Set on the session's
+  // conversation so the SDK copies it onto every span.
   WEAVE_INTEGRATION_NAME: 'weave.integration.name',
   WEAVE_INTEGRATION_VERSION: 'weave.integration.version',
 
-  // Back-pointer from a subagent `invoke_agent` span to the parent agent's
-  // `Agent` tool call that spawned it. Set on the inner `invoke_agent` span
-  // so queries can correlate the subagent invocation with the spawning
-  // tool_use_id without walking the span tree.
+  // Back-pointer from a subagent's invoke_agent span to the tool_use_id of
+  // the Agent call that spawned it (correlation without walking the tree).
   WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID: 'weave.claude_code.subagent.spawning_tool_call_id',
 
   // Weave Agents backend - compaction (set as span attributes on the turn span;
@@ -90,28 +78,14 @@ export const ATTR = {
   EVT_PERMISSION_SUGGESTIONS: 'weave.permission.suggestions',
 } as const;
 
-/**
- * Default name for the top-level agent: the value shown in Weave's Agents
- * view and stamped as `gen_ai.agent.name` on every turn span. Users can
- * override it (settings `agent_name` / `WEAVE_AGENT_NAME`); this is the
- * fallback when neither is set.
- */
+/** Top-level `gen_ai.agent.name` fallback; users override via settings
+ *  `agent_name` / `WEAVE_AGENT_NAME`. */
 export const DEFAULT_AGENT_NAME = 'claude-code';
 
-/**
- * Stable identifier for this integration, stamped as `weave.integration.name`
- * on every turn span. Unlike the agent name (`gen_ai.agent.name`), it is not
- * user-overridable and does not change for subagents, so it's a reliable
- * dimension for "which integration produced this trace" in the Weave Agents
- * backend.
- */
 const INTEGRATION_NAME = 'weave-claude-code';
 
-/**
- * Prefix for free-form integration metadata. Each entry of a session's
- * `integrationMeta` is stamped as `weave.integration.meta.<key>`, so new
- * fields (e.g. `claude_code_app_version`) need no new attribute constant.
- */
+/** Free-form integration metadata prefix: new fields (e.g.
+ *  `claude_code_app_version`) need no new attribute constant. */
 const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,8 +114,8 @@ export function jsonStr(v: unknown): string {
   }
 }
 
-/** `gen_ai.output.messages` JSON for plain assistant text(s), the shape used on
- *  turn and subagent `invoke_agent` spans (chat spans carry parts instead). */
+/** `gen_ai.output.messages` JSON for plain assistant text(s) — the shape used
+ *  on turn and subagent `invoke_agent` spans (chat spans carry parts instead). */
 export function assistantOutputMessages(texts: string[]): string {
   return jsonStr(texts.map((content) => ({ role: 'assistant', content })));
 }
@@ -153,13 +127,8 @@ export function parseTimestamp(ts: string | undefined): Date | undefined {
   return Number.isFinite(d.getTime()) ? d : undefined;
 }
 
-/**
- * Build the per-session integration attributes. `version` is the plugin
- * version; `meta` is free-form per-session context flattened to
- * `weave.integration.meta.<key>` (falsy values skipped). Installed on the
- * session's conversation so the SDK stamps them onto every span the session
- * emits (turn root and all children).
- */
+/** Per-session integration attributes; `meta` flattens to
+ *  `weave.integration.meta.<key>` (falsy values skipped). */
 export function buildIntegrationAttrs(args: {
   version: string;
   meta?: Record<string, string | undefined>;
@@ -176,12 +145,9 @@ export function buildIntegrationAttrs(args: {
   return attrs;
 }
 
-/**
- * Map Claude assistant content blocks to ordered `MessagePart`s for a chat
- * span's `gen_ai.output.messages`, preserving transcript order so the model's
- * natural interleave (text, tool_use, text) is visible in the Weave UI. Empty
- * text/thinking blocks are skipped.
- */
+/** Map assistant content blocks to ordered `MessagePart`s (text → text,
+ *  thinking/redacted → reasoning, tool_use → tool_call; empties skipped), so
+ *  the model's natural interleave survives into `gen_ai.output.messages`. */
 export function contentBlocksToParts(blocks: unknown[]): MessagePart[] {
   const parts: MessagePart[] = [];
   for (const block of blocks) {
@@ -205,14 +171,10 @@ export function contentBlocksToParts(blocks: unknown[]): MessagePart[] {
   return parts;
 }
 
-/**
- * Build a `weave.Usage` from Anthropic's per-call usage. OTel `inputTokens` is
- * the total prompt; Anthropic splits it into three disjoint fields (uncached +
- * cache_read + cache_creation), so sum them.
- * https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md
- * Cache and reasoning fields are set only when present so a call without them
- * doesn't emit zero-valued attributes.
- */
+/** Anthropic usage → `weave.Usage`. OTel inputTokens is the TOTAL prompt, so
+ *  sum Anthropic's three disjoint fields (uncached + cache_read +
+ *  cache_creation); optional fields are set only when present.
+ *  https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md */
 export function buildUsage(usage: UsageSummary, reasoningTokens?: number): Usage {
   const out: Usage = {
     inputTokens:
@@ -261,16 +223,9 @@ export interface CompactionAttrs {
   itemsAfter?: number;
 }
 
-/**
- * Stamp `weave.compaction.*` attributes onto a turn span. The Weave Agents
- * backend extracts these into dedicated columns (`compaction_summary`,
- * `compaction_items_before`, `compaction_items_after`) and renders a
- * "context_compacted" card in the chat view.
- *
- * Compaction is a session-level event, but with no session span it attaches to
- * the turn span open when compaction fires, or to the next turn span when
- * compaction fires between turns.
- */
+/** Stamp `weave.compaction.*` onto a turn (the backend renders a
+ *  context_compacted card). Compaction is session-level, but with no session
+ *  span it rides the open turn — or the next one, between turns. */
 export function setCompactionAttrs(turn: Turn, attrs: CompactionAttrs): void {
   const out: Attributes = {};
   if (attrs.summary !== undefined) out[ATTR.COMPACTION_SUMMARY] = attrs.summary;
