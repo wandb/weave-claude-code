@@ -12,21 +12,14 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { flushWeave, initWeaveInMemory, makeGenaiDaemon, spanParentId } from './helpers.ts';
-
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
-function userLine(text: string): string {
-  return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } });
-}
-function assistantLine(text: string, usage: Record<string, number>): string {
-  return JSON.stringify({
-    type: 'assistant',
-    message: { role: 'assistant', model: 'claude-opus-4-8', id: 'm1', usage, stop_reason: 'end_turn', content: [{ type: 'text', text }] },
-  });
-}
+import {
+  flushWeave,
+  initWeaveInMemory,
+  makeGenaiDaemon,
+  spanParentId,
+  transcriptAssistantLine,
+  transcriptUserLine,
+} from './helpers.ts';
 
 test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_agent + chat with tokens', async () => {
   const exporter = await initWeaveInMemory();
@@ -37,14 +30,14 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
 
   // Main transcript: the in-progress turn the subagent ran under, already on disk.
   const mainPath = path.join(dir, `${sid}.jsonl`);
-  fs.writeFileSync(mainPath, userLine('spawn a subagent') + '\n' + assistantLine('working', { input_tokens: 10, output_tokens: 5 }) + '\n');
+  fs.writeFileSync(mainPath, transcriptUserLine('spawn a subagent') + '\n' + transcriptAssistantLine('working', { input_tokens: 10, output_tokens: 5 }) + '\n');
 
   // Subagent transcript where the daemon derives it (agentId-based sibling dir).
   const subPath = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
   fs.mkdirSync(path.dirname(subPath), { recursive: true });
-  fs.writeFileSync(subPath, userLine('do the subtask') + '\n' + assistantLine('subtask done', { input_tokens: 200, output_tokens: 40 }) + '\n');
+  fs.writeFileSync(subPath, transcriptUserLine('do the subtask') + '\n' + transcriptAssistantLine('subtask done', { input_tokens: 200, output_tokens: 40 }) + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     // Fresh daemon that only sees the subagent's completion, not its start.
     await d.routeEvent({
@@ -95,12 +88,12 @@ test('recovery reuses an already-open turn span instead of creating a spurious s
   const agentId = 'b1234567890abcdef';
 
   const mainPath = path.join(dir, `${sid}.jsonl`);
-  fs.writeFileSync(mainPath, userLine('start') + '\n');
+  fs.writeFileSync(mainPath, transcriptUserLine('start') + '\n');
   const subPath = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
   fs.mkdirSync(path.dirname(subPath), { recursive: true });
-  fs.writeFileSync(subPath, userLine('subtask') + '\n' + assistantLine('done', { input_tokens: 50, output_tokens: 7 }) + '\n');
+  fs.writeFileSync(subPath, transcriptUserLine('subtask') + '\n' + transcriptAssistantLine('done', { input_tokens: 50, output_tokens: 7 }) + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     // UserPromptSubmit reconstructs the session and opens a turn first; recovery
     // must nest under that existing turn, not create a second one.

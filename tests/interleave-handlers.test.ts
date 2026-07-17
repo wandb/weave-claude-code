@@ -21,10 +21,6 @@ import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { ATTR } from '../src/genaiSpans.ts';
 import { childrenOf, flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 const USAGE = { input_tokens: 100, output_tokens: 1508, cache_read_input_tokens: 400 };
 
 function aLine(id: string, ts: string, block: Record<string, unknown>, stop?: string) {
@@ -74,7 +70,7 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do the thing' });
@@ -126,7 +122,7 @@ test('handlers: a new response transitions and finalizes the previous chat span'
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do two things'));
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do two things' });
@@ -169,7 +165,7 @@ test('handlers: SessionEnd finalizes a still-open chat span with its output + us
   const { file, append, dir } = makeTranscript(sid);
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do the thing' });

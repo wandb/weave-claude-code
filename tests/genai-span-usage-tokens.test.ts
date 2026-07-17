@@ -28,10 +28,6 @@ import type { InMemorySpanExporter, ReadableSpan } from '@opentelemetry/sdk-trac
 import { ATTR } from '../src/genaiSpans.ts';
 import { flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 function aLine(id: string, ts: string, text: string, usage: Record<string, number>) {
   return {
     type: 'assistant',
@@ -53,7 +49,7 @@ async function chatSpanForUsage(exporter: InMemorySpanExporter, sid: string, usa
     JSON.stringify(userText('2026-01-01T00:00:00Z', 'do it')),
     JSON.stringify(aLine('msgA', '2026-01-01T00:00:01Z', 'all done', usage)),
   ].join('\n') + '\n');
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });

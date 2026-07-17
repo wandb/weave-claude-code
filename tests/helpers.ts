@@ -142,15 +142,54 @@ export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   return genaiExporter;
 }
 
+/** The daemon surface the genai tests drive: the (private) routeEvent entry
+ *  point production feeds from the socket, plus drain for shutdown tests. */
+export type DaemonDriver = {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
+  drain(reason: string): Promise<void>;
+};
+
 /** Construct a GlobalDaemon with tracing marked enabled (the SDK is already
- *  initialised via `initWeaveInMemory`), skipping the real socket/`start()`. */
-export function makeGenaiDaemon(agentName = 'claude-code'): GlobalDaemon {
+ *  initialised via `initWeaveInMemory`), skipping the real socket/`start()`,
+ *  viewed through the {@link DaemonDriver} test seam. */
+export function makeGenaiDaemon(agentName = 'claude-code'): DaemonDriver {
   const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
   const d = new GlobalDaemon('/tmp/unused.sock', logFile, {
     weaveProject: 'e/p', apiKey: 'k', baseUrl: 'https://x', agentName, debug: false,
   });
   (d as unknown as { tracingEnabled: boolean }).tracingEnabled = true;
-  return d;
+  return d as unknown as DaemonDriver;
+}
+
+/** One JSONL transcript line for a user text message. `version` mirrors the
+ *  CC CLI version stamp real transcripts carry on their head line. */
+export function transcriptUserLine(text: string, opts: { version?: string; timestamp?: string } = {}): string {
+  return JSON.stringify({
+    type: 'user',
+    ...(opts.version ? { version: opts.version } : {}),
+    ...(opts.timestamp ? { timestamp: opts.timestamp } : {}),
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  });
+}
+
+/** One JSONL transcript line for a single-text assistant response. */
+export function transcriptAssistantLine(
+  text: string,
+  usage: Record<string, number>,
+  opts: { id?: string; model?: string; timestamp?: string } = {},
+): string {
+  return JSON.stringify({
+    type: 'assistant',
+    ...(opts.timestamp ? { timestamp: opts.timestamp } : {}),
+    message: {
+      role: 'assistant',
+      id: opts.id ?? 'm1',
+      model: opts.model ?? 'claude-opus-4-8',
+      usage,
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text }],
+    },
+  });
 }
 
 /** Flush any spans buffered in the SDK so the in-memory exporter has them. */

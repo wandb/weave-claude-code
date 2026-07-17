@@ -22,10 +22,6 @@ import * as path from 'node:path';
 import { VERSION } from '../src/setup.ts';
 import { flushWeave, initWeaveInMemory, makeGenaiDaemon, spanParentId } from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 const USAGE = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0 };
 
 function userText(ts: string, text: string, version: string) {
@@ -56,7 +52,7 @@ test('integration identity stamps weave.integration.* on every span (turn, chat,
   // First transcript line carries the CC CLI version (real CC transcripts do).
   fs.appendFileSync(file, JSON.stringify(userText('2026-01-01T00:00:00.000Z', 'do it', '1.2.3')) + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });

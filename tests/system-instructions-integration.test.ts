@@ -20,19 +20,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { ATTR } from '../src/genaiSpans.ts';
-import { flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
-
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
+import { flushWeave, initWeaveInMemory, makeGenaiDaemon, transcriptUserLine } from './helpers.ts';
 
 /** Seed a transcript file with a single user line (the first line carries the
  *  CC CLI version, as real transcripts do) and return its path. */
 function seedTranscript(sid: string): { dir: string; file: string } {
   const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-sysinstr-'));
   const file = path.join(dir, `${sid}.jsonl`);
-  const userLine = { type: 'user', version: '1.2.3', timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } };
-  fs.writeFileSync(file, JSON.stringify(userLine) + '\n');
+  fs.writeFileSync(file, transcriptUserLine('hi', { version: '1.2.3', timestamp: '2026-01-01T00:00:00.000Z' }) + '\n');
   return { dir, file };
 }
 
@@ -57,7 +52,7 @@ test('buffers InstructionsLoaded fired before SessionStart, then accumulates in 
   exporter.reset();
   const sid = 'sess-order';
   const { dir, file } = seedTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     const loadInstr = makeInstructionsLoader(dir);
     // Global CLAUDE.md loads BEFORE SessionStart (the real, non-deterministic order).
@@ -88,7 +83,7 @@ test('re-loading the same file replaces its content rather than duplicating', as
   exporter.reset();
   const sid = 'sess-dedup';
   const { dir, file } = seedTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     const loadInstr = makeInstructionsLoader(dir);
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
@@ -115,7 +110,7 @@ test('stamps system instructions on every turn root (no session span to hang the
   exporter.reset();
   const sid = 'sess-multiturn';
   const { dir, file } = seedTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     const loadInstr = makeInstructionsLoader(dir);
     await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
@@ -142,7 +137,7 @@ test('omits gen_ai.system_instructions when no instructions were loaded', async 
   exporter.reset();
   const sid = 'sess-none';
   const { dir, file } = seedTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });

@@ -15,22 +15,19 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ATTR } from '../src/genaiSpans.ts';
-import { flushWeave, initWeaveInMemory, makeGenaiDaemon, spanParentId } from './helpers.ts';
+import {
+  flushWeave,
+  initWeaveInMemory,
+  makeGenaiDaemon,
+  spanParentId,
+  transcriptAssistantLine,
+  transcriptUserLine,
+} from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
-function userLine(text: string): string {
-  return JSON.stringify({ type: 'user', version: '1.2.3', timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text }] } });
-}
-function assistantLine(text: string, usage: Record<string, number>): string {
-  return JSON.stringify({
-    type: 'assistant',
-    timestamp: '2026-01-01T00:00:05.000Z',
-    message: { role: 'assistant', model: 'claude-opus-4-8', id: 'm1', usage, stop_reason: 'end_turn', content: [{ type: 'text', text }] },
-  });
-}
+const userLine = (text: string): string =>
+  transcriptUserLine(text, { version: '1.2.3', timestamp: '2026-01-01T00:00:00.000Z' });
+const assistantLine = (text: string, usage: Record<string, number>): string =>
+  transcriptAssistantLine(text, usage, { timestamp: '2026-01-01T00:00:05.000Z' });
 
 test('matched subagent: tools and chats nest under its invoke_agent marker with full identity', async () => {
   const exporter = await initWeaveInMemory();
@@ -48,7 +45,7 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
   fs.mkdirSync(path.dirname(subPath), { recursive: true });
   fs.writeFileSync(subPath, userLine(firingPrompt) + '\n' + assistantLine('found it', { input_tokens: 120, output_tokens: 30 }) + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: coordPath, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'kick off' });

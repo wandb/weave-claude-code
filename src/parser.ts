@@ -28,7 +28,6 @@ export interface AssistantCallDetail {
 }
 
 export interface Turn {
-  totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
   textBlocks(): string[];
   assistantCalls(): AssistantCallDetail[];
@@ -44,15 +43,6 @@ function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
     output_tokens: raw['output_tokens'] ?? 0,
     cache_read_input_tokens: raw['cache_read_input_tokens'],
     cache_creation_input_tokens: raw['cache_creation_input_tokens'],
-  };
-}
-
-function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
-  return {
-    input_tokens: a.input_tokens + b.input_tokens,
-    output_tokens: a.output_tokens + b.output_tokens,
-    cache_read_input_tokens: (a.cache_read_input_tokens ?? 0) + (b.cache_read_input_tokens ?? 0),
-    cache_creation_input_tokens: (a.cache_creation_input_tokens ?? 0) + (b.cache_creation_input_tokens ?? 0),
   };
 }
 
@@ -167,17 +157,11 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
     };
   });
 
-  const totalUsageValue = calls.reduce<UsageSummary>(
-    (acc, call) => addUsage(acc, call.usage),
-    { input_tokens: 0, output_tokens: 0 },
-  );
-
   const model = calls.filter(call => call.model).at(-1)?.model;
 
   const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
 
   return {
-    totalUsage: () => totalUsageValue,
     primaryModel: () => model,
     textBlocks: () => texts,
     assistantCalls: () => calls,

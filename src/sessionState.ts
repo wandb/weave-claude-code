@@ -4,7 +4,6 @@
 
 import * as path from 'path';
 import { createHash } from 'crypto';
-import type { Attributes } from '@opentelemetry/api';
 import * as weave from 'weave';
 import { VERSION } from './setup.js';
 import { parseSessionFd, extractAssistantTextBlocks, isTextBlock } from './parser.js';
@@ -27,7 +26,7 @@ export type PendingToolCall = {
  *  ordered `gen_ai.output.messages` parts on this span, set when it is
  *  finalized (at the next response transition or at Stop), once all its split
  *  transcript lines are present. */
-export type ActiveChat = {
+type ActiveChat = {
   /** Response key (Anthropic `message.id`, or index fallback) this chat span
    *  represents; see `chatMessageKey`. */
   responseKey: string;
@@ -186,12 +185,11 @@ export type SubagentTracker = {
  *  mirrors SubagentTracking.findPendingTeammateIdle for the per-session path. */
 export type TeamMember = {
   subAgent: weave.SubAgent;
-  conversationId: string;
+  /** Coordinator's Conversation handle. The teammate's own turn trace starts
+   *  from it so the coordinator's conversation.id and integration identity
+   *  (which don't inherit cross-session) seed the teammate's span subtree. */
+  conversation: weave.Conversation;
   coordinatorTranscriptPath: string;
-  /** Coordinator's integration identity, re-stamped on the teammate's own
-   *  turn+chat spans (which are created cross-session, outside the
-   *  coordinator's ambient conversation, so they don't inherit it). */
-  integrationAttrs: Attributes;
   emitted: boolean;
 }
 
@@ -206,18 +204,13 @@ export type SessionState = {
   cwd: string;
   source: string;
   initialRequestModel?: string;
-  /** Integration identity (name, version, meta.*), built once at SessionStart.
-   *  Set as the conversation's attributes (the SDK forwards them down the
-   *  handle chain onto every span) and kept here for the cross-session
-   *  teammate path, which re-stamps them on spans created outside this
-   *  session's conversation. */
-  integrationAttrs: Attributes;
 
   /** The session's Conversation handle. Seeds `gen_ai.conversation.id`, the
-   *  agent identity, and the integration attributes onto every turn started
-   *  from it (and, via the handle chain, onto all child spans) — no ambient
-   *  state involved, so events in separate `runIsolated` frames still inherit
-   *  everything. Unset when tracing is disabled. */
+   *  agent identity, and the integration attributes (name, version, meta.*,
+   *  built at session creation) onto every turn started from it — and, via
+   *  the handle chain, onto all child spans. No ambient state involved, so
+   *  events in separate `runIsolated` frames still inherit everything. Unset
+   *  when tracing is disabled. */
   conversation?: weave.Conversation;
 
   currentTurn?: weave.Turn;
@@ -322,7 +315,7 @@ export class SubagentTracking {
  *  for a brand-new session, or the number of turns already on disk when
  *  reconstructing a session lost across a daemon restart (so the resumed turn
  *  keeps counting up instead of resetting to 1). */
-export type NewSessionStateOptions = {
+type NewSessionStateOptions = {
   sessionId: string;
   conversationId: string;
   transcript: TranscriptFile;
@@ -363,7 +356,6 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     cwd,
     source,
     initialRequestModel,
-    integrationAttrs,
     conversation,
     turnNumber,
     totalToolCalls: 0,

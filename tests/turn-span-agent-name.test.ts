@@ -16,10 +16,6 @@ import * as path from 'node:path';
 import { ATTR, DEFAULT_AGENT_NAME } from '../src/genaiSpans.ts';
 import { flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 function writeTranscript(sessionId: string, text: string): { file: string; dir: string } {
   const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-agentname-'));
   const file = path.join(dir, `${sessionId}.jsonl`);
@@ -35,7 +31,7 @@ test('turn span: agentName drives gen_ai.agent.name', async () => {
     exporter.reset();
     const sid = `sess-${name}`;
     const { file, dir } = writeTranscript(sid, 'hello');
-    const d = makeGenaiDaemon(name) as unknown as Driver;
+    const d = makeGenaiDaemon(name);
     try {
       await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/tmp' });
       await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'hello' });

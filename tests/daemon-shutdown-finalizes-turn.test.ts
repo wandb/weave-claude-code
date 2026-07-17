@@ -42,11 +42,6 @@ function makeTranscript(sessionId: string): { file: string; append: (line: unkno
   return { file, dir, append: (line: unknown) => fs.appendFileSync(file, JSON.stringify(line) + '\n') };
 }
 
-interface Harness {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-  drain(reason: string): Promise<void>;
-}
-
 /** Drive a session to a mid-turn state: turn open, one tool completed. */
 async function openTurnWithOneCompletedTool(d: Harness, sid: string, append: (l: unknown) => void, file: string) {
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
@@ -63,7 +58,7 @@ test('daemon shutdown mid-turn exports the turn root span (children are not left
   exporter.reset();
   const sid = 'sess-shutdown';
   const { file, append, dir } = makeTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Harness;
+  const d = makeGenaiDaemon();
   try {
     await openTurnWithOneCompletedTool(d, sid, append, file);
 
@@ -94,7 +89,7 @@ test('daemon shutdown ends an open subagent invoke_agent span under the same tra
   exporter.reset();
   const sid = 'sess-shutdown-subagent';
   const { file, append, dir } = makeTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Harness;
+  const d = makeGenaiDaemon();
   try {
     append(userText('2026-01-01T00:00:00.000Z', 'spawn a reviewer'));
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
@@ -127,7 +122,7 @@ test('SessionEnd still exports the turn root span after the finalize refactor', 
   exporter.reset();
   const sid = 'sess-sessionend';
   const { file, append, dir } = makeTranscript(sid);
-  const d = makeGenaiDaemon() as unknown as Harness;
+  const d = makeGenaiDaemon();
   try {
     await openTurnWithOneCompletedTool(d, sid, append, file);
     await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });

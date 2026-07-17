@@ -26,10 +26,6 @@ import * as path from 'node:path';
 import { ATTR } from '../src/genaiSpans.ts';
 import { flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 /** One assistant transcript line carrying a single content block, mirroring how
  *  Claude Code splits a response. `usage` is the FULL message usage, duplicated
  *  on every line of the same response (verified against real transcripts). */
@@ -75,7 +71,7 @@ test('reconstruction: split thinking/redacted_thinking/text/tool_use lines inter
     aLine('msgB', '2026-01-01T00:00:10.000Z', { type: 'text', text: 'all done' }, 'end_turn'),
   ].map(l => JSON.stringify(l)).join('\n') + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do the thing' });

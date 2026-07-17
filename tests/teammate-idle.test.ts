@@ -32,10 +32,6 @@ import { childrenOf, flushWeave, initWeaveInMemory, makeGenaiDaemon } from './he
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-interface Driver {
-  routeEvent(p: Record<string, unknown>): Promise<void>;
-}
-
 /** Write a fake teammate transcript to a temp file and return its path.
  *
  * readFirstTranscriptLine requires the path to be within os.homedir() (security
@@ -152,7 +148,7 @@ test('TeammateIdle span tree: teammate turn carries the teammate chat span, tagg
   fs.writeFileSync(path.join(subDir, `agent-${agentId}.jsonl`),
     [USER_LINE, ASSISTANT_LINE].map(l => JSON.stringify(l)).join('\n') + '\n');
 
-  const d = makeGenaiDaemon() as unknown as Driver;
+  const d = makeGenaiDaemon();
   try {
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: coordSid, transcript_path: coordPath, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: coordSid, prompt: '/triage' });

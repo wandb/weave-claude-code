@@ -69,10 +69,10 @@ export function startChat(parent: weave.Turn | weave.SubAgent, model: string, st
  * model yet (LLMInit.model is required), so the caller can fall back to the turn
  * span and emit the chat span later once the model has flushed.
  */
-export function openChatForGroup(turn: weave.Turn, group: AssistantCallDetail[]): weave.LLM | undefined {
+export function openChatForGroup(parent: weave.Turn | weave.SubAgent, group: AssistantCallDetail[]): weave.LLM | undefined {
   const model = group.map(c => c.model).find(Boolean);
   if (!model) return undefined;
-  return startChat(turn, model, parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp));
+  return startChat(parent, model, parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp));
 }
 
 /**

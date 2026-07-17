@@ -32,7 +32,6 @@ export const ATTR = {
   CONVERSATION_ID: 'gen_ai.conversation.id',
 
   // GenAI semconv - model
-  REQUEST_MODEL: 'gen_ai.request.model',
   RESPONSE_MODEL: 'gen_ai.response.model',
   RESPONSE_ID: 'gen_ai.response.id',
   RESPONSE_FINISH_REASONS: 'gen_ai.response.finish_reasons',

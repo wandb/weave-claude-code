@@ -30,19 +30,30 @@ export enum AgentNameSource {
   Default = 'default',
 }
 
+/** Env-over-settings resolution shared by the project and API-key resolvers:
+ *  a non-empty env value wins, then a non-empty settings value, else null.
+ *  `sources` supplies the per-field labels for the matching branch. */
+function resolveFromEnvOrSettings<S>(
+  envValue: string | undefined,
+  settingsValue: string | null | undefined,
+  sources: { env: S; settings: S; notSet: S },
+): { value: string | null; source: S } {
+  if (envValue) return { value: envValue, source: sources.env };
+  if (settingsValue) return { value: settingsValue, source: sources.settings };
+  return { value: null, source: sources.notSet };
+}
+
 /** Resolve the effective Weave project (WEAVE_PROJECT env beats
  *  settings.weave_project) and where it came from. */
 export function resolveProject(
   settings: Settings,
   env: NodeJS.ProcessEnv = process.env,
 ): { value: string | null; source: WeaveProjectSource } {
-  const value = env['WEAVE_PROJECT'] ?? settings.weave_project ?? null;
-  const source = env['WEAVE_PROJECT']
-    ? WeaveProjectSource.EnvVar
-    : settings.weave_project
-      ? WeaveProjectSource.Settings
-      : WeaveProjectSource.NotSet;
-  return { value, source };
+  return resolveFromEnvOrSettings(env['WEAVE_PROJECT'], settings.weave_project, {
+    env: WeaveProjectSource.EnvVar,
+    settings: WeaveProjectSource.Settings,
+    notSet: WeaveProjectSource.NotSet,
+  });
 }
 
 /** Resolve the effective W&B API key (WANDB_API_KEY env beats
@@ -51,13 +62,11 @@ export function resolveApiKey(
   settings: Settings,
   env: NodeJS.ProcessEnv = process.env,
 ): { value: string | null; source: ApiKeySource } {
-  const value = env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null;
-  const source = env['WANDB_API_KEY']
-    ? ApiKeySource.EnvVar
-    : settings.wandb_api_key
-      ? ApiKeySource.Settings
-      : ApiKeySource.NotSet;
-  return { value, source };
+  return resolveFromEnvOrSettings(env['WANDB_API_KEY'], settings.wandb_api_key, {
+    env: ApiKeySource.EnvVar,
+    settings: ApiKeySource.Settings,
+    notSet: ApiKeySource.NotSet,
+  });
 }
 
 /** Resolve the effective top-level agent name (WEAVE_AGENT_NAME env beats
@@ -94,6 +103,10 @@ export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv):
   };
 }
 
+/** SaaS trace-ingest host: the default OTLP target, and what the routeless
+ *  SaaS API host remaps to. */
+const DEFAULT_TRACE_BASE_URL = 'https://trace.wandb.ai';
+
 /** Resolve the Weave trace server base URL for OTLP export. `WF_TRACE_SERVER_URL`
  *  wins when set. Otherwise `WANDB_BASE_URL` is used, but SaaS `api.wandb.ai` is
  *  the wandb API host with no OTLP route, so it maps to `trace.wandb.ai`; a
@@ -101,8 +114,16 @@ export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv):
 function resolveTraceBaseUrl(env: NodeJS.ProcessEnv): string {
   const explicit = env['WF_TRACE_SERVER_URL']?.trim();
   if (explicit) return explicit.replace(/\/+$/, '');
-  const base = (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
-  return /^https?:\/\/api\.wandb\.ai$/i.test(base) ? 'https://trace.wandb.ai' : base;
+  const base = (env['WANDB_BASE_URL'] ?? DEFAULT_TRACE_BASE_URL).replace(/\/+$/, '');
+  return /^https?:\/\/api\.wandb\.ai$/i.test(base) ? DEFAULT_TRACE_BASE_URL : base;
+}
+
+/** Comma-joined list of missing required config, for the "incomplete"
+ *  status/startup messages. `apiKeyLabel` differs by call site
+ *  (`wandb_api_key` for config-oriented messages, `WANDB_API_KEY` for
+ *  env-oriented ones). */
+export function missingConfig(hasProject: boolean, hasApiKey: boolean, apiKeyLabel: string): string {
+  return [!hasProject && 'weave_project', !hasApiKey && apiKeyLabel].filter(Boolean).join(', ');
 }
 
 /** Hex chars kept from the config hash. 16 (64 bits) is ample to detect a

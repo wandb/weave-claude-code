@@ -34,6 +34,7 @@ import {
   resolveAgentName,
   resolveDaemonConfig,
   daemonConfigFingerprint,
+  missingConfig,
   WeaveProjectSource,
   ApiKeySource,
 } from './config.js';
@@ -226,15 +227,6 @@ async function cmdInstall(
 
 function maskSecret(value: string): string {
   return `${value.slice(0, 4)}…`;
-}
-
-/**
- * Render the comma-joined list of missing required config for the "incomplete"
- * status/restart messages. `apiKeyLabel` differs by call site (`wandb_api_key`
- * for the config-oriented message, `WANDB_API_KEY` for the env-oriented one).
- */
-function missingConfig(project: string | null, apiKey: string | null, apiKeyLabel: string): string {
-  return [!project && 'weave_project', !apiKey && apiKeyLabel].filter(Boolean).join(', ');
 }
 
 async function cmdConfig(args: string[]): Promise<void> {
@@ -555,11 +547,7 @@ function printPrettyStatus(snap: StatusSnapshot): void {
   } else if (socketState === SocketState.Stale) {
     console.log('Weave Claude Code — daemon socket stale (auto-recovers next session)');
   } else {
-    const missing = missingConfig(
-      report.weave_project,
-      report.api_key_configured ? 'set' : null,
-      'wandb_api_key',
-    );
+    const missing = missingConfig(!!report.weave_project, report.api_key_configured, 'wandb_api_key');
     console.log('Weave Claude Code — configuration incomplete');
     if (missing) console.log(`  Set ${missing} to start tracing`);
   }
@@ -809,7 +797,7 @@ async function cmdRestart(): Promise<void> {
   const project = resolveProject(settings).value;
   const apiKey = resolveApiKey(settings).value;
   if (!project || !apiKey) {
-    const missing = missingConfig(project, apiKey, 'WANDB_API_KEY');
+    const missing = missingConfig(!!project, !!apiKey, 'WANDB_API_KEY');
     console.error(`⚠ Not starting daemon, missing configuration: ${missing}`);
     console.error('  Set it with: weave-claude-code config set weave_project ENTITY/PROJECT');
     process.exit(1);
