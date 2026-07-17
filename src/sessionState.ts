@@ -138,13 +138,10 @@ export async function readSubagentFirstLineWithRetry(
  *       span is created at SubagentStart with the current turn span as
  *       parent and no input messages (the firing prompt is unavailable).
  *
- * The subagent is its own `invoke_agent <subagent_type>` span, child of the
- * parent turn's `invoke_agent claude-code` span. Per the Weave Agents chat
- * view (`weave/trace_server/agents/chat_view.py`), nested `invoke_agent`
- * spans render as an `agent_start` lifecycle marker with the inner agent's
- * own assistant text — distinct from an `execute_tool` tool-call event.
- * The Agent tool call does NOT emit an `execute_tool` span; it emits this
- * `invoke_agent` span directly.
+ * The subagent is its own `invoke_agent <subagent_type>` span under the parent
+ * turn, and its chat/tool spans nest beneath it. (Why an `invoke_agent` marker
+ * rather than an `execute_tool` span: see the Agent-dispatch branch in
+ * `handlePreToolUse`.)
  */
 export type SubagentTracker = {
   subagentType: string;

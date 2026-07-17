@@ -57,22 +57,22 @@ export function parseIsoOrNow(ts: string | undefined): Date {
   return parseTimestamp(ts) ?? new Date();
 }
 
-/** Open a chat (LLM) span under a turn or subagent for `model`, deriving the provider. */
-export function startChat(parent: weave.Turn | weave.SubAgent, model: string, startTime: Date): weave.LLM {
-  const provider = providerFromModel(model);
-  return parent.startLLM({ model, ...(provider ? { providerName: provider } : {}), startTime });
-}
-
 /**
- * Open a chat (LLM) span for one response `group`, backdating its start to the
- * first call's request time. Returns undefined when no call in the group has a
- * model yet (LLMInit.model is required), so the caller can fall back to the turn
- * span and emit the chat span later once the model has flushed.
+ * Open a chat (LLM) span under a turn or subagent for one response `group`,
+ * deriving the provider and backdating the start to the first call's request
+ * time. Returns undefined when no call in the group has a model yet
+ * (LLMInit.model is required), so the caller can fall back to the turn span
+ * and emit the chat span later once the model has flushed.
  */
 export function openChatForGroup(parent: weave.Turn | weave.SubAgent, group: AssistantCallDetail[]): weave.LLM | undefined {
   const model = group.map(c => c.model).find(Boolean);
   if (!model) return undefined;
-  return startChat(parent, model, parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp));
+  const provider = providerFromModel(model);
+  return parent.startLLM({
+    model,
+    ...(provider ? { providerName: provider } : {}),
+    startTime: parseIsoOrNow(group[0].prevTimestamp ?? group[0].timestamp),
+  });
 }
 
 /**

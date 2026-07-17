@@ -45,7 +45,6 @@ import {
   callsForResponseKey,
   findToolUseResponseKey,
   parseIsoOrNow,
-  startChat,
   openChatForGroup,
   recordChat,
 } from './chatSpans.js';
@@ -155,7 +154,6 @@ export class GlobalDaemon {
   ) {}
 
   async start(): Promise<void> {
-    // Initialize the Weave SDK if Weave is configured
     if (this.config.weaveProject && this.config.apiKey) {
       try {
         await this.initWeave();
@@ -340,10 +338,6 @@ export class GlobalDaemon {
 
       if (isControlMessage(payload)) {
         if (payload.command === 'config-hash') {
-          // Reply carries the config fingerprint (for drift detection) plus the
-          // daemon's runtime identity, so `status` can show which build is
-          // actually running (pid + version + resolved entry script) rather than
-          // just where the CLI symlink currently points.
           socket.end(JSON.stringify({
             config_hash: daemonConfigFingerprint(this.config),
             pid: process.pid,
@@ -408,8 +402,7 @@ export class GlobalDaemon {
           await this.handleSessionStart(sessionId, input);
           break;
         case 'InstructionsLoaded':
-          // Reads the instruction file synchronously off the hook's file_path;
-          // no async work to await.
+          // Synchronous: reads the instruction file inline; nothing to await.
           this.handleInstructionsLoaded(sessionId, input);
           break;
         case 'UserPromptSubmit':
@@ -774,16 +767,12 @@ export class GlobalDaemon {
     // tool_input is per-tool JSON the SDK types as `unknown`; narrow to index it.
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
 
-    // Agent tool with subagent_type → emit a nested `invoke_agent <subagent_type>`
-    // span (a SubAgent marker), NOT an `execute_tool Agent` span. The Weave
-    // Agents chat view renders nested invoke_agent spans as their own
-    // `agent_start` lifecycle marker; an execute_tool wrapper here would
-    // mis-render the subagent dispatch as a generic tool call. The Agent tool's
-    // PostToolUse closes this span with the subagent's final return.
-    //
-    // `promptHash` lets SubagentStart correlate this tracker to the right
-    // subagent deterministically by reading the subagent transcript's line 1
-    // (the firing prompt) and matching by sha256 + subagent_type.
+    // Agent tool with subagent_type → a nested `invoke_agent` marker, NOT an
+    // `execute_tool Agent` span: the chat view renders nested invoke_agent as
+    // an `agent_start` lifecycle event, and a tool wrapper would mis-render the
+    // dispatch as a generic tool call. PostToolUse(Agent) closes the marker.
+    // `promptHash` lets SubagentStart correlate deterministically: sha256 of
+    // the firing prompt (the subagent transcript's line 1) + subagent_type.
     if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
       if (!session.currentTurn) {
         this.log('ERROR', `PreToolUse(Agent): no current turn for session=${sessionId}`);
@@ -930,10 +919,8 @@ export class GlobalDaemon {
    * Emit a complete chat span (LLM) for one assistant API response `key`. The
    * response's ordered text / thinking / tool_use blocks become
    * `gen_ai.output.messages` parts, so the model's natural interleave shows on
-   * the single chat span (the tools it called nest under this span as their own
-   * `execute_tool` children). Usage is taken once from the response (the split
-   * lines duplicate the message usage, so it must not be summed), then the span
-   * is ended. Reuses `existingLlm` when the span was already opened during
+   * the single chat span (its tool calls nest under it as `execute_tool`
+   * children). Reuses `existingLlm` when the span was already opened during
    * PreToolUse; otherwise opens a fresh one under the turn span.
    */
   private emitChatSpanForResponse(
@@ -962,8 +949,6 @@ export class GlobalDaemon {
     session.emittedChatSpanResponseKeys.add(key);
   }
 
-  /** Record one completed tool call in the session's total, per-turn, and
-   *  per-tool-name counters (all bumped together whenever a tool finishes). */
   private countToolCall(session: SessionState, toolName: string): void {
     session.totalToolCalls += 1;
     session.turnToolCalls += 1;
@@ -1123,14 +1108,10 @@ export class GlobalDaemon {
 
     const matched = !!bestTracker;
     if (!bestTracker) {
-      // No matching Agent tool call — either the parent's PreToolUse never
-      // fired, or the firing prompt couldn't be read from the subagent
-      // transcript. Create an orphan tracker AND an orphan `invoke_agent`
-      // span so the subagent still produces a valid nested agent invocation
-      // in the chat view. The span parents under the current turn (no
-      // spawning tool_use_id) and has no input_messages (firing prompt
-      // unavailable). Closed at SubagentStop since there will be no
-      // PostToolUse for it.
+      // No matching Agent tool call (the parent's PreToolUse never fired, or
+      // the firing prompt couldn't be read). Create an orphan tracker + marker
+      // so the subagent still renders as a nested invocation; closed at
+      // SubagentStop since no PostToolUse will come for it.
       const reason = firingPrompt === undefined
         ? 'transcript line 1 missing or non-user'
         : `no tracker matches (promptHash, type=${agentType})`;
@@ -1236,12 +1217,10 @@ export class GlobalDaemon {
       try {
         agentTranscript = new TranscriptFile(agentTranscriptPath);
         const parsed = parseSessionFd(agentTranscript.getFd());
-        // Use the last turn only. Subagent transcripts are almost always
-        // single-turn; the rare 2-turn case occurs when the parent agent's
-        // prior assistant message is carried in as pre-context on line 0
-        // and the user prompt that fires the subagent appears on line 1.
-        // Emitting chat spans from earlier turns would mis-attribute the
-        // parent's LLM call to this subagent invocation.
+        // Last turn only: a subagent transcript occasionally carries the
+        // parent's prior assistant message as pre-context (a 2-turn parse);
+        // emitting earlier turns would mis-attribute the parent's LLM call
+        // to this subagent invocation.
         const lastTurn = parsed?.turns.at(-1);
         model = lastTurn?.primaryModel();
         lastAssistantText = lastTurn?.textBlocks().join('\n');
@@ -1265,13 +1244,9 @@ export class GlobalDaemon {
       if (model) {
         tracker.subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
       }
-      // Orphan path: no PostToolUse will fire, so close the invoke_agent
-      // span here — unless TeammateIdle is expected to follow (FleetView/
-      // Teammate pattern). In that case, keep the span open so TeammateIdle
-      // can emit all-turns content and close it correctly.
-      // Matched path: leave the span open for PostToolUse to close with the
-      // canonical tool_response and remove the tracker; if we removed the
-      // tracker here, byToolUseId at PostToolUse would miss it.
+      // Close only plain orphans (no PostToolUse will fire for them). Matched
+      // trackers wait for PostToolUse's canonical tool_response; orphans
+      // awaiting TeammateIdle stay open so it can emit all-turns content.
       if (!tracker.ended && !tracker.toolUseId && !tracker.pendingTeammateIdle) {
         this.closeSubagent(tracker, lastAssistantText, /*failure*/ false);
       }
