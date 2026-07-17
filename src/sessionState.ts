@@ -207,10 +207,18 @@ export type SessionState = {
   source: string;
   initialRequestModel?: string;
   /** Integration identity (name, version, meta.*), built once at SessionStart.
-   *  Installed on the session's conversation at SessionStart and re-installed
-   *  for every later event in `routeEvent` (each `runIsolated` frame gets fresh
-   *  ambient state), so the SDK copies it onto every span the session emits. */
+   *  Set as the conversation's attributes (the SDK forwards them down the
+   *  handle chain onto every span) and kept here for the cross-session
+   *  teammate path, which re-stamps them on spans created outside this
+   *  session's conversation. */
   integrationAttrs: Attributes;
+
+  /** The session's Conversation handle. Seeds `gen_ai.conversation.id`, the
+   *  agent identity, and the integration attributes onto every turn started
+   *  from it (and, via the handle chain, onto all child spans) — no ambient
+   *  state involved, so events in separate `runIsolated` frames still inherit
+   *  everything. Unset when tracing is disabled. */
+  conversation?: weave.Conversation;
 
   currentTurn?: weave.Turn;
 
@@ -322,9 +330,13 @@ export type NewSessionStateOptions = {
   source: string;
   initialRequestModel: string | undefined;
   turnNumber: number;
+  /** The top-level agent name the conversation (and thus every turn) carries. */
+  agentName: string;
+  /** When false (tracing disabled), no Conversation handle is created. */
+  tracingEnabled: boolean;
 };
 
-/** Build a fresh SessionState. */
+/** Build a fresh SessionState, starting its Conversation when tracing is on. */
 export function newSessionState(options: NewSessionStateOptions): SessionState {
   const { sessionId, conversationId, transcript, cwd, source, initialRequestModel, turnNumber } =
     options;
@@ -340,6 +352,9 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     version: VERSION,
     meta: { claude_code_app_version: claudeCodeAppVersion },
   });
+  const conversation = options.tracingEnabled
+    ? weave.startConversation({ conversationId, agentName: options.agentName, attributes: integrationAttrs })
+    : undefined;
 
   return {
     sessionId,
@@ -349,6 +364,7 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     source,
     initialRequestModel,
     integrationAttrs,
+    conversation,
     turnNumber,
     totalToolCalls: 0,
     turnToolCalls: 0,

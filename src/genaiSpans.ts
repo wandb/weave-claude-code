@@ -291,7 +291,8 @@ export function setCompactionAttrs(turn: Turn, attrs: CompactionAttrs): void {
 // Display-name helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function snippet(value: unknown, maxLen = 60): string {
+/** Single-line preview of a value: whitespace collapsed, truncated with `…`. */
+export function snippet(value: unknown, maxLen = 60): string {
   const s = String(value ?? '').replace(/\s+/g, ' ').trim();
   return s.length <= maxLen ? s : s.slice(0, maxLen - 1) + '…';
 }
@@ -319,8 +320,4 @@ export function toolDisplayName(toolName: string, input: Record<string, unknown>
       return first ? `${toolName}: ${snippet(first)}` : toolName;
     }
   }
-}
-
-export function promptSnippet(prompt: string, maxLen = 60): string {
-  return snippet(prompt, maxLen);
 }

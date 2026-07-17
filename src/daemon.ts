@@ -33,7 +33,7 @@ import {
   addPermissionRequestEvent,
   setCompactionAttrs,
   toolDisplayName,
-  promptSnippet,
+  snippet,
   jsonStr,
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint } from './config.js';
@@ -380,25 +380,12 @@ export class GlobalDaemon {
 
     this.log('INFO', `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`);
 
-    // Each event runs in its own isolated context so ambient GenAI state (the
-    // conversation, and any turn/LLM the SDK's factories consult) never leaks
-    // across events. The SDK copies the conversation's `attributes` onto each
-    // span at creation, but runIsolated gives every frame a fresh empty state,
-    // so re-install the session's conversation here; otherwise the integration
-    // identity would only land on spans created in the SessionStart frame. The
-    // session (and its conversation) don't exist until SessionStart runs, so
-    // that one event runs without a re-install; it creates no child spans.
-    await weave.runIsolated(async () => {
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        weave.startConversation({
-          conversationId: session.conversationId,
-          agentName: this.agentName,
-          attributes: session.integrationAttrs,
-        });
-      }
-      await this.dispatchEvent(input, sessionId);
-    });
+    // Each event runs in its own isolated frame so the SDK's single-active
+    // guards (one Conversation/Turn/LLM per frame) never trip across
+    // concurrently open sessions. Identity doesn't ride on the frame: the
+    // conversation's id and attributes forward through the held handles
+    // (conversation → turn → llm/tool/subagent) onto every span.
+    await weave.runIsolated(() => this.dispatchEvent(input, sessionId));
   }
 
   /** Run the handler for a single hook event, narrowing `input` to the event's
@@ -489,19 +476,9 @@ export class GlobalDaemon {
       source,
       initialRequestModel,
       turnNumber: 0,
+      agentName: this.agentName,
+      tracingEnabled: this.tracingEnabled,
     });
-
-    // Install the conversation for this SessionStart frame; routeEvent
-    // re-installs it for every later event (each runIsolated frame is fresh).
-    // The SDK copies the integration identity onto every span created under it.
-    if (this.tracingEnabled) {
-      weave.startConversation({
-        conversationId,
-        agentName: this.agentName,
-        attributes: session.integrationAttrs,
-      });
-    }
-
     this.sessions.set(sessionId, session);
     this.drainPendingInstructions(session);
 
@@ -640,19 +617,11 @@ export class GlobalDaemon {
       source,
       initialRequestModel,
       turnNumber: priorTurns,
+      agentName: this.agentName,
+      tracingEnabled: this.tracingEnabled,
     });
     this.sessions.set(sessionId, session);
     this.drainPendingInstructions(session);
-    // Install the conversation for the current event frame. routeEvent's
-    // re-install ran before this session existed, so without this the spans this
-    // event emits would miss the integration identity (matches handleSessionStart).
-    if (this.tracingEnabled) {
-      weave.startConversation({
-        conversationId,
-        agentName: this.agentName,
-        attributes: session.integrationAttrs,
-      });
-    }
     this.log(
       'INFO',
       `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
@@ -714,6 +683,35 @@ export class GlobalDaemon {
     this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
+  /**
+   * Open a turn under the session's conversation and stamp the per-turn session
+   * metadata. Each turn is the root of its own trace; the backend stitches
+   * turns into a conversation via `gen_ai.conversation.id`, which — with the
+   * agent identity and integration attributes — the conversation handle seeds
+   * onto the turn and its whole span subtree. Session metadata is stamped
+   * per-turn so it's queryable without a session-level span.
+   */
+  private startSessionTurn(session: SessionState, displayName: string, userMessage?: string): weave.Turn | undefined {
+    if (!session.conversation) return undefined;
+    const turn = session.conversation.startTurn({
+      agentVersion: VERSION,
+      model: session.initialRequestModel,
+      userMessage,
+      systemInstructions: session.systemInstructions.map((i) => i.content),
+      startTime: new Date(),
+    });
+    turn.setAttributes({
+      [ATTR.WEAVE_SESSION_ID]: session.sessionId,
+      [ATTR.WEAVE_CWD]: session.cwd,
+      [ATTR.WEAVE_SOURCE]: session.source,
+      [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
+      [ATTR.WEAVE_TURN_NUMBER]: session.turnNumber,
+      [ATTR.WEAVE_DISPLAY_NAME]: displayName,
+    });
+    session.currentTurn = turn;
+    return turn;
+  }
+
   private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
     // Reconstruct the session if this daemon never saw its SessionStart (e.g. it
     // idled out mid-session and a fresh daemon took over) so the rest of the
@@ -728,33 +726,14 @@ export class GlobalDaemon {
     const prompt = input.prompt;
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${snippet(prompt, 120)}`,
     );
 
     session.turnNumber += 1;
     session.turnToolCalls = 0;
     session.emittedChatSpanResponseKeys.clear();
-    // The turn is the root of its own trace; the backend stitches turns into a
-    // conversation via gen_ai.conversation.id, inherited from the ambient
-    // conversation (re-installed per event in routeEvent). Session metadata is
-    // stamped per-turn so it's queryable without a session-level span.
-    const turn = weave.startTurn({
-      agentName: this.agentName,
-      agentVersion: VERSION,
-      ...(session.initialRequestModel ? { model: session.initialRequestModel } : {}),
-      systemInstructions: session.systemInstructions.map((i) => i.content),
-      startTime: new Date(),
-    });
-    turn.setAttributes({
-      [ATTR.WEAVE_SESSION_ID]: session.sessionId,
-      [ATTR.WEAVE_CWD]: session.cwd,
-      [ATTR.WEAVE_SOURCE]: session.source,
-      [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
-      [ATTR.WEAVE_TURN_NUMBER]: session.turnNumber,
-      [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]),
-      [ATTR.WEAVE_DISPLAY_NAME]: `Turn ${session.turnNumber}: ${promptSnippet(prompt)}`,
-    });
-    session.currentTurn = turn;
+    const turn = this.startSessionTurn(session, `Turn ${session.turnNumber}: ${snippet(prompt)}`, prompt);
+    if (!turn) return;
 
     // Drain compaction attrs buffered while no turn was open.
     if (session.pendingCompaction) {
@@ -954,7 +933,7 @@ export class GlobalDaemon {
     // required); skip it rather than guess a model.
     const llm = existingLlm ?? openChatForGroup(session.currentTurn, group);
     if (!llm) return;
-    recordChat(llm, group, session.conversationId);
+    recordChat(llm, group);
     session.emittedChatSpanResponseKeys.add(key);
   }
 
@@ -1169,24 +1148,9 @@ export class GlobalDaemon {
    *  session without a turn, so a subagent recovered at SubagentStop has a parent. */
   private getOrReconstructTurn(session: SessionState): weave.Turn | undefined {
     if (session.currentTurn) return session.currentTurn;
-    if (!this.tracingEnabled) return undefined;
-    const turnNumber = session.turnNumber || 1;
-    const turn = weave.startTurn({
-      agentName: this.agentName,
-      agentVersion: VERSION,
-      ...(session.initialRequestModel ? { model: session.initialRequestModel } : {}),
-      startTime: new Date(),
-    });
-    turn.setAttributes({
-      [ATTR.WEAVE_SESSION_ID]: session.sessionId,
-      [ATTR.WEAVE_CWD]: session.cwd,
-      [ATTR.WEAVE_SOURCE]: session.source,
-      [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
-      [ATTR.WEAVE_TURN_NUMBER]: turnNumber,
-      [ATTR.WEAVE_DISPLAY_NAME]: `Turn ${turnNumber} (reconstructed)`,
-    });
-    session.currentTurn = turn;
-    this.log('INFO', `Reconstructed turn span (turn ${turnNumber}) after restart`);
+    session.turnNumber ||= 1;
+    const turn = this.startSessionTurn(session, `Turn ${session.turnNumber} (reconstructed)`);
+    if (turn) this.log('INFO', `Reconstructed turn span (turn ${session.turnNumber}) after restart`);
     return turn;
   }
 
@@ -1263,7 +1227,7 @@ export class GlobalDaemon {
         lastAssistantText = lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          this.emitChatSpansUnderTurn(chatParent, session.conversationId, lastTurn.assistantCalls(), tracker.subagentType);
+          this.emitChatSpans(chatParent, lastTurn.assistantCalls(), tracker.subagentType);
         }
       } catch (err) {
         this.log('DEBUG', `SubagentStop: could not parse transcript: ${err}`);
@@ -1441,21 +1405,20 @@ export class GlobalDaemon {
   }
 
   /**
-   * Emit one chat span (LLM) per assistant call under `turn`, reconstructed from
-   * transcript data (backdated times, usage, ordered output parts). `agentName`
-   * tags each span so the Agents view groups a subagent's/teammate's calls under
-   * that agent; conversation.id is inherited from `turn`.
+   * Emit one chat span (LLM) per assistant call under `parent`, reconstructed
+   * from transcript data (backdated times, usage, ordered output parts).
+   * `agentName` tags each span so a subagent's/teammate's calls stay queryable
+   * by agent; conversation.id is inherited from the parent handle chain.
    */
-  private emitChatSpansUnderTurn(
-    turn: weave.Turn,
-    conversationId: string,
+  private emitChatSpans(
+    parent: weave.Turn,
     calls: AssistantCallDetail[],
     agentName?: string,
   ): void {
     for (const c of calls) {
       if (!c.model) continue;
-      const llm = startChat(turn, c.model, parseIsoOrNow(c.prevTimestamp ?? c.timestamp));
-      recordChat(llm, [c], conversationId, agentName);
+      const llm = startChat(parent, c.model, parseIsoOrNow(c.prevTimestamp ?? c.timestamp));
+      recordChat(llm, [c], agentName);
     }
   }
 
@@ -1463,9 +1426,11 @@ export class GlobalDaemon {
    * Emit a teammate's whole transcript as its OWN turn trace, then close the
    * teammate's SubAgent marker. TeammateIdle fires after the coordinator turn
    * that spawned the teammate has already closed, so the teammate can't nest
-   * under it; instead it gets a fresh root `invoke_agent` turn (stamped with the
-   * integration identity, which it won't inherit cross-session) with the
-   * teammate's chat spans as children. Returns the teammate's model, if known.
+   * under it; instead it gets a fresh root `invoke_agent` turn with the
+   * teammate's chat spans as children. A dedicated Conversation handle seeds
+   * the coordinator's conversation.id and integration identity (neither is
+   * inherited cross-session) onto that whole subtree. Returns the teammate's
+   * model, if known.
    */
   private emitTeammateTurnTrace(
     subAgent: weave.SubAgent,
@@ -1482,12 +1447,14 @@ export class GlobalDaemon {
       t = new TranscriptFile(transcriptPath);
       const parsed = parseSessionFd(t.getFd());
       if (parsed) {
-        // No ambient conversation cross-session: stamp conversation.id and the
-        // integration identity (a custom attr map) onto the teammate turn root.
-        const turn = weave.startTurn({ agentName: agentType, agentVersion: VERSION, startTime: new Date() });
-        turn.setAttributes({ ...integrationAttrs, [ATTR.CONVERSATION_ID]: conversationId });
+        const conversation = weave.startConversation({
+          conversationId,
+          agentName: agentType,
+          attributes: integrationAttrs,
+        });
+        const turn = conversation.startTurn({ agentVersion: VERSION, startTime: new Date() });
         for (const parsedTurn of parsed.turns) {
-          this.emitChatSpansUnderTurn(turn, conversationId, parsedTurn.assistantCalls(), agentType);
+          this.emitChatSpans(turn, parsedTurn.assistantCalls(), agentType);
         }
         turn.end();
         const lastTurn = parsed.turns.at(-1);

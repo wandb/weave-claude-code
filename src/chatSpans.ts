@@ -3,7 +3,6 @@
 // SPDX-PackageName: weave-claude-code
 
 import * as weave from 'weave';
-import type { Attributes } from '@opentelemetry/api';
 import type { AssistantCallDetail } from './parser.js';
 import { isToolUseBlock } from './parser.js';
 import {
@@ -80,13 +79,12 @@ export function openChatForGroup(turn: weave.Turn, group: AssistantCallDetail[])
  * Populate a chat (LLM) span from the assistant calls of one response, then end
  * it. Split lines share the response's usage, so take it once from the last line
  * (which carries stop_reason), not summed. `agentName` tags the span so the
- * Agents view groups a subagent's/teammate's calls under it; conversation.id is
- * inherited from the parent turn.
+ * subagent's/teammate's calls stay queryable by agent; conversation.id is
+ * inherited from the parent handle chain.
  */
 export function recordChat(
   llm: weave.LLM,
   group: AssistantCallDetail[],
-  conversationId: string,
   agentName?: string,
 ): void {
   const last = group.at(-1)!;
@@ -99,10 +97,7 @@ export function recordChat(
     ...(last.responseId ? { responseId: last.responseId } : {}),
     ...(finishReason ? { finishReasons: [finishReason] } : {}),
   });
-  // agent.name, and conversation.id for cross-session teammate spans (no ambient
-  // conversation to inherit from), aren't on record()'s surface — set directly.
-  const attrs: Attributes = { [ATTR.CONVERSATION_ID]: conversationId };
-  if (agentName) attrs[ATTR.AGENT_NAME] = agentName;
-  llm.setAttributes(attrs);
+  // agent.name isn't on record()'s surface — set directly.
+  if (agentName) llm.setAttributes({ [ATTR.AGENT_NAME]: agentName });
   llm.end({ endTime: parseIsoOrNow(last.timestamp) });
 }
