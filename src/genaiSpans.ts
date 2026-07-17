@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// After the Weave SDK migration this module holds constants, formatting
-// helpers, and thin span-shaping helpers typed against the `weave` SDK. All
-// span construction/lifecycle lives in daemon.ts via
-// `weave.startConversation/.startTurn/.startLLM/.startTool/.startSubagent`.
+// Attribute-key constants, formatting helpers, and thin span-shaping helpers
+// typed against the `weave` SDK. Span construction/lifecycle lives with the
+// SDK handles: conversations start in sessionState.ts, turns/tools/subagents
+// in daemon.ts, and chat (LLM) spans via chatSpans.ts.
 
 import type { Attributes } from '@opentelemetry/api';
 import type { MessagePart, Tool, Turn, Usage } from 'weave';
@@ -29,7 +29,6 @@ export const ATTR = {
   // GenAI semconv - agent
   AGENT_NAME: 'gen_ai.agent.name',
   AGENT_ID: 'gen_ai.agent.id',
-  AGENT_VERSION: 'gen_ai.agent.version',
   CONVERSATION_ID: 'gen_ai.conversation.id',
 
   // GenAI semconv - model
@@ -47,7 +46,6 @@ export const ATTR = {
   // GenAI semconv - messages
   INPUT_MESSAGES: 'gen_ai.input.messages',
   OUTPUT_MESSAGES: 'gen_ai.output.messages',
-  OUTPUT_TYPE: 'gen_ai.output.type',
   SYSTEM_INSTRUCTIONS: 'gen_ai.system_instructions',
 
   // GenAI semconv - errors
@@ -235,13 +233,8 @@ export function buildUsage(usage: UsageSummary, reasoningTokens?: number): Usage
 // Span events
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface PermissionRequestEventArgs {
-  suggestions?: unknown;
-  timestamp: Date;
-}
-
 /** Added at PermissionRequest time. Records that the request happened. */
-export function addPermissionRequestEvent(tool: Tool, args: PermissionRequestEventArgs): void {
+export function addPermissionRequestEvent(tool: Tool, args: { suggestions?: unknown; timestamp: Date }): void {
   const attrs: Attributes = {};
   if (args.suggestions !== undefined) {
     attrs[ATTR.EVT_PERMISSION_SUGGESTIONS] = jsonStr(args.suggestions);
@@ -249,13 +242,8 @@ export function addPermissionRequestEvent(tool: Tool, args: PermissionRequestEve
   tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
 }
 
-export interface PermissionResolvedEventArgs {
-  approved: boolean;
-  timestamp: Date;
-}
-
 /** Added at PostToolUse[Failure]. Records the request outcome. */
-export function addPermissionResolvedEvent(tool: Tool, args: PermissionResolvedEventArgs): void {
+export function addPermissionResolvedEvent(tool: Tool, args: { approved: boolean; timestamp: Date }): void {
   tool.addEvent(
     ATTR.EVT_PERMISSION_RESOLVED,
     { [ATTR.EVT_PERMISSION_APPROVED]: args.approved },

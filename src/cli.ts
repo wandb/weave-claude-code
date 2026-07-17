@@ -337,18 +337,13 @@ async function cmdConfig(args: string[]): Promise<void> {
     // `debug` is the only boolean Settings field; every other writable key is a
     // string. Split the assignment so each branch's value type matches the
     // narrowed property type (no whole-object cast needed).
-    let coerced: string | boolean;
     if (writableKey === 'debug') {
-      coerced = value === 'true';
-      settings.debug = coerced;
+      settings.debug = value === 'true';
     } else {
-      coerced = value;
       settings[writableKey] = value;
     }
     saveSettings(settings);
-    const displayValue = writableKey === 'wandb_api_key' && typeof coerced === 'string'
-      ? maskSecret(coerced)
-      : coerced;
+    const displayValue = writableKey === 'wandb_api_key' ? maskSecret(value) : value;
     console.log(`✓ Set ${key} = ${displayValue}`);
     return;
   }

@@ -37,6 +37,7 @@ import {
   jsonStr,
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint } from './config.js';
+import type { DaemonConfig } from './config.js';
 import {
   chatMessageKey,
   callsForResponseKey,
@@ -147,20 +148,16 @@ export class GlobalDaemon {
   constructor(
     private readonly socketPath: string,
     private readonly logFile: string,
-    private readonly weaveProject: string | null,
-    private readonly apiKey: string | null,
-    private readonly baseUrl: string,
-    private readonly debugEnabled: boolean,
-    private readonly agentName: string,
+    private readonly config: DaemonConfig,
   ) {}
 
   async start(): Promise<void> {
     // Initialize the Weave SDK if Weave is configured
-    if (this.weaveProject && this.apiKey) {
+    if (this.config.weaveProject && this.config.apiKey) {
       try {
         await this.initWeave();
-        this.log('INFO', `OTel tracer initialized — project=${this.weaveProject}, endpoint=${this.baseUrl}/agents/otel/v1/traces`);
-        this.log('INFO', `View traces: https://wandb.ai/${this.weaveProject}/weave/agents`);
+        this.log('INFO', `OTel tracer initialized — project=${this.config.weaveProject}, endpoint=${this.config.baseUrl}/agents/otel/v1/traces`);
+        this.log('INFO', `View traces: https://wandb.ai/${this.config.weaveProject}/weave/agents`);
       } catch (err) {
         this.log('ERROR', `Failed to initialize OTel tracer: ${err} — continuing without tracing`);
         this.tracingEnabled = false;
@@ -259,12 +256,12 @@ export class GlobalDaemon {
   // ── tracer initialization ───────────────────────────────────────────────
 
   private async initWeave(): Promise<void> {
-    if (!this.weaveProject) throw new Error('weaveProject required to init tracer');
-    if (!this.apiKey) throw new Error('apiKey required to init tracer');
+    if (!this.config.weaveProject) throw new Error('weaveProject required to init tracer');
+    if (!this.config.apiKey) throw new Error('apiKey required to init tracer');
 
-    const [entity, project] = this.weaveProject.split('/', 2);
+    const [entity, project] = this.config.weaveProject.split('/', 2);
     if (!entity || !project) {
-      throw new Error(`Invalid weave_project format: '${this.weaveProject}' (expected entity/project)`);
+      throw new Error(`Invalid weave_project format: '${this.config.weaveProject}' (expected entity/project)`);
     }
 
     // The Weave SDK has no programmatic apiKey/host in its Settings; it resolves
@@ -273,10 +270,10 @@ export class GlobalDaemon {
     // the OTLP exporter straight at our trace server; WANDB_API_KEY supplies the
     // auth header. We deliberately do NOT set WANDB_BASE_URL (weave treats that
     // as the API host and would derive a wrong trace URL from it).
-    process.env['WF_TRACE_SERVER_URL'] = this.baseUrl;
-    process.env['WANDB_API_KEY'] = this.apiKey;
+    process.env['WF_TRACE_SERVER_URL'] = this.config.baseUrl;
+    process.env['WANDB_API_KEY'] = this.config.apiKey;
 
-    await weave.init(this.weaveProject);
+    await weave.init(this.config.weaveProject);
     this.tracingEnabled = true;
   }
 
@@ -335,7 +332,7 @@ export class GlobalDaemon {
           // actually running (pid + version + resolved entry script) rather than
           // just where the CLI symlink currently points.
           socket.end(JSON.stringify({
-            config_hash: this.configFingerprint(),
+            config_hash: daemonConfigFingerprint(this.config),
             pid: process.pid,
             version: VERSION,
             path: daemonEntryPath(),
@@ -476,7 +473,7 @@ export class GlobalDaemon {
       source,
       initialRequestModel,
       turnNumber: 0,
-      agentName: this.agentName,
+      agentName: this.config.agentName,
       tracingEnabled: this.tracingEnabled,
     });
     this.sessions.set(sessionId, session);
@@ -617,7 +614,7 @@ export class GlobalDaemon {
       source,
       initialRequestModel,
       turnNumber: priorTurns,
-      agentName: this.agentName,
+      agentName: this.config.agentName,
       tracingEnabled: this.tracingEnabled,
     });
     this.sessions.set(sessionId, session);
@@ -1553,15 +1550,17 @@ export class GlobalDaemon {
     if (assistantMessages.length) {
       turnAttrs[ATTR.OUTPUT_MESSAGES] = jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m })));
     }
-    // Aggregate finish reasons from per-call detail
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {
       turnAttrs[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
     }
-    if (model) {
-      turnAttrs[ATTR.REQUEST_MODEL] = model;
-    }
     session.currentTurn.setAttributes(turnAttrs);
+    // Through record(), not setAttributes: Turn.end() re-emits
+    // gen_ai.request.model from its internal field, so a raw attribute write
+    // of the parsed model would be clobbered by the initial-request model.
+    if (model) {
+      session.currentTurn.record({ model });
+    }
     session.currentTurn.end();
     session.currentTurn = undefined;
 
@@ -1815,20 +1814,8 @@ export class GlobalDaemon {
     return 'tool_error';
   }
 
-  /** Fingerprint of the config this daemon loaded at startup. Held in memory;
-   *  replied over the socket for the `config-hash` control message. */
-  private configFingerprint(): string {
-    return daemonConfigFingerprint({
-      weaveProject: this.weaveProject,
-      apiKey: this.apiKey,
-      baseUrl: this.baseUrl,
-      agentName: this.agentName,
-      debug: this.debugEnabled,
-    });
-  }
-
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
-    if (level === 'DEBUG' && !this.debugEnabled) return;
+    if (level === 'DEBUG' && !this.config.debug) return;
     appendToLog(this.logFile, level, msg);
   }
 }
@@ -1844,18 +1831,18 @@ export async function runDaemon(): Promise<void> {
 
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
 
-  const { weaveProject, apiKey, baseUrl, agentName, debug } = resolveDaemonConfig(settings, process.env);
+  const config = resolveDaemonConfig(settings, process.env);
 
-  if (!weaveProject || !apiKey) {
-    const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
+  if (!config.weaveProject || !config.apiKey) {
+    const missing = [!config.weaveProject && 'weave_project', !config.apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
     appendToLog(logFile, 'INFO', `Daemon not started — missing configuration: ${missing}`);
     process.exit(0);
   }
 
   // Ensure downstream tooling (e.g. wandb settings) still sees the API key.
-  process.env['WANDB_API_KEY'] = apiKey;
+  process.env['WANDB_API_KEY'] = config.apiKey;
 
-  const daemon = new GlobalDaemon(socketPath, logFile, weaveProject, apiKey, baseUrl, debug, agentName);
+  const daemon = new GlobalDaemon(socketPath, logFile, config);
 
   try {
     await daemon.start();

@@ -146,7 +146,9 @@ export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
  *  initialised via `initWeaveInMemory`), skipping the real socket/`start()`. */
 export function makeGenaiDaemon(agentName = 'claude-code'): GlobalDaemon {
   const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
-  const d = new GlobalDaemon('/tmp/unused.sock', logFile, 'e/p', 'k', 'https://x', false, agentName);
+  const d = new GlobalDaemon('/tmp/unused.sock', logFile, {
+    weaveProject: 'e/p', apiKey: 'k', baseUrl: 'https://x', agentName, debug: false,
+  });
   (d as unknown as { tracingEnabled: boolean }).tracingEnabled = true;
   return d;
 }
