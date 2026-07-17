@@ -758,14 +758,17 @@ export class GlobalDaemon {
     // dispatch as a generic tool call. PostToolUse(Agent) closes the marker.
     // `promptHash` lets SubagentStart correlate deterministically: sha256 of
     // the firing prompt (the subagent transcript's line 1) + subagent_type.
-    if (!agentId && toolName === 'Agent' && toolInput['subagent_type']) {
-      if (!session.currentTurn) {
-        this.log('ERROR', `PreToolUse(Agent): no current turn for session=${sessionId}`);
+    // A dispatch from within a subagent (agent_id set) nests under the
+    // spawner's own marker, so recursive spawns keep their depth.
+    if (toolName === 'Agent' && toolInput['subagent_type']) {
+      const spawner = agentId ? session.subagents.byAgentId(agentId)?.subAgent : session.currentTurn;
+      if (!spawner) {
+        this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
         return;
       }
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
-      const subAgent = session.currentTurn.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
+      const subAgent = spawner.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
       const subAttrs: Attributes = {
         [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: toolUseId,
         [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput),
