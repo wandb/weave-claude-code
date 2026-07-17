@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveDaemonConfig } from '../src/daemon.ts';
+import { resolveDaemonConfig } from '../src/config.ts';
 
 const SETTINGS = { weave_project: 'e/p', wandb_api_key: 'k' };
 const baseUrlFor = (env: Record<string, string>): string =>

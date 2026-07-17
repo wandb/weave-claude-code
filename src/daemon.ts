@@ -21,7 +21,8 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import { loadSettings, VERSION, type Settings } from './setup.js';
+import { loadSettings, VERSION } from './setup.js';
+import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import { appendToLog, deepEqual } from './utils.js';
 import {
   parseSessionFd,
@@ -33,7 +34,6 @@ import {
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
-  DEFAULT_AGENT_NAME,
   CompactionAttrs,
   IntegrationBaggageSpanProcessor,
   createIntegrationBaggage,
@@ -2313,57 +2313,6 @@ export class GlobalDaemon {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config resolution and fingerprinting
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** The config the daemon loads at startup and holds for its lifetime. */
-type DaemonConfig = {
-  weaveProject: string | null;
-  apiKey: string | null;
-  baseUrl: string;
-  agentName: string;
-  debug: boolean;
-}
-
-/** Resolve the effective daemon config from settings + env, applying the same
- *  env-over-settings precedence the daemon uses at startup. */
-export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv): DaemonConfig {
-  return {
-    weaveProject: env['WEAVE_PROJECT'] ?? settings.weave_project ?? null,
-    apiKey: env['WANDB_API_KEY'] ?? settings.wandb_api_key ?? null,
-    baseUrl: resolveTraceBaseUrl(env),
-    // `||` (not `??`) so an empty/whitespace value falls through to the default
-    // rather than producing a blank `invoke_agent ` span name.
-    agentName: env['WEAVE_AGENT_NAME']?.trim() || settings.agent_name?.trim() || DEFAULT_AGENT_NAME,
-    debug: !!env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true,
-  };
-}
-
-/** Resolve the Weave trace server base URL for OTLP export. `WF_TRACE_SERVER_URL`
- *  wins when set. Otherwise `WANDB_BASE_URL` is used, but SaaS `api.wandb.ai` is
- *  the wandb API host with no OTLP route, so it maps to `trace.wandb.ai`; a
- *  self-hosted `WANDB_BASE_URL` passes through unchanged. */
-function resolveTraceBaseUrl(env: NodeJS.ProcessEnv): string {
-  const explicit = env['WF_TRACE_SERVER_URL']?.trim();
-  if (explicit) return explicit.replace(/\/+$/, '');
-  const base = (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
-  return /^https?:\/\/api\.wandb\.ai$/i.test(base) ? 'https://trace.wandb.ai' : base;
-}
-
-/** Hex chars kept from the config hash. 16 (64 bits) is ample to detect a
- *  config change while keeping the value compact for logs and the socket reply. */
-const CONFIG_FINGERPRINT_LENGTH = 16;
-
-/** Short, stable hash of a daemon config. The API key is hashed, not exposed,
- *  so the fingerprint is safe to send over the socket. */
-export function daemonConfigFingerprint(c: DaemonConfig): string {
-  return createHash('sha256')
-    .update(JSON.stringify([c.weaveProject, c.apiKey, c.baseUrl, c.agentName, c.debug]))
-    .digest('hex')
-    .slice(0, CONFIG_FINGERPRINT_LENGTH);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Entry point (invoked by `weave-claude-code daemon`)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2376,7 +2325,7 @@ export async function runDaemon(): Promise<void> {
   const { weaveProject, apiKey, baseUrl, agentName, debug } = resolveDaemonConfig(settings, process.env);
 
   if (!weaveProject || !apiKey) {
-    const missing = [!weaveProject && 'weave_project', !apiKey && 'WANDB_API_KEY'].filter(Boolean).join(', ');
+    const missing = missingConfig(!!weaveProject, !!apiKey, 'WANDB_API_KEY');
     appendToLog(logFile, 'INFO', `Daemon not started — missing configuration: ${missing}`);
     process.exit(0);
   }
