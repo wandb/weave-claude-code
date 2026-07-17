@@ -34,6 +34,7 @@ import {
   addPermissionRequestEvent,
   setCompactionAttrs,
   toolDisplayName,
+  assistantOutputMessages,
   snippet,
   jsonStr,
 } from './genaiSpans.js';
@@ -52,6 +53,7 @@ import {
   resolvePermissionIfPending,
   hashPrompt,
   computeSubagentTranscriptPath,
+  subagentsDirFor,
   extractUserMessageContent,
   lastAssistantTextEndsWith,
   readSubagentFirstLineWithRetry,
@@ -999,6 +1001,30 @@ export class GlobalDaemon {
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
 
+  /**
+   * Settle the Agent-dispatch tracker for `toolUseId` at PostToolUse[Failure],
+   * if one exists. An Agent tool call has no pendingToolCall; its span is the
+   * subagent's `invoke_agent` marker, closed here with the tool's canonical
+   * return. Team spawns are the exception: the Agent tool returns immediately
+   * (the teammate runs async in its own session), so the marker stays open —
+   * the team map owns it and the teammate's TeammateIdle closes it — and only
+   * the per-session tracker is dropped. Returns true when the tool call was a
+   * subagent dispatch.
+   */
+  private settleSubagentDispatch(
+    session: SessionState,
+    toolUseId: string,
+    output: unknown,
+    failure: boolean,
+  ): boolean {
+    const tracker = session.subagents.byToolUseId(toolUseId);
+    if (!tracker?.subAgent) return false;
+    if (!tracker.teamName) this.closeSubagent(tracker, output, failure);
+    session.subagents.remove(tracker);
+    this.countToolCall(session, 'Agent');
+    return true;
+  }
+
   private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -1006,23 +1032,7 @@ export class GlobalDaemon {
     const toolUseId = input.tool_use_id;
     if (!toolUseId) return;
 
-    // Subagent dispatch: the matching span is the subagent's invoke_agent
-    // marker (not a pendingToolCall), so we close it here with the subagent's
-    // final assistant text as `gen_ai.output.messages`.
-    const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.subAgent) {
-      if (subagentTracker.teamName) {
-        // Agent-teams: the Agent tool returns immediately (teammate runs async
-        // in its own session). Do NOT close the invoke_agent span — it would
-        // end empty before the teammate works. The team map owns it now.
-        session.subagents.remove(subagentTracker);
-      } else {
-        this.closeSubagent(subagentTracker, input.tool_response, /*failure*/ false);
-        session.subagents.remove(subagentTracker);
-      }
-      this.countToolCall(session, 'Agent');
-      return;
-    }
+    if (this.settleSubagentDispatch(session, toolUseId, input.tool_response, /*failure*/ false)) return;
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
@@ -1045,24 +1055,7 @@ export class GlobalDaemon {
 
     const error = input.error;
 
-    // Subagent dispatch failed (rare). Close the invoke_agent span with ERROR
-    // status; subagent chat spans, if any reached SubagentStop, are already
-    // attached as children.
-    const subagentTracker = session.subagents.byToolUseId(toolUseId);
-    if (subagentTracker?.subAgent) {
-      if (subagentTracker.teamName) {
-        // Agent-teams: the team map owns this span (closed at the teammate's
-        // TeammateIdle, cross-session). Closing it here would end it early and
-        // then double-end when TeammateIdle fires. Mirror handlePostToolUse:
-        // just drop the per-session tracker; the queue entry lives on.
-        session.subagents.remove(subagentTracker);
-      } else {
-        this.closeSubagent(subagentTracker, error, /*failure*/ true);
-        session.subagents.remove(subagentTracker);
-      }
-      this.countToolCall(session, 'Agent');
-      return;
-    }
+    if (this.settleSubagentDispatch(session, toolUseId, error, /*failure*/ true)) return;
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
@@ -1094,7 +1087,7 @@ export class GlobalDaemon {
 
     if (output !== undefined && output !== null && output !== '') {
       const outputText = typeof output === 'string' ? output : jsonStr(output);
-      sub.setAttributes({ [ATTR.OUTPUT_MESSAGES]: jsonStr([{ role: 'assistant', content: outputText }]) });
+      sub.setAttributes({ [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages([outputText]) });
     }
     if (failure) {
       sub.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(output) });
@@ -1149,11 +1142,7 @@ export class GlobalDaemon {
         pendingTeammateIdle: true,
       };
       if (session.currentTurn) {
-        bestTracker.subAgent = session.currentTurn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
-        bestTracker.subAgent.setAttributes({
-          [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
-          [ATTR.WEAVE_ORPHAN_REASON]: reason,
-        });
+        bestTracker.subAgent = this.startOrphanSubagent(session.currentTurn, agentType, reason);
       }
       session.subagents.add(bestTracker);
     }
@@ -1165,6 +1154,17 @@ export class GlobalDaemon {
     }
 
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
+  }
+
+  /** Open an orphan `invoke_agent` marker under `turn` for a subagent with no
+   *  matched Agent tool call, stamping why it exists outside the normal path. */
+  private startOrphanSubagent(turn: weave.Turn, agentType: string, orphanReason: string): weave.SubAgent {
+    const subAgent = turn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
+    subAgent.setAttributes({
+      [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
+      [ATTR.WEAVE_ORPHAN_REASON]: orphanReason,
+    });
+    return subAgent;
   }
 
   /** The session's open turn, opening a fresh one if a restart left the
@@ -1188,12 +1188,8 @@ export class GlobalDaemon {
   ): SubagentTracker | undefined {
     const turn = this.getOrReconstructTurn(session);
     if (!turn) return undefined;
-    const subAgent = turn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
+    const subAgent = this.startOrphanSubagent(turn, agentType, 'recovered at SubagentStop after daemon restart (no tracker)');
     subAgent.record({ agentId });
-    subAgent.setAttributes({
-      [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
-      [ATTR.WEAVE_ORPHAN_REASON]: 'recovered at SubagentStop after daemon restart (no tracker)',
-    });
     const tracker: SubagentTracker = {
       subagentType: agentType,
       detectedAt: new Date(),
@@ -1397,9 +1393,7 @@ export class GlobalDaemon {
     idleTranscriptPath: string | undefined,
   ): string | undefined {
     try {
-      const projectDir = path.dirname(coordinatorTranscriptPath);
-      const sessionDirName = path.basename(coordinatorTranscriptPath, '.jsonl');
-      const subagentsDir = path.join(projectDir, sessionDirName, 'subagents');
+      const subagentsDir = subagentsDirFor(coordinatorTranscriptPath);
       if (fs.existsSync(subagentsDir)) {
         let best: { p: string; mtime: number } | undefined;
         for (const meta of fs.readdirSync(subagentsDir).filter(f => f.endsWith('.meta.json'))) {
@@ -1498,7 +1492,7 @@ export class GlobalDaemon {
     if (model) subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
     if (lastAssistantText) {
       subAgent.setAttributes({
-        [ATTR.OUTPUT_MESSAGES]: jsonStr([{ role: 'assistant', content: lastAssistantText }]),
+        [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages([lastAssistantText]),
       });
     }
     subAgent.end();
@@ -1583,7 +1577,7 @@ export class GlobalDaemon {
 
     const turnAttrs: Attributes = { [ATTR.WEAVE_TURN_TOOL_COUNT]: session.turnToolCalls };
     if (assistantMessages.length) {
-      turnAttrs[ATTR.OUTPUT_MESSAGES] = jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m })));
+      turnAttrs[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(assistantMessages);
     }
     const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
     if (finishReasons?.length) {

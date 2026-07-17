@@ -140,6 +140,12 @@ export function jsonStr(v: unknown): string {
   }
 }
 
+/** `gen_ai.output.messages` JSON for plain assistant text(s) — the shape used
+ *  on turn and subagent `invoke_agent` spans (chat spans carry parts instead). */
+export function assistantOutputMessages(texts: string[]): string {
+  return jsonStr(texts.map((content) => ({ role: 'assistant', content })));
+}
+
 /** Parse an ISO timestamp; returns undefined for missing or unparseable input. */
 export function parseTimestamp(ts: string | undefined): Date | undefined {
   if (!ts) return undefined;

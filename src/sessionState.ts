@@ -3,11 +3,11 @@
 // SPDX-PackageName: weave-claude-code
 
 import * as path from 'path';
-import { createHash } from 'crypto';
 import * as weave from 'weave';
 import { VERSION } from './setup.js';
 import { parseSessionFd, extractAssistantTextBlocks, isTextBlock } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
+import { sha256Hex } from './utils.js';
 import { buildIntegrationAttrs, addPermissionResolvedEvent } from './genaiSpans.js';
 import type { CompactionAttrs } from './genaiSpans.js';
 
@@ -45,20 +45,25 @@ export function resolvePermissionIfPending(pending: PendingToolCall, approved: b
 /** sha256 of the firing prompt — used to correlate an `Agent` PreToolUse with
  *  the subagent's SubagentStart by matching transcript content. */
 export function hashPrompt(prompt: string): string {
-  return createHash('sha256').update(prompt, 'utf8').digest('hex');
+  return sha256Hex(prompt);
 }
 
 /**
- * Map a parent transcript path + subagent agent_id to the subagent's transcript
- * file. Claude Code writes subagent transcripts as siblings of the parent in a
- * `<session_id>/subagents/` subdirectory:
- *   parent:   <project_dir>/<session_id>.jsonl
+ * Directory holding a session's subagent transcripts. Claude Code writes them
+ * as siblings of the session transcript in a `<session_id>/subagents/`
+ * subdirectory:
+ *   session:  <project_dir>/<session_id>.jsonl
  *   subagent: <project_dir>/<session_id>/subagents/agent-<agent_id>.jsonl
  */
+export function subagentsDirFor(sessionTranscriptPath: string): string {
+  const projectDir = path.dirname(sessionTranscriptPath);
+  const sessionDirName = path.basename(sessionTranscriptPath, '.jsonl');
+  return path.join(projectDir, sessionDirName, 'subagents');
+}
+
+/** Map a parent transcript path + subagent agent_id to the subagent's transcript file. */
 export function computeSubagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
-  const projectDir = path.dirname(parentTranscriptPath);
-  const sessionDirName = path.basename(parentTranscriptPath, '.jsonl');
-  return path.join(projectDir, sessionDirName, 'subagents', `agent-${agentId}.jsonl`);
+  return path.join(subagentsDirFor(parentTranscriptPath), `agent-${agentId}.jsonl`);
 }
 
 /** Pull the user-message content out of a transcript line. Returns the prompt

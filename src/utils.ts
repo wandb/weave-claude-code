@@ -7,6 +7,12 @@ import * as net from 'net';
 import * as path from 'path';
 import * as readline from 'readline';
 import { spawnSync } from 'child_process';
+import { createHash } from 'crypto';
+
+/** Hex-encoded sha256 of `input`. */
+export function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex');
+}
 
 export function prompt(question: string): Promise<string> {
   return new Promise((resolve) => {
