@@ -12,17 +12,17 @@ export interface UsageSummary {
 }
 
 /**
- * Per-API-call detail for a single assistant message in the transcript.
- * Each entry corresponds to one LLM invocation within a turn, used to emit
- * one `chat <model>` span per call at Stop time.
+ * One assistant API response within a turn. Claude Code splits a response's
+ * thinking / text / tool_use blocks across transcript lines sharing a
+ * `message.id`; `buildTurn` folds those back into a single entry.
  */
 export interface AssistantCallDetail {
-  timestamp: string;            // ISO timestamp of the assistant message
-  prevTimestamp?: string;       // ISO timestamp of preceding transcript line (proxy for "request started")
+  timestamp: string;            // ISO timestamp of the response's last transcript line
+  prevTimestamp?: string;       // ISO timestamp of the line preceding it (proxy for "request started")
   model?: string;
-  usage: UsageSummary;          // per-call usage
+  usage: UsageSummary;
   reasoningTokens?: number;     // reasoning/thinking tokens, if any
-  contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
+  contentBlocks: unknown[];     // raw content blocks in transcript order (text, tool_use, thinking, ...)
   responseId?: string;          // provider message id
   finishReason?: string;        // stop_reason / finish_reason if present
 }
@@ -127,7 +127,8 @@ function buildSession(lines: unknown[]): ParsedSession {
 }
 
 function buildTurn(assistantLines: AssistantLine[]): Turn {
-  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
+  const calls: AssistantCallDetail[] = [];
+  for (const { line, prevTimestamp } of assistantLines) {
     const { message } = readTranscriptLine(line);
     const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
     const usage = rawToUsageSummary(rawUsage);
@@ -145,17 +146,21 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
     const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
     const timestamp = (line['timestamp'] as string | undefined) ?? '';
 
-    return {
-      timestamp,
-      prevTimestamp,
-      model,
-      usage,
-      reasoningTokens,
-      contentBlocks,
-      responseId,
-      finishReason: stopReason,
-    };
-  });
+    // Fold split lines (shared message.id) into one call per API response.
+    // Split lines duplicate the response usage — keep the last line's, which
+    // accompanies stop_reason; keep the first line's prevTimestamp as start.
+    const prev = calls.at(-1);
+    if (responseId && prev?.responseId === responseId) {
+      prev.contentBlocks.push(...contentBlocks);
+      prev.timestamp = timestamp;
+      prev.usage = usage;
+      prev.reasoningTokens = reasoningTokens ?? prev.reasoningTokens;
+      prev.model ??= model;
+      prev.finishReason ??= stopReason;
+      continue;
+    }
+    calls.push({ timestamp, prevTimestamp, model, usage, reasoningTokens, contentBlocks, responseId, finishReason: stopReason });
+  }
 
   const model = calls.filter(call => call.model).at(-1)?.model;
 

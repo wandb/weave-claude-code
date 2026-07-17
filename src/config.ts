@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Config resolution shared by the CLI and the daemon: the effective Weave
-// project / API key / agent name (env over settings.json), plus the daemon's
-// full config and its fingerprint. Lives here rather than in cli.ts or
-// daemon.ts so both use one implementation without an import cycle (cli.ts
-// imports the daemon entry point).
+// Config resolution shared by the CLI and the daemon (env over
+// settings.json). Lives here so both use one implementation without an
+// import cycle (cli.ts imports the daemon entry point).
 
 import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 import { sha256Hex } from './utils.js';
