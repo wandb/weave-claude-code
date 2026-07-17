@@ -45,6 +45,7 @@ import {
   emitAssistantTextSpan,
   emitThinkingSpan,
   emitChatSpansFromAssistantCalls,
+  normalizeContentBlocks,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
   setCompactionAttrs,
@@ -1360,7 +1361,7 @@ export class GlobalDaemon {
     // the stop_reason, rather than summing.
     const last = group[group.length - 1];
     const finishReason = group.map(c => c.finishReason).find(Boolean);
-    const parts = group.flatMap(c => c.contentBlocks);
+    const parts = normalizeContentBlocks(group.flatMap(c => c.contentBlocks));
     finalizeChatSpan(span, {
       usage: last.usage,
       reasoningTokens: last.reasoningTokens,
@@ -2017,14 +2018,16 @@ export class GlobalDaemon {
       }
     }
 
-    const parsedTexts = currentTurn?.textBlocks() ?? [];
-    const lastMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
-    const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
+    // Root turn output = the final assistant message only. Interstitial text
+    // already renders as ordered assistant_text child spans (emitContentBlocks);
+    // re-dumping every text block here is what collapsed the Agents chat view
+    // into one trailing message. Matches the Codex plugin's root-output shape.
+    const finalText = finalAssistantMessage?.trim() || currentTurn?.textBlocks().at(-1);
 
-    if (assistantMessages.length) {
+    if (finalText) {
       session.currentTurnSpan.setAttribute(
         ATTR.OUTPUT_MESSAGES,
-        jsonStr(assistantMessages.map((m) => ({ role: 'assistant', content: m }))),
+        jsonStr([{ role: 'assistant', content: finalText }]),
       );
     }
 

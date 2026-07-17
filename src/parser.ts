@@ -194,6 +194,7 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
 type TextBlock = { type: 'text'; text: string };
 type ThinkingBlock = { type: 'thinking'; thinking: string };
 type RedactedThinkingBlock = { type: 'redacted_thinking'; data?: string };
+type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input?: unknown };
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -209,6 +210,11 @@ export function isThinkingBlock(block: unknown): block is ThinkingBlock {
 
 export function isRedactedThinkingBlock(block: unknown): block is RedactedThinkingBlock {
   return isObject(block) && block['type'] === 'redacted_thinking';
+}
+
+export function isToolUseBlock(block: unknown): block is ToolUseBlock {
+  return isObject(block) && block['type'] === 'tool_use'
+    && typeof block['id'] === 'string' && typeof block['name'] === 'string';
 }
 
 /**

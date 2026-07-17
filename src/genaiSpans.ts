@@ -15,7 +15,7 @@ import {
   trace,
 } from '@opentelemetry/api';
 import type { ReadableSpan, Span as SdkSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { extractAssistantTextBlocks } from './parser.js';
+import { isTextBlock, isThinkingBlock, isToolUseBlock } from './parser.js';
 import type { AssistantCallDetail, UsageSummary } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -597,6 +597,32 @@ export function emitThinkingSpan(
   span.end(args.endedAt ?? args.startedAt);
 }
 
+type NormalizedPart =
+  | { type: 'text'; content: string }
+  | { type: 'thinking'; content: string }
+  | { type: 'tool_call'; toolCallId: string; toolName: string; arguments: unknown };
+
+/**
+ * Normalize raw Anthropic content blocks to the GenAI part shape the Weave
+ * Agents chat view expects (matching the Codex plugin): `text` / `thinking`
+ * carry their string as `content`, `tool_use` becomes a `tool_call` part.
+ * Blocks with no readable content (`redacted_thinking`, unknown types) are
+ * dropped.
+ */
+export function normalizeContentBlocks(blocks: unknown[]): NormalizedPart[] {
+  const parts: NormalizedPart[] = [];
+  for (const block of blocks) {
+    if (isTextBlock(block)) {
+      parts.push({ type: 'text', content: block.text });
+    } else if (isThinkingBlock(block)) {
+      parts.push({ type: 'thinking', content: block.thinking });
+    } else if (isToolUseBlock(block)) {
+      parts.push({ type: 'tool_call', toolCallId: block.id, toolName: block.name, arguments: block.input });
+    }
+  }
+  return parts;
+}
+
 /**
  * Walk a parsed list of per-message details and emit one chat span per
  * assistant message. `parentSpan` is the turn-level span (for the main agent)
@@ -612,6 +638,7 @@ export function emitChatSpansFromAssistantCalls(
     if (!c.model) continue;
     const startedAt = parseTimestamp(c.prevTimestamp) ?? parseTimestamp(c.timestamp) ?? new Date();
     const endedAt = parseTimestamp(c.timestamp) ?? new Date();
+    const parts = normalizeContentBlocks(c.contentBlocks);
     emitChatSpan(tracer, parentSpan, {
       conversationId,
       model: c.model,
@@ -621,9 +648,7 @@ export function emitChatSpansFromAssistantCalls(
       reasoningTokens: c.reasoningTokens,
       responseId: c.responseId,
       finishReasons: c.finishReason ? [c.finishReason] : undefined,
-      outputMessages: c.contentBlocks.length
-        ? [{ role: 'assistant', content: assistantBlocksToText(c.contentBlocks), parts: c.contentBlocks }]
-        : undefined,
+      outputMessages: parts.length ? [{ role: 'assistant', parts }] : undefined,
     });
   }
 }
@@ -633,10 +658,6 @@ export function parseTimestamp(ts: string | undefined): Date | undefined {
   if (!ts) return undefined;
   const d = new Date(ts);
   return Number.isFinite(d.getTime()) ? d : undefined;
-}
-
-function assistantBlocksToText(blocks: unknown[]): string {
-  return extractAssistantTextBlocks(blocks).join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
