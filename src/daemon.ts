@@ -757,25 +757,22 @@ export class GlobalDaemon {
     // an `agent_start` lifecycle event, and a tool wrapper would mis-render the
     // dispatch as a generic tool call. PostToolUse(Agent) closes the marker.
     //
-    // Fires for the main agent AND a subagent that spawns its own subagent
-    // (`agentId` set): the parent resolves to the spawning subagent's own
-    // marker, so the grandchild nests under it instead of orphaning onto the turn.
+    // Fires for the main agent AND a subagent that spawns its own subagent: a
+    // dispatch from within a subagent (`agentId` set) nests under the spawner's
+    // own marker, so recursive spawns keep their depth; the main agent's
+    // dispatch nests under the current turn.
     //
     // `promptHash` lets SubagentStart correlate deterministically: sha256 of
     // the firing prompt (the subagent transcript's line 1) + subagent_type.
     if (toolName === 'Agent' && toolInput['subagent_type']) {
-      // Parent: the spawning subagent's own marker when this dispatch comes
-      // from inside a subagent, else the current turn.
-      const spawnParent: weave.Turn | weave.SubAgent | undefined = agentId
-        ? session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn
-        : session.currentTurn;
-      if (!spawnParent) {
-        this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}`);
+      const spawner = agentId ? session.subagents.byAgentId(agentId)?.subAgent : session.currentTurn;
+      if (!spawner) {
+        this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
         return;
       }
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
-      const subAgent = spawnParent.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
+      const subAgent = spawner.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
       const subAttrs: Attributes = {
         [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: toolUseId,
         [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput),
