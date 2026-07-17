@@ -35,18 +35,15 @@ import {
   setCompactionAttrs,
   toolDisplayName,
   assistantOutputMessages,
+  buildUsage,
+  contentBlocksToParts,
+  providerFromModel,
+  parseTimestamp,
   snippet,
   jsonStr,
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import type { DaemonConfig } from './config.js';
-import {
-  chatMessageKey,
-  callsForResponseKey,
-  parseIsoOrNow,
-  openChatForGroup,
-  recordChat,
-} from './chatSpans.js';
 import {
   resolvePermissionIfPending,
   hashPrompt,
@@ -70,10 +67,9 @@ import type { AssistantCallDetail } from './parser.js';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Inbound control message sent directly to the socket (not a hook event).
- *  `shutdown` stops the daemon; `config-hash` asks it to reply with the
- *  fingerprint of the config it loaded (used by `status` for drift detection)
- *  plus the daemon's runtime identity (pid, version, entry path). */
+/** Socket control message (not a hook event): `shutdown` stops the daemon;
+ *  `config-hash` replies with the loaded config's fingerprint (drift
+ *  detection) plus the daemon's identity (pid, version, entry path). */
 type ControlMessage = {
   command: 'shutdown' | 'config-hash';
 }
@@ -105,10 +101,8 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   return cmd === 'shutdown' || cmd === 'config-hash';
 }
 
-/** Absolute real path of the daemon's own entry script, resolving the npm bin
- *  symlink to the actual dist/cli.js (or src/cli.ts under tsx). Lets `status`
- *  report which build the running daemon is executing. Falls back to the raw
- *  argv path if it can't be resolved. */
+/** Real path of the daemon's entry script (npm bin symlink resolved), so
+ *  `status` can report which build is actually running. */
 function daemonEntryPath(): string {
   const entry = process.argv[1] ?? '';
   try {
@@ -116,6 +110,37 @@ function daemonEntryPath(): string {
   } catch {
     return entry;
   }
+}
+
+function chatMessageKey(call: AssistantCallDetail, callIdx: number): string {
+  return call.responseId ?? `idx:${callIdx}`;
+}
+
+function parseIsoOrNow(ts: string | undefined): Date {
+  return parseTimestamp(ts) ?? new Date();
+}
+
+function openChat(parent: weave.Turn | weave.SubAgent, call: AssistantCallDetail): weave.LLM | undefined {
+  if (!call.model) return undefined;
+  const provider = providerFromModel(call.model);
+  return parent.startLLM({
+    model: call.model,
+    ...(provider ? { providerName: provider } : {}),
+    startTime: parseIsoOrNow(call.prevTimestamp ?? call.timestamp),
+  });
+}
+
+function recordChat(llm: weave.LLM, call: AssistantCallDetail, agentName?: string): void {
+  const parts = contentBlocksToParts(call.contentBlocks);
+  llm.record({
+    ...(parts.length ? { outputMessages: [{ role: 'assistant', parts }] } : {}),
+    usage: buildUsage(call.usage, call.reasoningTokens),
+    outputType: 'text',
+    ...(call.responseId ? { responseId: call.responseId } : {}),
+    ...(call.finishReason ? { finishReasons: [call.finishReason] } : {}),
+  });
+  if (agentName) llm.setAttributes({ [ATTR.AGENT_NAME]: agentName });
+  llm.end({ endTime: parseIsoOrNow(call.timestamp) });
 }
 
 // Keep resumed sessions warm across long idle gaps.
@@ -140,7 +165,9 @@ export class GlobalDaemon {
    *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
   private pendingInstructions = new Map<string, LoadedInstruction[]>();
   private tracingEnabled = false;
-  /** Cross-session team members awaiting TeammateIdle, queued by team + name. */
+  /** Cross-session team correlation (coordinator's PreToolUse(Agent) → the
+   *  teammate's TeammateIdle), keyed `${team_name}::${name}`. FIFO queue per
+   *  key so a re-spawned name never overwrites a live span. */
   private teamMembers = new Map<string, TeamMember[]>();
   /** Agent calls whose span completion belongs to TeammateIdle, not PostToolUse. */
   private teamDispatches = new Set<PendingSubagentCall>();
@@ -167,10 +194,8 @@ export class GlobalDaemon {
       this.log('INFO', 'No weave_project / API key configured — tracing disabled');
     }
 
-    // Bind the socket, exiting cleanly if another daemon already owns it.
-    // Concurrent hook invocations can each cold-start a daemon, but only one
-    // can bind; the losers exit (process.exit(0)) and their hook still reaches
-    // the winner over the socket. See bindSocketWithHerdProtection.
+    // Concurrent hook invocations can each cold-start a daemon; only one
+    // binds, the losers exit and their event reaches the winner over the socket.
     await this.bindSocketWithHerdProtection();
 
     this.running = true;
@@ -224,12 +249,9 @@ export class GlobalDaemon {
     });
   }
 
-  /**
-   * Bind the daemon socket, tolerant of a herd of concurrent starts. Listen; on
-   * EADDRINUSE/EEXIST, re-probe: a live listener means another daemon won → exit
-   * 0; a stale inode is unlinked and retried. Only a confirmed-stale socket is
-   * ever unlinked, so a late starter can't delete the winner's live socket.
-   */
+  /** Bind the socket, tolerant of a start herd: on EADDRINUSE/EEXIST, a live
+   *  listener means another daemon won (exit 0); only a confirmed-stale inode
+   *  is unlinked and retried, so a late starter can't delete the winner's. */
   private async bindSocketWithHerdProtection(): Promise<void> {
     const MAX_RECLAIM_ATTEMPTS = 5;
     for (let attempt = 0; ; attempt++) {
@@ -506,9 +528,8 @@ export class GlobalDaemon {
       const parentPath = path.join(transcriptDir, `${parent}.jsonl`);
       current = parent;
       if (!fs.existsSync(parentPath)) {
-        // Parent transcript not on disk (e.g., resumed across machines).
-        // Stop here — the recorded parent id is still the best stitching
-        // key we have, even though we can't verify if IT was a fork too.
+        // Parent transcript not on disk (e.g. resumed across machines): stop —
+        // the recorded parent id is still the best stitching key we have.
         this.log(
           'DEBUG',
           `resolveConversationId: parent transcript not on disk: ${parentPath} — stopping chain walk at ${parent}`,
@@ -519,9 +540,8 @@ export class GlobalDaemon {
     }
 
     if (current !== sessionId && source !== 'resume') {
-      // Fork detected but `source` doesn't say resume — log so the mismatch
-      // is visible. We still stitch by the chain root because that's the
-      // correct behavior; this just surfaces an unexpected hook payload.
+      // Unexpected payload (fork found but source isn't 'resume') — still
+      // stitch by the chain root; just surface the mismatch.
       this.log(
         'DEBUG',
         `resolveConversationId: forkedFrom chain found but source='${source}' (expected 'resume') session=${sessionId} root=${current}`,
@@ -1002,6 +1022,8 @@ export class GlobalDaemon {
       return;
     }
 
+    // Other team keys registered but not this one: most likely the
+    // teammate_name ≠ Agent.name invariant broke — log it, then fall through.
     if (this.teamMembers.size > 0) {
       this.log('INFO', `TeammateIdle: no team entry for ${key} (registered: ${[...this.teamMembers.keys()].join(', ')}) — check teammate_name === Agent.name`);
     }
@@ -1027,7 +1049,10 @@ export class GlobalDaemon {
     this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${candidate.transcriptPath}`);
   }
 
-  /** Find the teammate transcript paired with its coordinator-side Agent call. */
+  /** Resolve a teammate's OWN transcript: the coordinator's subagents dir
+   *  holds `agent-<id>.jsonl` + `agent-<id>.meta.json` ({"agentType": name});
+   *  match by agentType, newest mtime wins (re-spawns). Falls back to the idle
+   *  session's transcript (TeammateIdle.session_id is unreliable). */
   private resolveTeammateTranscript(
     coordinatorTranscriptPath: string,
     teammateName: string,
@@ -1055,7 +1080,27 @@ export class GlobalDaemon {
     return idleTranscriptPath;
   }
 
-  /** Emit all teammate turns in a fresh trace, then close its dispatch marker. */
+  /** Emit one chat span per assistant response under `parent`, reconstructed
+   *  from transcript data (backdated times, usage, ordered output parts). */
+  private emitChatSpans(
+    parent: weave.Turn | weave.SubAgent,
+    calls: AssistantCallDetail[],
+    agentName?: string,
+  ): void {
+    for (const call of calls) {
+      const llm = openChat(parent, call);
+      if (llm) recordChat(llm, call, agentName);
+    }
+  }
+
+  /**
+   * Emit a teammate's whole transcript as its OWN turn trace (the spawning
+   * coordinator turn has long closed), then close the Subagent marker. The
+   * coordinator's Conversation handle seeds conversation.id + integration
+   * identity, neither of which inherits cross-session; the turn is backdated
+   * to span the transcript so its chat children stay inside its window.
+   * Returns the teammate's model, if known.
+   */
   private emitTeammateTurnTrace(
     subAgent: weave.SubAgent,
     conversation: weave.Conversation,
@@ -1100,22 +1145,6 @@ export class GlobalDaemon {
     }
     subAgent.end();
     return model;
-  }
-
-  private emitChatSpans(
-    parent: weave.Turn | weave.SubAgent,
-    calls: AssistantCallDetail[],
-    agentName?: string,
-  ): void {
-    const emitted = new Set<string>();
-    for (let i = 0; i < calls.length; i++) {
-      const key = chatMessageKey(calls[i], i);
-      if (emitted.has(key)) continue;
-      emitted.add(key);
-      const group = callsForResponseKey(calls, key);
-      const llm = openChatForGroup(parent, group);
-      if (llm) recordChat(llm, group, agentName);
-    }
   }
 
   private async handlePreCompact(sessionId: string, input: PreCompactHookInput): Promise<void> {
@@ -1319,10 +1348,9 @@ export class GlobalDaemon {
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
-  /** Retry parseSessionFile while the transcript writer catches up to Stop.
-   *  If `finalAssistantMessage` is set, require the last assistant call's
-   *  text to end with it (mod trailing whitespace) — guards against reading
-   *  before the synthesis line lands. Default budget: 5 × 200ms = 1s. */
+  /** Retry the transcript parse while the writer catches up to Stop; when
+   *  `finalAssistantMessage` is set, require the last assistant text to end
+   *  with it. Budget: 5 × 200ms. */
   private async parseSessionFileWithRetry(
     transcript: TranscriptFile,
     finalAssistantMessage?: string,
@@ -1340,12 +1368,9 @@ export class GlobalDaemon {
     let result: ReturnType<typeof parseSessionFd> = null;
     for (let i = 0; i < attempts; i++) {
       result = parseSessionFd(fd);
-      // Writer caught up: parsed at least one turn AND (no synthesis to verify,
-      // OR the last assistant call ends with it).
       if (result?.turns.length && (!expected || lastAssistantTextEndsWith(result, expected))) {
         return result;
       }
-      // No next parse to wait for on the last iteration, so skip the sleep.
       if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
     }
     return result;
