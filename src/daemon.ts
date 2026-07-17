@@ -689,16 +689,14 @@ export class GlobalDaemon {
 
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     if (toolName === 'Agent' && toolInput['subagent_type']) {
-      const spawnParent: weave.Turn | weave.SubAgent | undefined = agentId
-        ? session.activeSubagents.get(agentId)?.subAgent ?? session.currentTurn
-        : session.currentTurn;
-      if (!spawnParent) {
-        this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}`);
+      const spawner = agentId ? session.activeSubagents.get(agentId)?.subAgent : session.currentTurn;
+      if (!spawner) {
+        this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
         return;
       }
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
-      const subAgent = spawnParent.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
+      const subAgent = spawner.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
       if (prompt) {
         subAgent.setAttributes({ [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) });
       }
