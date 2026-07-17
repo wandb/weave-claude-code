@@ -9,6 +9,7 @@ import type { Attributes } from '@opentelemetry/api';
 import type {
   HookInput,
   SessionStartHookInput,
+  InstructionsLoadedHookInput,
   UserPromptSubmitHookInput,
   PreToolUseHookInput,
   PostToolUseHookInput,
@@ -53,12 +54,14 @@ import {
   lastAssistantTextEndsWith,
   readSubagentFirstLineWithRetry,
   newSessionState,
+  upsertInstruction,
 } from './sessionState.js';
 import type {
   PendingToolCall,
   SubagentTracker,
   TeamMember,
   SessionState,
+  LoadedInstruction,
 } from './sessionState.js';
 import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
@@ -68,7 +71,8 @@ import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
 /** Inbound control message sent directly to the socket (not a hook event).
  *  `shutdown` stops the daemon; `config-hash` asks it to reply with the
- *  fingerprint of the config it loaded (used by `status` for drift detection). */
+ *  fingerprint of the config it loaded (used by `status` for drift detection)
+ *  plus the daemon's runtime identity (pid, version, entry path). */
 type ControlMessage = {
   command: 'shutdown' | 'config-hash';
 }
@@ -80,6 +84,19 @@ function isControlMessage(payload: unknown): payload is ControlMessage {
   if (typeof payload !== 'object' || payload === null) return false;
   const cmd = (payload as Record<string, unknown>).command;
   return cmd === 'shutdown' || cmd === 'config-hash';
+}
+
+/** Absolute real path of the daemon's own entry script, resolving the npm bin
+ *  symlink to the actual dist/cli.js (or src/cli.ts under tsx). Lets `status`
+ *  report which build the running daemon is executing. Falls back to the raw
+ *  argv path if it can't be resolved. */
+function daemonEntryPath(): string {
+  const entry = process.argv[1] ?? '';
+  try {
+    return fs.realpathSync(entry);
+  } catch {
+    return entry;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +132,10 @@ export class GlobalDaemon {
   private readonly inactivityMs = Number(process.env.WEAVE_INACTIVITY_MS) || INACTIVITY_TIMEOUT_MS;
   private sessions = new Map<string, SessionState>();
   private sessionQueues = new Map<string, Promise<void>>();
+  /** InstructionsLoaded files that arrived before their session existed (the
+   *  hook can fire before SessionStart). Keyed by session_id; drained into the
+   *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
+  private pendingInstructions = new Map<string, LoadedInstruction[]>();
   /** True once `weave.init` has completed. All span emission is gated on it. */
   private tracingEnabled = false;
   /** Cross-session team correlation, keyed by `${team_name}::${name}`. Bridges
@@ -309,7 +330,16 @@ export class GlobalDaemon {
 
       if (isControlMessage(payload)) {
         if (payload.command === 'config-hash') {
-          socket.end(JSON.stringify({ config_hash: this.configFingerprint() }));
+          // Reply carries the config fingerprint (for drift detection) plus the
+          // daemon's runtime identity, so `status` can show which build is
+          // actually running (pid + version + resolved entry script) rather than
+          // just where the CLI symlink currently points.
+          socket.end(JSON.stringify({
+            config_hash: this.configFingerprint(),
+            pid: process.pid,
+            version: VERSION,
+            path: daemonEntryPath(),
+          }));
         } else {
           socket.end();
           void this.shutdown('control message');
@@ -379,6 +409,11 @@ export class GlobalDaemon {
       switch (input.hook_event_name) {
         case 'SessionStart':
           await this.handleSessionStart(sessionId, input);
+          break;
+        case 'InstructionsLoaded':
+          // Reads the instruction file synchronously off the hook's file_path;
+          // no async work to await.
+          this.handleInstructionsLoaded(sessionId, input);
           break;
         case 'UserPromptSubmit':
           await this.handleUserPromptSubmit(sessionId, input);
@@ -468,6 +503,7 @@ export class GlobalDaemon {
     }
 
     this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
 
     const resumed = conversationId !== sessionId;
     this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
@@ -606,6 +642,7 @@ export class GlobalDaemon {
       turnNumber: priorTurns,
     });
     this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
     // Install the conversation for the current event frame. routeEvent's
     // re-install ran before this session existed, so without this the spans this
     // event emits would miss the integration identity (matches handleSessionStart).
@@ -621,6 +658,60 @@ export class GlobalDaemon {
       `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
     );
     return session;
+  }
+
+  /**
+   * Capture one instruction file (global/project CLAUDE.md, .claude/rules,
+   * @-import) from InstructionsLoaded for `gen_ai.system_instructions`.
+   *
+   * The hook is observability-only and gives `file_path`, not contents, so we
+   * read the file ourselves. The read is synchronous to keep a session-start
+   * burst in load order (async reads could reorder); the files are small and
+   * local, off Claude Code's hot path.
+   *
+   * The hook's order vs SessionStart is not guaranteed (a file can load first),
+   * so instructions arriving before the session exists are buffered and drained
+   * on creation. We do not reconstruct here: handleSessionStart is idempotent,
+   * so a premature reconstruct would no-op the real one and lose its source/model.
+   *
+   * Only files loaded while this daemon runs are captured; a session
+   * reconstructed after a restart starts empty and picks up only files that
+   * (re)load afterward (e.g. load_reason=compact).
+   */
+  private handleInstructionsLoaded(sessionId: string, input: InstructionsLoadedHookInput): void {
+    const filePath = input.file_path;
+    let content: string;
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch (err) {
+      this.log('DEBUG', `InstructionsLoaded: unreadable ${filePath}: ${err}`);
+      return;
+    }
+
+    const instruction: LoadedInstruction = { filePath, content };
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      upsertInstruction(session.systemInstructions, instruction);
+    } else {
+      // Session not set up yet; buffer until SessionStart / reconstruct drains it.
+      const pending = this.pendingInstructions.get(sessionId) ?? [];
+      upsertInstruction(pending, instruction);
+      this.pendingInstructions.set(sessionId, pending);
+    }
+    this.log(
+      'DEBUG',
+      `InstructionsLoaded: session=${sessionId} reason=${input.load_reason} file=${path.basename(filePath)} bytes=${content.length}${session ? '' : ' (buffered)'}`,
+    );
+  }
+
+  /** Move any instructions buffered before this session existed into its state,
+   *  then discard the buffer. */
+  private drainPendingInstructions(session: SessionState): void {
+    const pending = this.pendingInstructions.get(session.sessionId);
+    this.pendingInstructions.delete(session.sessionId);
+    if (!pending?.length) return;
+    for (const instruction of pending) upsertInstruction(session.systemInstructions, instruction);
+    this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
   private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
@@ -651,6 +742,7 @@ export class GlobalDaemon {
       agentName: this.agentName,
       agentVersion: VERSION,
       ...(session.initialRequestModel ? { model: session.initialRequestModel } : {}),
+      systemInstructions: session.systemInstructions.map((i) => i.content),
       startTime: new Date(),
     });
     turn.setAttributes({
@@ -1073,16 +1165,73 @@ export class GlobalDaemon {
     this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
   }
 
+  /** The session's open turn, opening a fresh one if a restart left the
+   *  session without a turn, so a subagent recovered at SubagentStop has a parent. */
+  private getOrReconstructTurn(session: SessionState): weave.Turn | undefined {
+    if (session.currentTurn) return session.currentTurn;
+    if (!this.tracingEnabled) return undefined;
+    const turnNumber = session.turnNumber || 1;
+    const turn = weave.startTurn({
+      agentName: this.agentName,
+      agentVersion: VERSION,
+      ...(session.initialRequestModel ? { model: session.initialRequestModel } : {}),
+      startTime: new Date(),
+    });
+    turn.setAttributes({
+      [ATTR.WEAVE_SESSION_ID]: session.sessionId,
+      [ATTR.WEAVE_CWD]: session.cwd,
+      [ATTR.WEAVE_SOURCE]: session.source,
+      [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
+      [ATTR.WEAVE_TURN_NUMBER]: turnNumber,
+      [ATTR.WEAVE_DISPLAY_NAME]: `Turn ${turnNumber} (reconstructed)`,
+    });
+    session.currentTurn = turn;
+    this.log('INFO', `Reconstructed turn span (turn ${turnNumber}) after restart`);
+    return turn;
+  }
+
+  /** Rebuild a subagent tracker when SubagentStop finds none: the subagent
+   *  started under a daemon that has since restarted. Opens an invoke_agent
+   *  span under the turn so the normal emit path records it instead of
+   *  dropping it. */
+  private recoverSubagentTracker(
+    session: SessionState,
+    agentId: string,
+    agentType: string,
+  ): SubagentTracker | undefined {
+    const turn = this.getOrReconstructTurn(session);
+    if (!turn) return undefined;
+    const subAgent = turn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
+    subAgent.record({ agentId });
+    subAgent.setAttributes({
+      [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
+      [ATTR.WEAVE_ORPHAN_REASON]: 'recovered at SubagentStop after daemon restart (no tracker)',
+    });
+    const tracker: SubagentTracker = {
+      subagentType: agentType,
+      detectedAt: new Date(),
+      agentId,
+      subAgent,
+      transcriptPath: computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId),
+    };
+    session.subagents.add(tracker);
+    this.log('INFO', `SubagentStop: recovered subagent agentId=${agentId} type=${agentType} after restart`);
+    return tracker;
+  }
+
   private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
+    // Reconstruct the session if a restart lost it (see getOrReconstructSession).
+    const session = await this.getOrReconstructSession(sessionId, input);
     if (!session || !this.tracingEnabled) return;
 
     const agentId = input.agent_id;
     if (!agentId) return;
 
-    const tracker = session.subagents.byAgentId(agentId);
+    // No tracker: the subagent started under a since-restarted daemon. Recover it.
+    const tracker = session.subagents.byAgentId(agentId)
+      ?? this.recoverSubagentTracker(session, agentId, input.agent_type);
     if (!tracker) {
-      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId}`);
+      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId} and none recoverable`);
       return;
     }
 
@@ -1091,7 +1240,11 @@ export class GlobalDaemon {
     // with the subagent's `gen_ai.agent.name` so the Agents view groups them.
     const chatParent = session.currentTurn;
 
-    const agentTranscriptPath = input.agent_transcript_path;
+    // Fall back to the stored or agentId-derived path when the payload omits it.
+    const agentTranscriptPath =
+      input.agent_transcript_path ??
+      tracker.transcriptPath ??
+      computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     let model: string | undefined;
     let lastAssistantText: string | undefined;
     if (agentTranscriptPath && chatParent) {
@@ -1447,6 +1600,9 @@ export class GlobalDaemon {
   }
 
   private async handleSessionEnd(sessionId: string, input: SessionEndHookInput): Promise<void> {
+    // Discard any never-drained instruction buffer (e.g. a session that emitted
+    // InstructionsLoaded but never SessionStart) so the map can't leak.
+    this.pendingInstructions.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
 

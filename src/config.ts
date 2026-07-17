@@ -88,10 +88,21 @@ export function resolveDaemonConfig(settings: Settings, env: NodeJS.ProcessEnv):
   return {
     weaveProject: resolveProject(settings, env).value,
     apiKey: resolveApiKey(settings, env).value,
-    baseUrl: (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, ''),
+    baseUrl: resolveTraceBaseUrl(env),
     agentName: resolveAgentName(settings, env).value,
     debug: !!env['WEAVE_CLAUDE_DEBUG'] || settings.debug === true,
   };
+}
+
+/** Resolve the Weave trace server base URL for OTLP export. `WF_TRACE_SERVER_URL`
+ *  wins when set. Otherwise `WANDB_BASE_URL` is used, but SaaS `api.wandb.ai` is
+ *  the wandb API host with no OTLP route, so it maps to `trace.wandb.ai`; a
+ *  self-hosted `WANDB_BASE_URL` passes through unchanged. */
+function resolveTraceBaseUrl(env: NodeJS.ProcessEnv): string {
+  const explicit = env['WF_TRACE_SERVER_URL']?.trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  const base = (env['WANDB_BASE_URL'] ?? 'https://trace.wandb.ai').replace(/\/+$/, '');
+  return /^https?:\/\/api\.wandb\.ai$/i.test(base) ? 'https://trace.wandb.ai' : base;
 }
 
 /** Hex chars kept from the config hash. 16 (64 bits) is ample to detect a

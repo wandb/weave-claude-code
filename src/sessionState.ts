@@ -92,6 +92,20 @@ export function lastAssistantTextEndsWith(
   return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
 }
 
+/** One instruction file surfaced by the `InstructionsLoaded` hook. Accumulated
+ *  per session (deduped by path) and stamped as `gen_ai.system_instructions` on
+ *  each turn root. */
+export type LoadedInstruction = { filePath: string; content: string };
+
+/** Append `item` to `list` in place, replacing any existing entry with the same
+ *  filePath so a reloaded file (e.g. `load_reason=compact`) updates rather than
+ *  duplicates. Preserves each file's first-seen position. */
+export function upsertInstruction(list: LoadedInstruction[], item: LoadedInstruction): void {
+  const idx = list.findIndex((i) => i.filePath === item.filePath);
+  if (idx >= 0) list[idx] = item;
+  else list.push(item);
+}
+
 /** Read the subagent transcript's first line, retrying briefly because Claude
  *  Code may not have flushed it yet when SubagentStart fires. Total wait
  *  bounded by the sum of `RETRY_DELAYS_MS`. */
@@ -221,6 +235,10 @@ export type SessionState = {
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
 
+  /** Instruction files (global/project CLAUDE.md, .claude/rules, @-imports)
+   *  captured from InstructionsLoaded, in load order, deduped by path. Stamped
+   *  on every turn root as `gen_ai.system_instructions`. */
+  systemInstructions: LoadedInstruction[];
 }
 
 /**
@@ -338,5 +356,6 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     pendingToolCalls: new Map(),
     subagents: new SubagentTracking(),
     emittedChatSpanResponseKeys: new Set(),
+    systemInstructions: [],
   };
 }

@@ -48,6 +48,7 @@ export const ATTR = {
   INPUT_MESSAGES: 'gen_ai.input.messages',
   OUTPUT_MESSAGES: 'gen_ai.output.messages',
   OUTPUT_TYPE: 'gen_ai.output.type',
+  SYSTEM_INSTRUCTIONS: 'gen_ai.system_instructions',
 
   // GenAI semconv - errors
   ERROR_TYPE: 'error.type',

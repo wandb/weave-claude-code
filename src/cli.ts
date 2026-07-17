@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { spawnSync, spawn } from 'child_process';
 import {
   CONFIG_DIR,
@@ -392,6 +393,11 @@ interface StatusReport {
   /** True when a daemon is alive but loaded an older config than settings.json
    *  now resolves to, so a restart is needed to pick up the change. */
   config_drift: boolean;
+  /** Identity the live daemon reported for itself: its pid, version, and the
+   *  resolved entry script it's executing. All null when no daemon is alive or
+   *  it predates identity reporting. Lets you confirm which build is actually
+   *  running (e.g. a linked local dev build vs the published install). */
+  daemon: { pid: number | null; version: string | null; path: string | null };
   ready_to_trace: boolean;
   view_traces_url: string | null;
 }
@@ -422,6 +428,7 @@ async function gatherStatus(): Promise<StatusSnapshot> {
     daemon_socket: { path: null, state: null },
     log_file: { path: null, size_bytes: null },
     config_drift: false,
+    daemon: { pid: null, version: null, path: null },
     ready_to_trace: false,
     view_traces_url: null,
   };
@@ -480,11 +487,16 @@ async function gatherStatus(): Promise<StatusSnapshot> {
   if (report.daemon_socket.state === SocketState.Alive) {
     try {
       const reply = await requestFromSocket(settings.daemon_socket, JSON.stringify({ command: 'config-hash' }));
-      const running = (JSON.parse(reply) as Record<string, unknown>)['config_hash'];
+      const parsed = JSON.parse(reply) as Record<string, unknown>;
+      const running = parsed['config_hash'];
       const current = daemonConfigFingerprint(resolveDaemonConfig(settings, process.env));
       report.config_drift = typeof running === 'string' && running !== current;
+      // Runtime identity the daemon reports about itself (absent on older daemons).
+      if (typeof parsed['pid'] === 'number') report.daemon.pid = parsed['pid'];
+      if (typeof parsed['version'] === 'string') report.daemon.version = parsed['version'];
+      if (typeof parsed['path'] === 'string') report.daemon.path = parsed['path'];
     } catch {
-      // Daemon did not reply with a fingerprint; cannot determine drift.
+      // Daemon did not reply; cannot determine drift or identity.
     }
   }
 
@@ -501,90 +513,115 @@ async function gatherStatus(): Promise<StatusSnapshot> {
   return snap;
 }
 
+const STATUS_LABEL_WIDTH = 8;
+
+/** Replace the home-dir prefix with `~` so long absolute paths stay readable. */
+function abbrevHome(p: string): string {
+  const home = os.homedir();
+  return home && p.startsWith(home + path.sep) ? `~${p.slice(home.length)}` : p;
+}
+
+/** Human-readable byte size: KB under 1 MiB, MB above. */
+function humanSize(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+/** One indented "glyph label   value" row under a section header, label padded
+ *  so values line up. An optional `hint` (a fix command) prints on the next
+ *  line, arrow-prefixed. */
+function statusRow(glyph: string, label: string, value: string, hint?: string): void {
+  console.log(`  ${glyph} ${label.padEnd(STATUS_LABEL_WIDTH)} ${value}`);
+  if (hint) console.log(`    ${' '.repeat(STATUS_LABEL_WIDTH)} → ${hint}`);
+}
+
 function printPrettyStatus(snap: StatusSnapshot): void {
   const { report, config_state, config_error, api_key_masked, api_key_source } = snap;
 
-  console.log('Weave Claude Code Plugin Status');
-  console.log('================================');
-
+  // Not-yet-configured states are terminal: there are no sections to show.
   if (config_state === ConfigState.Missing) {
-    console.log(`✗ Configuration: not found at ${report.settings_file}`);
-    console.log('\nRun: weave-claude-code install');
+    console.log('Weave Claude Code — not configured');
+    console.log(`  No config at ${abbrevHome(report.settings_file)}`);
+    console.log('  → weave-claude-code install');
     return;
   }
   if (config_state === ConfigState.Unreadable) {
-    console.log(`✗ Configuration: failed to read (${config_error})`);
+    console.log('Weave Claude Code — config unreadable');
+    console.log(`  Failed to read ${abbrevHome(report.settings_file)} (${config_error})`);
     return;
   }
-  console.log(`✓ Configuration: ${report.settings_file}`);
 
-  if (report.cli_path) {
-    console.log(`✓ CLI: ${report.cli_path} (v${report.version})`);
-  } else {
-    console.log('✗ CLI: weave-claude-code not found in PATH');
-    console.log('  Run: npm install -g weave-claude-code');
-  }
+  const socketState = report.daemon_socket.state;
 
-  if (report.weave_project) {
-    console.log(`✓ Weave project: ${report.weave_project} (from ${report.weave_project_source})`);
-  } else {
-    console.log('✗ Weave project: not configured');
-    console.log('  Run: weave-claude-code config set weave_project ENTITY/PROJECT');
-  }
-
-  if (report.api_key_configured) {
-    console.log(`✓ W&B API key: ${api_key_masked} (from ${api_key_source})`);
-  } else {
-    console.log('✗ W&B API key: not configured');
-    console.log('  Run: weave-claude-code config set wandb_api_key <your-api-key>');
-  }
-
-  console.log(`✓ Agent name: ${report.agent_name}`);
-  if (report.config_drift) {
-    console.log('⚠ Daemon is running an older config. Run: weave-claude-code restart');
-  }
-
-  if (report.plugin_source === null) {
-    console.log('✗ Source: not registered');
-    console.log('  Run: weave-claude-code install');
-  } else if (report.plugin_source.type === 'github') {
-    const refLabel = report.plugin_source.ref ? ` @ ${report.plugin_source.ref}` : '';
-    console.log(`✓ Source: github ${report.plugin_source.repo}${refLabel}`);
-  } else {
-    const versionLabel = report.plugin_source.version ? ` @ v${report.plugin_source.version}` : '';
-    console.log(`✓ Source: directory ${report.plugin_source.path}${versionLabel}`);
-  }
-
-  const { path: socketPath, state: socketState } = report.daemon_socket;
-  if (socketState === SocketState.Alive) {
-    console.log(`✓ Daemon socket: ${socketPath} (alive)`);
-  } else if (socketState === SocketState.Stale) {
-    console.log(`✗ Daemon socket: ${socketPath} (stale — file exists but no listener)`);
-    console.log(`  Auto-recovers on next Claude Code session — no action needed.`);
-  } else {
-    console.log(`- Daemon socket: ${socketPath} (not running)`);
-  }
-
-  if (report.log_file.size_bytes !== null) {
-    const kb = (report.log_file.size_bytes / 1024).toFixed(1);
-    console.log(`✓ Log file: ${report.log_file.path} (${kb} KB)`);
-  } else {
-    console.log(`- Log file: ${report.log_file.path} (not created yet)`);
-  }
-
-  console.log('');
+  // Headline: lead with the overall state and the single most useful follow-up.
   if (report.ready_to_trace) {
-    console.log('Status: Ready to trace');
-    console.log(`View traces: ${report.view_traces_url}`);
+    console.log('Weave Claude Code — ready to trace');
+    console.log(`  ${report.view_traces_url}`);
   } else if (socketState === SocketState.Stale) {
-    console.log('Status: Daemon socket is stale — will auto-recover on next Claude Code hook');
+    console.log('Weave Claude Code — daemon socket stale (auto-recovers next session)');
   } else {
     const missing = missingConfig(
       report.weave_project,
       report.api_key_configured ? 'set' : null,
       'wandb_api_key',
     );
-    console.log(`Status: Configuration incomplete — set ${missing} to start tracing`);
+    console.log('Weave Claude Code — configuration incomplete');
+    if (missing) console.log(`  Set ${missing} to start tracing`);
+  }
+
+  // Config
+  console.log(`\nConfig    ${abbrevHome(report.settings_file)}`);
+  if (report.weave_project) {
+    statusRow('✓', 'Project', `${report.weave_project}  (${report.weave_project_source})`);
+  } else {
+    statusRow('✗', 'Project', 'not set', 'weave-claude-code config set weave_project ENTITY/PROJECT');
+  }
+  if (report.api_key_configured) {
+    statusRow('✓', 'API key', `${api_key_masked}  (${api_key_source})`);
+  } else {
+    statusRow('✗', 'API key', 'not set', 'weave-claude-code config set wandb_api_key <your-api-key>');
+  }
+  statusRow('✓', 'Agent', report.agent_name);
+
+  // Plugin
+  console.log('\nPlugin');
+  if (report.cli_path) {
+    statusRow('✓', 'CLI', `v${report.version}   ${abbrevHome(report.cli_path)}`);
+  } else {
+    statusRow('✗', 'CLI', 'not found in PATH', 'npm install -g weave-claude-code');
+  }
+  if (report.plugin_source === null) {
+    statusRow('✗', 'Source', 'not registered', 'weave-claude-code install');
+  } else if (report.plugin_source.type === 'github') {
+    const refLabel = report.plugin_source.ref ? ` @ ${report.plugin_source.ref}` : '';
+    statusRow('✓', 'Source', `github ${report.plugin_source.repo}${refLabel}`);
+  } else {
+    const versionLabel = report.plugin_source.version ? ` @ v${report.plugin_source.version}` : '';
+    statusRow('✓', 'Source', `directory ${abbrevHome(report.plugin_source.path)}${versionLabel}`);
+  }
+
+  // Daemon — section header carries the overall daemon state.
+  const daemonState =
+    socketState === SocketState.Alive ? '● alive'
+    : socketState === SocketState.Stale ? '⚠ stale (file exists, no listener)'
+    : '○ not running';
+  console.log(`\nDaemon    ${daemonState}`);
+  if (socketState === SocketState.Alive) {
+    if (report.daemon.pid !== null) {
+      const v = report.daemon.version ? `v${report.daemon.version}` : 'version unknown';
+      statusRow('✓', 'Process', `pid ${report.daemon.pid} (${v})`);
+    }
+    if (report.daemon.path) {
+      statusRow('✓', 'From', abbrevHome(report.daemon.path));
+    }
+    if (report.config_drift) {
+      statusRow('⚠', 'Config', 'daemon on an older config', 'weave-claude-code restart');
+    }
+  }
+  if (report.log_file.size_bytes !== null) {
+    statusRow('✓', 'Log', `${abbrevHome(report.log_file.path ?? '')} (${humanSize(report.log_file.size_bytes)})`);
+  } else {
+    statusRow('-', 'Log', `${abbrevHome(report.log_file.path ?? '')} (not created yet)`);
   }
 }
 
