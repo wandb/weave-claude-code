@@ -146,7 +146,7 @@ export type SubagentTracker = {
   subagentType: string;
   detectedAt: Date;
   toolUseId?: string;          // tool_use_id of the spawning Agent tool (matched path only)
-  subAgent?: weave.SubAgent;   // subagent's `invoke_agent` marker span (a leaf)
+  subAgent?: weave.SubAgent;   // subagent's `invoke_agent` marker span; its chat/tool spans nest here
   agentId?: string;
   /** sha256 of the prompt passed to the Agent tool; matched against the
    *  subagent's transcript line-1 user message at SubagentStart. */

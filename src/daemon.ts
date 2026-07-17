@@ -814,14 +814,15 @@ export class GlobalDaemon {
       return;
     }
 
-    // Parent for the tool span. A SubAgent is a leaf (it can't parent tools), so
-    // a subagent's own tools nest directly under the turn and carry the
-    // subagent's `gen_ai.agent.name` so the Agents view groups them. For the
-    // main agent, nest under the active response's chat span (advanced from the
-    // transcript), falling back to the turn when the machine can't advance yet.
-    const subagentType = agentId ? session.subagents.byAgentId(agentId)?.subagentType : undefined;
-    const parent: weave.Turn | weave.LLM | undefined = agentId
-      ? session.currentTurn
+    // Parent for the tool span. A subagent's tools nest under its own
+    // `invoke_agent` marker, tagged with the subagent's `gen_ai.agent.name` so
+    // they also stay queryable by agent (falling back to the turn if the marker
+    // is missing). For the main agent, nest under the active response's chat
+    // span (advanced from the transcript), falling back to the turn when the
+    // machine can't advance yet.
+    const tracker = agentId ? session.subagents.byAgentId(agentId) : undefined;
+    const parent: weave.Turn | weave.SubAgent | weave.LLM | undefined = agentId
+      ? tracker?.subAgent ?? session.currentTurn
       : this.advanceMainAgentChatSpan(session, toolUseId) ?? session.currentTurn;
     if (!parent) {
       this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
@@ -835,7 +836,7 @@ export class GlobalDaemon {
       startTime: new Date(),
     });
     const toolAttrs: Attributes = { [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput) };
-    if (subagentType) toolAttrs[ATTR.AGENT_NAME] = subagentType;
+    if (tracker) toolAttrs[ATTR.AGENT_NAME] = tracker.subagentType;
     tool.setAttributes(toolAttrs);
     session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
   }
@@ -1199,10 +1200,11 @@ export class GlobalDaemon {
       return;
     }
 
-    // The subagent marker (SubAgent) is a leaf and can't parent chat spans, so
-    // the subagent's LLM calls are emitted under the current turn and tagged
-    // with the subagent's `gen_ai.agent.name` so the Agents view groups them.
-    const chatParent = session.currentTurn;
+    // The subagent's LLM calls nest under its `invoke_agent` marker, so its
+    // work (and token usage) reads as the subagent's own subtree. Orphans that
+    // never got a marker fall back to the turn; the `gen_ai.agent.name` tag on
+    // each chat keeps them queryable by agent either way.
+    const chatParent = tracker.subAgent ?? session.currentTurn;
 
     // Fall back to the stored or agentId-derived path when the payload omits it.
     const agentTranscriptPath =
@@ -1411,7 +1413,7 @@ export class GlobalDaemon {
    * by agent; conversation.id is inherited from the parent handle chain.
    */
   private emitChatSpans(
-    parent: weave.Turn,
+    parent: weave.Turn | weave.SubAgent,
     calls: AssistantCallDetail[],
     agentName?: string,
   ): void {

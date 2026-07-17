@@ -57,10 +57,10 @@ export function parseIsoOrNow(ts: string | undefined): Date {
   return parseTimestamp(ts) ?? new Date();
 }
 
-/** Open a chat (LLM) span under `turn` for `model`, deriving the provider. */
-export function startChat(turn: weave.Turn, model: string, startTime: Date): weave.LLM {
+/** Open a chat (LLM) span under a turn or subagent for `model`, deriving the provider. */
+export function startChat(parent: weave.Turn | weave.SubAgent, model: string, startTime: Date): weave.LLM {
   const provider = providerFromModel(model);
-  return turn.startLLM({ model, ...(provider ? { providerName: provider } : {}), startTime });
+  return parent.startLLM({ model, ...(provider ? { providerName: provider } : {}), startTime });
 }
 
 /**

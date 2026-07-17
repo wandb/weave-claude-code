@@ -67,13 +67,14 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
     );
     assert.ok(subInvoke, `expected a recovered subagent invoke_agent span; got: ${names}`);
 
-    // The SubAgent marker is a leaf, so the subagent's chat spans flatten under
-    // the turn tagged with the subagent's agent.name — and carry its tokens.
+    // The subagent's chat spans nest under its invoke_agent marker — and carry
+    // its tokens.
     const chat = spans.find(
       (s) => s.attributes['gen_ai.operation.name'] === 'chat' && s.attributes['gen_ai.agent.name'] === 'general-purpose',
     );
     assert.ok(chat, `expected the subagent chat span; got: ${names}`);
     assert.ok(Number(chat.attributes['gen_ai.usage.output_tokens']) > 0, 'chat span carries the subagent token usage');
+    assert.equal(spanParentId(chat), subInvoke.spanContext().spanId, 'subagent chat nests under the subagent invoke_agent span');
 
     // Recovery reconstructs the turn; the subagent nests under it.
     const turn = spans.find(
@@ -81,7 +82,6 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
     );
     assert.ok(turn, `expected a reconstructed turn span to parent the subagent; got: ${names}`);
     assert.equal(spanParentId(subInvoke), turn.spanContext().spanId, 'subagent invoke_agent nests under the reconstructed turn');
-    assert.equal(spanParentId(chat), turn.spanContext().spanId, 'subagent chat flattens under the reconstructed turn');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
