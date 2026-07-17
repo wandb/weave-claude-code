@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// An execute_tool span carries no conversation id of its own; it inherits
-// gen_ai.conversation.id from its root turn span at query time. If that root is
-// lost to a hard crash (SIGKILL/OOM, no graceful cleanup), the exported tool span
-// can't be stitched to a conversation. Every other span builder already propagates
-// the id; this drives a real PreToolUse and asserts the tool span carries it too.
+// Regression test: a lost root span (hard crash) orphaned already-exported
+// tool spans that had no conversation id of their own.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

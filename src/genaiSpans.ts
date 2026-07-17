@@ -368,8 +368,7 @@ type ToolSpanArgs = {
   toolName: string;
   toolUseId: string;
   toolInput: Record<string, unknown>;
-  /** Stitching key: same value as the enclosing turn's `gen_ai.conversation.id`,
-   *  propagated directly so the tool span stays attributable if its root is lost. */
+  /** Stitching key — same as the enclosing turn's `gen_ai.conversation.id`. */
   conversationId: string;
   displayName?: string;
 };
