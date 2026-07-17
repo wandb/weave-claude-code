@@ -5,11 +5,41 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { spawnSync } from 'child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'child_process';
 import { findClaudeCLI, appendToLog } from './utils.js';
 import { VERSION } from './version.mjs';
 
 export { VERSION };
+
+// Shared spawnSync options for every `claude plugin ...` invocation: capture
+// utf8 stdout/stderr through pipes so we can inspect the output for status.
+const CLAUDE_SPAWN_OPTS: SpawnSyncOptionsWithStringEncoding = {
+  encoding: 'utf8',
+  stdio: ['pipe', 'pipe', 'pipe'],
+};
+
+/** Concatenate a spawnSync result's stderr and stdout (either may be null). */
+function combinedOutput(result: SpawnSyncReturns<string>): string {
+  return (result.stderr ?? '') + (result.stdout ?? '');
+}
+
+/**
+ * Throw (and log) `Failed to ${action}: ${output}` when a `claude plugin ...`
+ * command exited non-zero, unless `alreadyOk` (a matched "already
+ * registered/installed" message) makes the non-zero exit benign.
+ */
+function failIfError(
+  result: SpawnSyncReturns<string>,
+  alreadyOk: boolean,
+  logFile: string,
+  action: string,
+): void {
+  if (result.status === 0 || alreadyOk) return;
+  const output = combinedOutput(result).trim();
+  const msg = `Failed to ${action}: ${output}`;
+  appendToLog(logFile, 'ERROR', msg);
+  throw new Error(msg);
+}
 
 export interface Settings {
   log_file: string;
@@ -177,7 +207,7 @@ export type PluginSource =
  * unparseable. Caller is responsible for shape validation on the returned
  * value (typed as `unknown`).
  */
-function readJsonFile(filePath: string): unknown | null {
+function readJsonFile(filePath: string): unknown {
   if (!fs.existsSync(filePath)) return null;
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -192,17 +222,10 @@ function readJsonFile(filePath: string): unknown | null {
  * version for directory-source registrations.
  */
 function readPackageVersion(dir: string): string | null {
-  const pkg = readJsonFile(path.join(dir, 'package.json')) as { version?: unknown } | null;
+  const pkg = readJsonFile(path.join(dir, 'package.json')) as { version?: unknown };
   return typeof pkg?.version === 'string' ? pkg.version : null;
 }
 
-/**
- * Read and normalize the source spec Claude Code has registered for the given
- * marketplace, or null if the marketplace isn't registered or the on-disk
- * shape is unrecognized. Unknown shapes are treated as null rather than
- * throwing so a future Claude Code schema change degrades to "Source: not
- * registered" rather than crashing status.
- */
 /**
  * Shape of a github-source entry inside known_marketplaces.json. `ref` is
  * optional because pre-v0.2 marketplace registrations didn't pin to a tag.
@@ -220,6 +243,13 @@ function isRawDirectorySource(s: Record<string, unknown>): s is RawDirectorySour
   return s['source'] === 'directory' && typeof s['path'] === 'string';
 }
 
+/**
+ * Read and normalize the source spec Claude Code has registered for the given
+ * marketplace, or null if the marketplace isn't registered or the on-disk
+ * shape is unrecognized. Unknown shapes are treated as null rather than
+ * throwing so a future Claude Code schema change degrades to "Source: not
+ * registered" rather than crashing status.
+ */
 export function readRegisteredPluginSource(marketplaceName: string): PluginSource | null {
   const knownPath = path.join(os.homedir(), '.claude', 'plugins', 'known_marketplaces.json');
   const raw = readJsonFile(knownPath);
@@ -303,15 +333,10 @@ export function registerPlugin(
   const mktResult = spawnSync(
     claudePath,
     ['plugin', 'marketplace', 'add', marketplaceArg],
-    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    CLAUDE_SPAWN_OPTS,
   );
-  const mktAlready = /already/i.test((mktResult.stderr ?? '') + (mktResult.stdout ?? ''));
-  if (mktResult.status !== 0 && !mktAlready) {
-    const output = ((mktResult.stderr ?? '') + (mktResult.stdout ?? '')).trim();
-    const msg = `Failed to register marketplace '${marketplaceArg}': ${output}`;
-    appendToLog(logFile, 'ERROR', msg);
-    throw new Error(msg);
-  }
+  const mktAlready = /already/i.test(combinedOutput(mktResult));
+  failIfError(mktResult, mktAlready, logFile, `register marketplace '${marketplaceArg}'`);
 
   const refAfter = readRegisteredMarketplaceRef(MARKETPLACE_NAME);
   // Drift detection compares marketplace refs (version tags). Local sources
@@ -323,15 +348,10 @@ export function registerPlugin(
   const pluginResult = spawnSync(
     claudePath,
     ['plugin', 'install', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
-    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    CLAUDE_SPAWN_OPTS,
   );
-  const pluginAlready = /already/i.test((pluginResult.stderr ?? '') + (pluginResult.stdout ?? ''));
-  if (pluginResult.status !== 0 && !pluginAlready) {
-    const output = ((pluginResult.stderr ?? '') + (pluginResult.stdout ?? '')).trim();
-    const msg = `Failed to install plugin '${PLUGIN_NAME}': ${output}`;
-    appendToLog(logFile, 'ERROR', msg);
-    throw new Error(msg);
-  }
+  const pluginAlready = /already/i.test(combinedOutput(pluginResult));
+  failIfError(pluginResult, pluginAlready, logFile, `install plugin '${PLUGIN_NAME}'`);
 
   const { updated: pluginUpdated } = maybeUpdateOutdatedPlugin(claudePath, logFile, refDrifted, pluginAlready);
 
@@ -364,14 +384,9 @@ function maybeUpdateOutdatedPlugin(
   const updateResult = spawnSync(
     claudePath,
     ['plugin', 'update', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
-    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    CLAUDE_SPAWN_OPTS,
   );
-  if (updateResult.status !== 0) {
-    const output = ((updateResult.stderr ?? '') + (updateResult.stdout ?? '')).trim();
-    const msg = `Failed to update plugin '${PLUGIN_NAME}': ${output}`;
-    appendToLog(logFile, 'ERROR', msg);
-    throw new Error(msg);
-  }
+  failIfError(updateResult, /*alreadyOk*/ false, logFile, `update plugin '${PLUGIN_NAME}'`);
   return { updated: true };
 }
 
@@ -399,15 +414,15 @@ export function unregisterPlugin(): UninstallResult {
   const pluginResult = spawnSync(
     claudePath,
     ['plugin', 'uninstall', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '--scope', 'user'],
-    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    CLAUDE_SPAWN_OPTS,
   );
   const pluginAlreadyAbsent = /not installed|not found|unknown plugin|no installed plugin/i
-    .test((pluginResult.stderr ?? '') + (pluginResult.stdout ?? ''));
+    .test(combinedOutput(pluginResult));
   if (pluginResult.status !== 0) {
     if (pluginAlreadyAbsent) {
       pluginStatus = RemovalStatus.AlreadyAbsent;
     } else {
-      const output = ((pluginResult.stderr ?? '') + (pluginResult.stdout ?? '')).trim();
+      const output = combinedOutput(pluginResult).trim();
       pluginStatus = RemovalStatus.Failed;
       pluginError = `Failed to uninstall plugin '${PLUGIN_NAME}': ${output}`;
     }
@@ -421,15 +436,15 @@ export function unregisterPlugin(): UninstallResult {
   const mktResult = spawnSync(
     claudePath,
     ['plugin', 'marketplace', 'remove', MARKETPLACE_NAME],
-    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    CLAUDE_SPAWN_OPTS,
   );
   const marketplaceAlreadyAbsent = /not found|unknown marketplace|no configured marketplace/i
-    .test((mktResult.stderr ?? '') + (mktResult.stdout ?? ''));
+    .test(combinedOutput(mktResult));
   if (mktResult.status !== 0) {
     if (marketplaceAlreadyAbsent) {
       marketplaceStatus = RemovalStatus.AlreadyAbsent;
     } else {
-      const output = ((mktResult.stderr ?? '') + (mktResult.stdout ?? '')).trim();
+      const output = combinedOutput(mktResult).trim();
       marketplaceStatus = RemovalStatus.Failed;
       marketplaceError = `Failed to remove marketplace '${MARKETPLACE_NAME}': ${output}`;
     }
