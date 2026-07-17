@@ -16,7 +16,7 @@ import * as net from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { resolveDaemonConfig, daemonConfigFingerprint } from '../src/daemon.ts';
+import { resolveDaemonConfig, daemonConfigFingerprint } from '../src/config.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
