@@ -21,6 +21,22 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import type {
+  HookInput,
+  SessionStartHookInput,
+  InstructionsLoadedHookInput,
+  UserPromptSubmitHookInput,
+  PreToolUseHookInput,
+  PostToolUseHookInput,
+  PostToolUseFailureHookInput,
+  PermissionRequestHookInput,
+  SubagentStartHookInput,
+  SubagentStopHookInput,
+  TeammateIdleHookInput,
+  PreCompactHookInput,
+  StopHookInput,
+  SessionEndHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 import { loadSettings, VERSION } from './setup.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import { appendToLog, deepEqual } from './utils.js';
@@ -769,16 +785,16 @@ export class GlobalDaemon {
   // ── event routing ─────────────────────────────────────────────────────────
 
   private async routeEvent(payload: HookPayload): Promise<void> {
-    const eventName = payload['hook_event_name'] as string | undefined;
-    const sessionId = payload['session_id'] as string | undefined;
-    const agentId = payload['agent_id'] as string | undefined;
-
+    // Trust the raw hook JSON against the SDK's schema once here so dispatch
+    // and handlers work with typed, discriminated inputs.
+    const input = payload as HookInput;
+    const sessionId = input.session_id;
     if (!sessionId) {
       this.log('ERROR', 'Missing session_id in payload');
       return;
     }
 
-    this.log('INFO', `${eventName ?? 'unknown'} session=${sessionId}${agentId ? ` agent=${agentId}` : ''}`);
+    this.log('INFO', `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`);
 
     // Activate the session's integration baggage for the whole event so every
     // span created while handling it inherits the integration identity (copied
@@ -790,75 +806,69 @@ export class GlobalDaemon {
       ? propagation.setBaggage(otelContext.active(), session.integrationBaggage)
       : otelContext.active();
     await otelContext.with(eventContext, () =>
-      this.dispatchEvent(eventName, sessionId, agentId, payload),
+      this.dispatchEvent(input, sessionId),
     );
   }
 
-  /** Run the handler for a single hook event. Split out from `routeEvent` so
-   *  the latter can run it inside the session's baggage context. */
-  private async dispatchEvent(
-    eventName: string | undefined,
-    sessionId: string,
-    agentId: string | undefined,
-    payload: HookPayload,
-  ): Promise<void> {
+  /** Narrow `input` via the discriminant and run its handler (inside the
+   *  session's baggage context installed by `routeEvent`). */
+  private async dispatchEvent(input: HookInput, sessionId: string): Promise<void> {
     try {
-      switch (eventName) {
+      switch (input.hook_event_name) {
         case 'SessionStart':
-          await this.handleSessionStart(sessionId, payload);
+          await this.handleSessionStart(sessionId, input);
           break;
         case 'InstructionsLoaded':
-          // Reads the instruction file synchronously off the hook's file_path;
-          // no async work to await.
-          this.handleInstructionsLoaded(sessionId, payload);
+          // Synchronous: reads the instruction file inline; nothing to await.
+          this.handleInstructionsLoaded(sessionId, input);
           break;
         case 'UserPromptSubmit':
-          await this.handleUserPromptSubmit(sessionId, payload);
+          await this.handleUserPromptSubmit(sessionId, input);
           break;
         case 'PreToolUse':
-          await this.handlePreToolUse(sessionId, agentId, payload);
+          await this.handlePreToolUse(sessionId, input);
           break;
         case 'PermissionRequest':
-          await this.handlePermissionRequest(sessionId, payload);
+          await this.handlePermissionRequest(sessionId, input);
           break;
         case 'PostToolUse':
-          await this.handlePostToolUse(sessionId, payload);
+          await this.handlePostToolUse(sessionId, input);
           break;
         case 'PostToolUseFailure':
-          await this.handlePostToolUseFailure(sessionId, payload);
+          await this.handlePostToolUseFailure(sessionId, input);
           break;
         case 'SubagentStart':
-          await this.handleSubagentStart(sessionId, payload);
+          await this.handleSubagentStart(sessionId, input);
           break;
         case 'SubagentStop':
-          await this.handleSubagentStop(sessionId, payload);
+          await this.handleSubagentStop(sessionId, input);
           break;
         case 'TeammateIdle':
-          await this.handleTeammateIdle(sessionId, payload);
+          await this.handleTeammateIdle(sessionId, input);
           break;
         case 'PreCompact':
-          await this.handlePreCompact(sessionId, payload);
+          await this.handlePreCompact(sessionId, input);
           break;
         case 'Stop':
-          await this.handleStop(sessionId, payload);
+          await this.handleStop(sessionId, input);
           break;
         case 'SessionEnd':
-          await this.handleSessionEnd(sessionId, payload);
+          await this.handleSessionEnd(sessionId, input);
           break;
         default:
           break;
       }
     } catch (err) {
-      this.log('ERROR', `Error handling ${eventName ?? 'unknown'}: ${err}`);
+      this.log('ERROR', `Error handling ${input.hook_event_name}: ${err}`);
     }
   }
 
   // ── event handlers ────────────────────────────────────────────────────────
 
-  private async handleSessionStart(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSessionStart(sessionId: string, input: SessionStartHookInput): Promise<void> {
     if (this.sessions.has(sessionId)) return; // idempotent
 
-    const rawPath = payload['transcript_path'] as string | undefined;
+    const rawPath = input.transcript_path;
     if (!rawPath) {
       this.log('ERROR', `Missing transcript_path for session ${sessionId}`);
       return;
@@ -872,9 +882,9 @@ export class GlobalDaemon {
       return;
     }
 
-    const source = (payload['source'] as string | undefined) ?? 'unknown';
-    const initialRequestModel = payload['model'] as string | undefined;
-    const cwd = (payload['cwd'] as string | undefined) ?? '';
+    const source = input.source;
+    const initialRequestModel = input.model;
+    const cwd = input.cwd;
 
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
@@ -984,12 +994,12 @@ export class GlobalDaemon {
    */
   private async getOrReconstructSession(
     sessionId: string,
-    payload: HookPayload,
+    input: HookInput,
   ): Promise<SessionState | undefined> {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
 
-    const rawPath = payload['transcript_path'] as string | undefined;
+    const rawPath = input.transcript_path;
     if (!rawPath) return undefined;
 
     let transcript: TranscriptFile;
@@ -1000,9 +1010,12 @@ export class GlobalDaemon {
       return undefined;
     }
 
-    const source = (payload['source'] as string | undefined) ?? 'reconstructed';
-    const cwd = (payload['cwd'] as string | undefined) ?? '';
-    const initialRequestModel = payload['model'] as string | undefined;
+    // source/model aren't on every hook variant (this reconstructs from a
+    // UserPromptSubmit), so read them best-effort off the raw record.
+    const raw = input as Record<string, unknown>;
+    const source = (raw['source'] as string | undefined) ?? 'reconstructed';
+    const cwd = input.cwd;
+    const initialRequestModel = raw['model'] as string | undefined;
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
     // Seed the turn counter from the turns already on disk so numbering
@@ -1050,14 +1063,8 @@ export class GlobalDaemon {
    * reconstructed after a restart starts empty and picks up only files that
    * (re)load afterward (e.g. load_reason=compact).
    */
-  private handleInstructionsLoaded(sessionId: string, payload: HookPayload): void {
-    const filePath = payload['file_path'] as string | undefined;
-    const loadReason = (payload['load_reason'] as string | undefined) ?? 'unknown';
-    if (!filePath) {
-      this.log('DEBUG', `InstructionsLoaded ignored (missing file_path): session=${sessionId}`);
-      return;
-    }
-
+  private handleInstructionsLoaded(sessionId: string, input: InstructionsLoadedHookInput): void {
+    const filePath = input.file_path;
     let content: string;
     try {
       content = fs.readFileSync(filePath, 'utf8');
@@ -1078,7 +1085,7 @@ export class GlobalDaemon {
     }
     this.log(
       'DEBUG',
-      `InstructionsLoaded: session=${sessionId} reason=${loadReason} file=${path.basename(filePath)} bytes=${content.length}${session ? '' : ' (buffered)'}`,
+      `InstructionsLoaded: session=${sessionId} reason=${input.load_reason} file=${path.basename(filePath)} bytes=${content.length}${session ? '' : ' (buffered)'}`,
     );
   }
 
@@ -1092,18 +1099,18 @@ export class GlobalDaemon {
     this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
-  private async handleUserPromptSubmit(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
     // Reconstruct the session if this daemon never saw its SessionStart (e.g. it
     // idled out mid-session and a fresh daemon took over) so the rest of the
     // session stays traced instead of dropping with "Unknown session".
-    const session = await this.getOrReconstructSession(sessionId, payload);
+    const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) {
       this.log('ERROR', `Unknown session (no transcript_path to reconstruct): ${sessionId}`);
       return;
     }
     if (!this.tracer) return;
 
-    const prompt = (payload['prompt'] as string | undefined) ?? '';
+    const prompt = input.prompt;
     this.log(
       'DEBUG',
       `UserPromptSubmit: session=${sessionId} current_turn_span=${session.currentTurnSpan ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${promptSnippet(prompt, 120)}`,
@@ -1140,15 +1147,17 @@ export class GlobalDaemon {
     );
   }
 
-  private async handlePreToolUse(sessionId: string, agentId: string | undefined, payload: HookPayload): Promise<void> {
+  private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracer) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
-    const toolName = payload['tool_name'] as string | undefined;
+    const agentId = input.agent_id;
+    const toolUseId = input.tool_use_id;
+    const toolName = input.tool_name;
     if (!toolUseId || !toolName) return;
 
-    const toolInput = (payload['tool_input'] ?? {}) as Record<string, unknown>;
+    // tool_input is per-tool JSON the SDK types as `unknown`; narrow to index it.
+    const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
 
     // Parent: subagent's invoke_agent span if this PreToolUse comes from inside
     // a subagent, else the current turn span.
@@ -1391,11 +1400,11 @@ export class GlobalDaemon {
     }
   }
 
-  private async handlePermissionRequest(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolName = payload['tool_name'] as string | undefined;
+    const toolName = input.tool_name;
     if (!toolName) return;
 
     // Correlate to a pending tool call by tool_name + tool_input. Record the
@@ -1403,7 +1412,7 @@ export class GlobalDaemon {
     // once we know whether it was approved.
     let pending: PendingToolCall | undefined;
     for (const call of session.pendingToolCalls.values()) {
-      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, payload['tool_input'])) {
+      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, input.tool_input)) {
         pending = call;
         break;
       }
@@ -1415,18 +1424,18 @@ export class GlobalDaemon {
 
     pending.permissionRequested = true;
     addPermissionRequestEvent(pending.span, {
-      suggestions: payload['permission_suggestions'],
+      suggestions: input.permission_suggestions,
       timestamp: new Date(),
     });
 
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
 
-  private async handlePostToolUse(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
+    const toolUseId = input.tool_use_id;
     if (!toolUseId) return;
 
     // Subagent dispatch: the matching span is the subagent's invoke_agent
@@ -1440,7 +1449,7 @@ export class GlobalDaemon {
         // end empty before the teammate works. The team map owns it now.
         session.subagents.remove(subagentTracker);
       } else {
-        this.closeSubagentInvokeAgentSpan(subagentTracker, payload['tool_response'], /*failure*/ false);
+        this.closeSubagentInvokeAgentSpan(subagentTracker, input.tool_response, /*failure*/ false);
         session.subagents.remove(subagentTracker);
       }
       session.totalToolCalls += 1;
@@ -1454,7 +1463,7 @@ export class GlobalDaemon {
 
     resolvePermissionIfPending(pending, true);
 
-    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(payload['tool_response']));
+    pending.span.setAttribute(ATTR.TOOL_CALL_RESULT, jsonStr(input.tool_response));
     pending.span.end();
 
     session.pendingToolCalls.delete(toolUseId);
@@ -1463,14 +1472,14 @@ export class GlobalDaemon {
     session.toolCounts[pending.toolName] = (session.toolCounts[pending.toolName] ?? 0) + 1;
   }
 
-  private async handlePostToolUseFailure(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolUseId = payload['tool_use_id'] as string | undefined;
+    const toolUseId = input.tool_use_id;
     if (!toolUseId) return;
 
-    const error = payload['error'] ?? payload['tool_response'];
+    const error = input.error;
 
     // Subagent dispatch failed (rare). Close the invoke_agent span with ERROR
     // status; subagent chat spans, if any reached SubagentStop, are already
@@ -1541,14 +1550,14 @@ export class GlobalDaemon {
     tracker.ended = true;
   }
 
-  private async handleSubagentStart(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracer) return;
 
-    const agentId = payload['agent_id'] as string | undefined;
+    const agentId = input.agent_id;
     if (!agentId) return;
 
-    const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
+    const agentType = input.agent_type;
 
     // Content-based deterministic correlation: SubagentStart carries no
     // pointer back to the parent's `tool_use_id`, so we read the subagent's
@@ -1638,13 +1647,11 @@ export class GlobalDaemon {
   private recoverSubagentTracker(
     session: SessionState,
     agentId: string,
-    payload: HookPayload,
+    agentType: string,
   ): SubagentTracker | undefined {
     if (!this.tracer) return undefined;
     const turnSpan = this.getOrReconstructTurnSpan(session);
     if (!turnSpan) return undefined;
-    // Type comes from the SubagentStop payload's agent_type; 'unknown' if absent.
-    const agentType = (payload['agent_type'] as string | undefined) ?? 'unknown';
     const invokeAgentSpan = startInvokeAgentSpan(this.tracer, turnSpan, {
       agentType,
       conversationId: session.conversationId,
@@ -1668,17 +1675,17 @@ export class GlobalDaemon {
     return tracker;
   }
 
-  private async handleSubagentStop(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
     // Reconstruct the session if a restart lost it (see getOrReconstructSession).
-    const session = await this.getOrReconstructSession(sessionId, payload);
+    const session = await this.getOrReconstructSession(sessionId, input);
     if (!session || !this.tracer) return;
 
-    const agentId = payload['agent_id'] as string | undefined;
+    const agentId = input.agent_id;
     if (!agentId) return;
 
     // No tracker: the subagent started under a since-restarted daemon. Recover it.
     const tracker = session.subagents.byAgentId(agentId)
-      ?? this.recoverSubagentTracker(session, agentId, payload);
+      ?? this.recoverSubagentTracker(session, agentId, input.agent_type);
     if (!tracker) {
       this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId} and none recoverable`);
       return;
@@ -1691,7 +1698,7 @@ export class GlobalDaemon {
 
     // Fall back to the stored or agentId-derived path when the payload omits it.
     const agentTranscriptPath =
-      (payload['agent_transcript_path'] as string | undefined) ??
+      input.agent_transcript_path ??
       tracker.transcriptPath ??
       computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     let model: string | undefined;
@@ -1757,7 +1764,7 @@ export class GlobalDaemon {
     }
   }
 
-  private async handleTeammateIdle(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
     if (!this.tracer) return;
     // FAIL-OPEN on a missing session: in the agent-teams model this hook fires
     // under the TEAMMATE's session_id, which may not be registered with this
@@ -1779,8 +1786,8 @@ export class GlobalDaemon {
     //
     // Note: CC docs incorrectly listed agent_id / agent_type — those fields do
     // not appear in practice.
-    const agentType = (payload['teammate_name'] as string | undefined) ?? 'teammate';
-    const teamName = (payload['team_name'] as string | undefined) ?? '?';
+    const agentType = input.teammate_name;
+    const teamName = input.team_name;
 
     // ── Cross-session team path (agent-teams / TeamCreate model) ─────────
     // The coordinator's PreToolUse(Agent, team_name) registered the invoke_agent
@@ -1798,7 +1805,7 @@ export class GlobalDaemon {
         return;
       }
       member.emitted = true;
-      const idleTranscript = session?.transcript.resolvedPath ?? (payload['transcript_path'] as string | undefined);
+      const idleTranscript = session?.transcript.resolvedPath ?? input.transcript_path;
       const teammateTranscriptPath = this.resolveTeammateTranscript(member.coordinatorTranscriptPath, agentType, idleTranscript);
       this.emitTeammateTranscript(member.invokeAgentSpan, member.conversationId, teammateTranscriptPath);
       // Remove the consumed entry; drop the key once its queue drains.
@@ -1952,14 +1959,20 @@ export class GlobalDaemon {
     invokeAgentSpan.end();
   }
 
-  private async handlePreCompact(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handlePreCompact(sessionId: string, input: PreCompactHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    // Live CC payloads carry a summary + item counts the SDK type doesn't
+    // declare — read them off the raw record.
+    const raw = input as Record<string, unknown>;
+    const summary = raw['summary'] ?? raw['compaction_summary'];
+    const itemsBefore = raw['items_before'];
+    const itemsAfter = raw['items_after'];
     const attrs: CompactionAttrs = {
-      summary: (payload['summary'] as string | undefined) ?? (payload['compaction_summary'] as string | undefined),
-      itemsBefore: typeof payload['items_before'] === 'number' ? (payload['items_before'] as number) : undefined,
-      itemsAfter: typeof payload['items_after'] === 'number' ? (payload['items_after'] as number) : undefined,
+      summary: typeof summary === 'string' ? summary : undefined,
+      itemsBefore: typeof itemsBefore === 'number' ? itemsBefore : undefined,
+      itemsAfter: typeof itemsAfter === 'number' ? itemsAfter : undefined,
     };
 
     if (session.currentTurnSpan) {
@@ -1972,14 +1985,13 @@ export class GlobalDaemon {
     }
   }
 
-  private async handleStop(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleStop(sessionId: string, input: StopHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurnSpan || !this.tracer) return;
 
     // Pass last_assistant_message so the retry waits for the synthesis to
     // flush — otherwise the final chat span drops when the read races the writer.
-    const rawFinalMessage = payload['last_assistant_message'];
-    const finalAssistantMessage = typeof rawFinalMessage === 'string' ? rawFinalMessage : undefined;
+    const finalAssistantMessage = input.last_assistant_message;
     const parsedSession = await this.parseSessionFileWithRetry(
       session.transcript,
       finalAssistantMessage,
@@ -1989,7 +2001,7 @@ export class GlobalDaemon {
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(payload['last_assistant_message'])}`,
+      `Stop: session=${sessionId} trace_id=${session.currentTurnSpan.spanContext().traceId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
     // Finalize the chat-span state machine for this turn.
@@ -2013,7 +2025,7 @@ export class GlobalDaemon {
     }
 
     const parsedTexts = currentTurn?.textBlocks() ?? [];
-    const lastMessage = (payload['last_assistant_message'] as string | undefined) ?? '';
+    const lastMessage = input.last_assistant_message ?? '';
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
     if (assistantMessages.length) {
@@ -2040,7 +2052,7 @@ export class GlobalDaemon {
     this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
   }
 
-  private async handleSessionEnd(sessionId: string, payload: HookPayload): Promise<void> {
+  private async handleSessionEnd(sessionId: string, input: SessionEndHookInput): Promise<void> {
     // Discard any never-drained instruction buffer (e.g. a session that emitted
     // InstructionsLoaded but never SessionStart) so the map can't leak.
     this.pendingInstructions.delete(sessionId);
@@ -2049,7 +2061,7 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${(payload['reason'] as string | undefined) ?? 'unknown'} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
     this.finalizeSession(session, 'session_ended');

@@ -65,7 +65,7 @@ function makeTranscript(sessionId: string): { file: string; append: (line: unkno
 interface Handlers {
   handleSessionStart(s: string, p: Record<string, unknown>): Promise<void>;
   handleUserPromptSubmit(s: string, p: Record<string, unknown>): Promise<void>;
-  handlePreToolUse(s: string, a: string | undefined, p: Record<string, unknown>): Promise<void>;
+  handlePreToolUse(s: string, p: Record<string, unknown>): Promise<void>;
   handlePostToolUse(s: string, p: Record<string, unknown>): Promise<void>;
   handleStop(s: string, p: Record<string, unknown>): Promise<void>;
   handleSessionEnd(s: string, p: Record<string, unknown>): Promise<void>;
@@ -103,7 +103,7 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
     // before the tool's PreToolUse fires.
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
+    await d.handlePreToolUse(sid, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: { file_path: '/foo.ts' } });
     await d.handlePostToolUse(sid, { tool_use_id: 'tool_1', tool_response: 'ok' });
 
     // msgB: text-only (no tool_use → no PreToolUse; back-filled at Stop).
@@ -145,14 +145,14 @@ test('handlers: a new response transitions and finalizes the previous chat span'
 
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'editing A' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_A', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_A', tool_name: 'Edit', tool_input: {} });
+    await d.handlePreToolUse(sid, { tool_use_id: 'tool_A', tool_name: 'Edit', tool_input: {} });
     await d.handlePostToolUse(sid, { tool_use_id: 'tool_A', tool_response: 'ok' });
 
     // Second response with its own tool_use → PreToolUse(tool_B) must finalize
     // msgA's chat span (transition) before opening msgB's.
     append(aLine('msgB', '2026-01-01T00:00:05.000Z', { type: 'text', text: 'editing B' }));
     append(aLine('msgB', '2026-01-01T00:00:06.000Z', { type: 'tool_use', id: 'tool_B', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_B', tool_name: 'Edit', tool_input: {} });
+    await d.handlePreToolUse(sid, { tool_use_id: 'tool_B', tool_name: 'Edit', tool_input: {} });
     await d.handlePostToolUse(sid, { tool_use_id: 'tool_B', tool_response: 'ok' });
 
     await d.handleStop(sid, {});
@@ -185,7 +185,7 @@ test('handlers: SessionEnd finalizes a still-open chat span with its text + usag
 
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'text', text: 'first I will edit' }));
     append(aLine('msgA', '2026-01-01T00:00:03.000Z', { type: 'tool_use', id: 'tool_1', name: 'Edit', input: {} }, 'tool_use'));
-    await d.handlePreToolUse(sid, undefined, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: {} });
+    await d.handlePreToolUse(sid, { tool_use_id: 'tool_1', tool_name: 'Edit', tool_input: {} });
 
     // No Stop — session ends mid-turn with the chat span still open.
     await d.handleSessionEnd(sid, { reason: 'clear' });
