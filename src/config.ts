@@ -7,7 +7,7 @@
 // import cycle (cli.ts imports the daemon entry point).
 
 import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
-import { createHash } from 'crypto';
+import { sha256Hex } from './utils.js';
 import type { Settings } from './setup.js';
 
 /** Where a resolved value came from, for user-facing "source" reporting. */
@@ -131,8 +131,6 @@ const CONFIG_FINGERPRINT_LENGTH = 16;
 /** Short, stable hash of a daemon config. The API key is hashed, not exposed,
  *  so the fingerprint is safe to send over the socket. */
 export function daemonConfigFingerprint(c: DaemonConfig): string {
-  return createHash('sha256')
-    .update(JSON.stringify([c.weaveProject, c.apiKey, c.baseUrl, c.agentName, c.debug]))
-    .digest('hex')
+  return sha256Hex(JSON.stringify([c.weaveProject, c.apiKey, c.baseUrl, c.agentName, c.debug]))
     .slice(0, CONFIG_FINGERPRINT_LENGTH);
 }

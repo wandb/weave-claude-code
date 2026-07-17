@@ -7,6 +7,12 @@ import * as net from 'net';
 import * as path from 'path';
 import * as readline from 'readline';
 import { spawnSync } from 'child_process';
+import { createHash } from 'crypto';
+
+/** Hex-encoded sha256 of `input`. */
+export function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex');
+}
 
 export function prompt(question: string): Promise<string> {
   return new Promise((resolve) => {
@@ -95,10 +101,12 @@ export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
-  const keysA = Object.keys(a as object);
-  const keysB = Object.keys(b as object);
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const keysA = Object.keys(ao);
+  const keysB = Object.keys(bo);
   if (keysA.length !== keysB.length) return false;
-  return keysA.every(k => deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+  return keysA.every(k => deepEqual(ao[k], bo[k]));
 }
 
 /**
