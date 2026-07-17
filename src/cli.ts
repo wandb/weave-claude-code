@@ -13,7 +13,7 @@ import {
   SETTINGS_FILE,
   MARKETPLACE_NAME,
   PLUGIN_NAME,
-  VERSION,
+  BUILD_VERSION,
   InstallSource,
   MarketplaceStatus,
   PluginStatus,
@@ -36,7 +36,7 @@ import { DEFAULT_AGENT_NAME } from './genaiSpans.js';
 // ---------------------------------------------------------------------------
 
 const HELP = `
-weave-claude-code v${VERSION}
+weave-claude-code v${BUILD_VERSION}
 
 Track Claude Code sessions in Weave for observability and debugging.
 
@@ -438,7 +438,7 @@ interface StatusSnapshot {
 
 async function gatherStatus(): Promise<StatusSnapshot> {
   const report: StatusReport = {
-    version: VERSION,
+    version: BUILD_VERSION,
     settings_file: SETTINGS_FILE,
     cli_path: null,
     weave_project: null,
@@ -870,7 +870,7 @@ async function main(): Promise<void> {
   const cmd = args[0];
 
   if (cmd === '--version' || cmd === '-v') {
-    console.log(VERSION);
+    console.log(BUILD_VERSION);
     process.exit(0);
   }
 
