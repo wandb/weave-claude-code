@@ -463,6 +463,30 @@ export class GlobalDaemon {
 
   // ── event handlers ────────────────────────────────────────────────────────
 
+  /** Resolve the conversation id, build the SessionState, register it, and drain
+   *  buffered instructions. Shared by SessionStart and post-restart rebuild. */
+  private async buildSession(
+    sessionId: string,
+    transcript: TranscriptFile,
+    opts: { source: string; cwd: string; initialRequestModel?: string; turnNumber: number },
+  ): Promise<SessionState> {
+    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, opts.source);
+    const session = newSessionState({
+      sessionId,
+      conversationId,
+      transcript,
+      cwd: opts.cwd,
+      source: opts.source,
+      initialRequestModel: opts.initialRequestModel,
+      turnNumber: opts.turnNumber,
+      agentName: this.config.agentName,
+      tracingEnabled: this.tracingEnabled,
+    });
+    this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
+    return session;
+  }
+
   private async handleSessionStart(sessionId: string, input: SessionStartHookInput): Promise<void> {
     if (this.sessions.has(sessionId)) return; // idempotent
 
@@ -480,31 +504,18 @@ export class GlobalDaemon {
       return;
     }
 
-    const source = input.source;
-    const initialRequestModel = input.model;
-    const cwd = input.cwd;
-
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
+    const session = await this.buildSession(sessionId, transcript, {
+      source: input.source,
+      cwd: input.cwd,
+      initialRequestModel: input.model,
       turnNumber: 0,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
     });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
 
-    const resumed = conversationId !== sessionId;
-    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
+    const resumed = session.conversationId !== sessionId;
+    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${session.conversationId})` : ''}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} conversation=${conversationId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} conversation=${session.conversationId} source=${session.source} model=${session.initialRequestModel ?? 'unknown'} cwd=${session.cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
     );
   }
 
@@ -603,8 +614,6 @@ export class GlobalDaemon {
     const source = (raw['source'] as string | undefined) ?? 'reconstructed';
     const cwd = input.cwd;
     const initialRequestModel = raw['model'] as string | undefined;
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
     // Seed the turn counter from the turns already on disk so numbering
     // continues across the restart instead of resetting to 1.
     let priorTurns = 0;
@@ -614,22 +623,10 @@ export class GlobalDaemon {
       this.log('DEBUG', `Reconstruct ${sessionId}: could not count prior turns: ${err}`);
     }
 
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      turnNumber: priorTurns,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
-    });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
+    const session = await this.buildSession(sessionId, transcript, { source, cwd, initialRequestModel, turnNumber: priorTurns });
     this.log(
       'INFO',
-      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
+      `Session reconstructed after restart: ${sessionId} (conversation=${session.conversationId}, prior_turns=${priorTurns})`,
     );
     return session;
   }
@@ -972,45 +969,36 @@ export class GlobalDaemon {
 
   private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const toolUseId = input.tool_use_id;
-    if (!toolUseId) return;
-
-    if (this.settleSubagentDispatch(session, toolUseId, input.tool_response, /*failure*/ false)) return;
-
-    const pending = session.pendingToolCalls.get(toolUseId);
-    if (!pending) return;
-
-    resolvePermissionIfPending(pending, true);
-
-    pending.tool.result = jsonStr(input.tool_response);
-    pending.tool.end();
-
-    session.pendingToolCalls.delete(toolUseId);
-    this.countToolCall(session, pending.toolName);
+    if (!session || !input.tool_use_id) return;
+    this.settleToolCall(session, input.tool_use_id, input.tool_response, /*failure*/ false);
   }
 
   private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session || !input.tool_use_id) return;
+    this.settleToolCall(session, input.tool_use_id, input.error, /*failure*/ true);
+  }
 
-    const toolUseId = input.tool_use_id;
-    if (!toolUseId) return;
-
-    const error = input.error;
-
-    if (this.settleSubagentDispatch(session, toolUseId, error, /*failure*/ true)) return;
+  /** Settle a completed tool call: close the subagent dispatch if it was one,
+   *  else close the pending tool span (recording result, ERROR on failure) and
+   *  count it. Shared by PostToolUse and PostToolUseFailure. */
+  private settleToolCall(session: SessionState, toolUseId: string, response: unknown, failure: boolean): void {
+    if (this.settleSubagentDispatch(session, toolUseId, response, failure)) return;
 
     const pending = session.pendingToolCalls.get(toolUseId);
     if (!pending) return;
 
-    resolvePermissionIfPending(pending, false);
-
-    pending.tool.result = error;
-    pending.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(error) });
-    // The SDK records the exception + ERROR status from `error`.
-    pending.tool.end({ error: new Error(error) });
+    resolvePermissionIfPending(pending, !failure);
+    if (failure) {
+      const error = String(response);
+      pending.tool.result = error;
+      pending.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(error) });
+      // The SDK records the exception + ERROR status from `error`.
+      pending.tool.end({ error: new Error(error) });
+    } else {
+      pending.tool.result = jsonStr(response);
+      pending.tool.end();
+    }
 
     session.pendingToolCalls.delete(toolUseId);
     this.countToolCall(session, pending.toolName);
