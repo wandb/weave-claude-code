@@ -20,7 +20,7 @@ import {
   trace,
 } from '@opentelemetry/api';
 import type { ReadableSpan, Span as SdkSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
-import type { MessagePart, Usage } from 'weave';
+import type { MessagePart, Tool, Turn, Usage } from 'weave';
 import { extractAssistantTextBlocks } from './parser.js';
 import type { AssistantCallDetail } from './parser.js';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
@@ -130,14 +130,14 @@ export const DEFAULT_AGENT_NAME = 'claude-code';
  * dimension for "which integration produced this trace" in the Weave Agents
  * backend.
  */
-export const INTEGRATION_NAME = 'weave-claude-code';
+const INTEGRATION_NAME = 'weave-claude-code';
 
 /**
  * Prefix for free-form integration metadata. Each entry of a session's
  * `integrationMeta` is stamped as `weave.integration.meta.<key>`, so new
  * fields (e.g. `claude_code_app_version`) need no new attribute constant.
  */
-export const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
+const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -262,28 +262,18 @@ export function buildUsage(usage: UsageSummary, reasoningTokens?: number): Usage
 // Span events
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface PermissionRequestEventArgs {
-  suggestions?: unknown;
-  timestamp: Date;
-}
-
 /** Added at PermissionRequest time. Records that the request happened. */
-export function addPermissionRequestEvent(toolSpan: Span, args: PermissionRequestEventArgs): void {
+export function addPermissionRequestEvent(tool: Tool, args: { suggestions?: unknown; timestamp: Date }): void {
   const attrs: Attributes = {};
   if (args.suggestions !== undefined) {
     attrs[ATTR.EVT_PERMISSION_SUGGESTIONS] = jsonStr(args.suggestions);
   }
-  toolSpan.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
-}
-
-export interface PermissionResolvedEventArgs {
-  approved: boolean;
-  timestamp: Date;
+  tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
 }
 
 /** Added at PostToolUse[Failure]. Records the request outcome. */
-export function addPermissionResolvedEvent(toolSpan: Span, args: PermissionResolvedEventArgs): void {
-  toolSpan.addEvent(
+export function addPermissionResolvedEvent(tool: Tool, args: { approved: boolean; timestamp: Date }): void {
+  tool.addEvent(
     ATTR.EVT_PERMISSION_RESOLVED,
     { [ATTR.EVT_PERMISSION_APPROVED]: args.approved },
     args.timestamp,
@@ -306,10 +296,12 @@ export interface CompactionAttrs {
  * the turn span open when compaction fires, or to the next turn span when
  * compaction fires between turns.
  */
-export function setCompactionAttrs(turnSpan: Span, attrs: CompactionAttrs): void {
-  if (attrs.summary !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_SUMMARY, attrs.summary);
-  if (attrs.itemsBefore !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, attrs.itemsBefore);
-  if (attrs.itemsAfter !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, attrs.itemsAfter);
+export function setCompactionAttrs(turn: Turn, attrs: CompactionAttrs): void {
+  const out: Attributes = {};
+  if (attrs.summary !== undefined) out[ATTR.COMPACTION_SUMMARY] = attrs.summary;
+  if (attrs.itemsBefore !== undefined) out[ATTR.COMPACTION_ITEMS_BEFORE] = attrs.itemsBefore;
+  if (attrs.itemsAfter !== undefined) out[ATTR.COMPACTION_ITEMS_AFTER] = attrs.itemsAfter;
+  if (Object.keys(out).length) turn.setAttributes(out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,9 +340,8 @@ export function toolDisplayName(toolName: string, input: Record<string, unknown>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LEGACY: baggage plumbing and hand-rolled span builders, still used by
-// daemon.ts. The SDK swap (next PRs in this stack) leaves them unreferenced;
-// they are then deleted.
+// LEGACY: baggage plumbing and hand-rolled span builders. Unreferenced after
+// the SDK swap in daemon.ts; kept out of this diff and deleted in the next PR.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Common prefix for all integration-identity attributes. The span processor
