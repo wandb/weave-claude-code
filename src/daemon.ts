@@ -13,6 +13,8 @@ import type {
   InstructionsLoadedHookInput,
   UserPromptSubmitHookInput,
   PreToolUseHookInput,
+  PostToolUseHookInput,
+  PostToolUseFailureHookInput,
   PermissionRequestHookInput,
   SubagentStartHookInput,
   SubagentStopHookInput,
@@ -23,27 +25,40 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
-import { appendToLog } from './utils.js';
+import { appendToLog, deepEqual } from './utils.js';
 import { parseSessionFd } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   CompactionAttrs,
+  addPermissionRequestEvent,
   setCompactionAttrs,
+  toolDisplayName,
   assistantOutputMessages,
   snippet,
+  jsonStr,
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import type { DaemonConfig } from './config.js';
 import {
+  chatMessageKey,
+  callsForResponseKey,
+  findToolUseResponseKey,
+  openChatForGroup,
+  recordChat,
+} from './chatSpans.js';
+import {
+  resolvePermissionIfPending,
   lastAssistantTextEndsWith,
   newSessionState,
   upsertInstruction,
 } from './sessionState.js';
 import type {
+  PendingToolCall,
   SessionState,
   LoadedInstruction,
 } from './sessionState.js';
+import type { AssistantCallDetail, ParsedSession } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -349,7 +364,10 @@ export class GlobalDaemon {
           await this.handlePermissionRequest(sessionId, input);
           break;
         case 'PostToolUse':
+          await this.handlePostToolUse(sessionId, input);
+          break;
         case 'PostToolUseFailure':
+          await this.handlePostToolUseFailure(sessionId, input);
           break;
         case 'SubagentStart':
           await this.handleSubagentStart(sessionId, input);
@@ -598,6 +616,7 @@ export class GlobalDaemon {
     // Close interrupted turns that never received a Stop hook.
     this.finalizeOpenTurn(session, 'superseded_by_next_prompt');
 
+    session.emittedChatSpanResponseKeys.clear();
     const turn = this.startSessionTurn(session, prompt);
     if (!turn) return;
 
@@ -613,13 +632,160 @@ export class GlobalDaemon {
   private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracingEnabled) return;
-    this.log('DEBUG', `PreToolUse (not yet traced): session=${sessionId} tool=${input.tool_name}`);
+
+    const agentId = input.agent_id;
+    const toolUseId = input.tool_use_id;
+    const toolName = input.tool_name;
+    if (!toolUseId || !toolName) return;
+
+    const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+    const tracker = agentId ? session.subagents.byAgentId(agentId) : undefined;
+    const parent: weave.Turn | weave.SubAgent | weave.LLM | undefined = agentId
+      ? tracker?.subAgent ?? session.currentTurn
+      : this.advanceMainAgentChatSpan(session, toolUseId) ?? session.currentTurn;
+    if (!parent) {
+      this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
+      return;
+    }
+
+    const tool = parent.startTool({
+      name: toolName,
+      args: jsonStr(toolInput),
+      toolCallId: toolUseId,
+      startTime: new Date(),
+    });
+    const toolAttrs: Attributes = { [ATTR.WEAVE_DISPLAY_NAME]: toolDisplayName(toolName, toolInput) };
+    if (tracker) toolAttrs[ATTR.AGENT_NAME] = tracker.subagentType;
+    tool.setAttributes(toolAttrs);
+    session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
+  }
+
+  private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): weave.LLM | undefined {
+    if (!session.currentTurn) return undefined;
+
+    let fd: number;
+    try {
+      fd = session.transcript.getFd();
+    } catch {
+      return undefined;
+    }
+    const parsed = parseSessionFd(fd);
+    if (!parsed) return undefined;
+    const lastTurn = parsed.turns.at(-1);
+    if (!lastTurn) return undefined;
+    const calls = lastTurn.assistantCalls();
+    const key = findToolUseResponseKey(calls, toolUseId);
+    if (!key) return undefined;
+
+    if (session.activeChat && session.activeChat.responseKey !== key) {
+      this.finalizeActiveChatSpan(session, calls);
+    }
+
+    if (!session.activeChat) {
+      const group = callsForResponseKey(calls, key);
+      const llm = openChatForGroup(session.currentTurn, group);
+      if (!llm) return undefined;
+      session.activeChat = { responseKey: key, llm };
+      session.emittedChatSpanResponseKeys.add(key);
+    }
+
+    return session.activeChat.llm;
+  }
+
+  private finalizeActiveChatSpan(session: SessionState, calls: AssistantCallDetail[]): void {
+    const active = session.activeChat;
+    if (!active) return;
+    this.emitChatSpanForResponse(session, calls, active.responseKey, active.llm);
+    session.activeChat = undefined;
+  }
+
+  private emitChatSpanForResponse(
+    session: SessionState,
+    calls: AssistantCallDetail[],
+    key: string,
+    existingLlm?: weave.LLM,
+  ): void {
+    if (!session.currentTurn) return;
+    const group = callsForResponseKey(calls, key);
+    // A stale response key can outlive an interrupted turn.
+    if (!group.length) {
+      existingLlm?.end();
+      return;
+    }
+    const llm = existingLlm ?? openChatForGroup(session.currentTurn, group);
+    if (!llm) {
+      this.log('DEBUG', `Chat span skipped (no model flushed for response ${key}); usage not recorded`);
+      return;
+    }
+    recordChat(llm, group);
+    session.emittedChatSpanResponseKeys.add(key);
   }
 
   private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    this.log('DEBUG', `PermissionRequest (not yet traced): session=${sessionId} tool=${input.tool_name}`);
+
+    const toolName = input.tool_name;
+    if (!toolName) return;
+
+    let pending: PendingToolCall | undefined;
+    for (const call of session.pendingToolCalls.values()) {
+      if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, input.tool_input)) {
+        pending = call;
+        break;
+      }
+    }
+    if (!pending) {
+      this.log('DEBUG', `PermissionRequest: no pending tool call for tool_name=${toolName}`);
+      return;
+    }
+
+    pending.permissionRequested = true;
+    addPermissionRequestEvent(pending.tool, {
+      suggestions: input.permission_suggestions,
+      timestamp: new Date(),
+    });
+
+    this.log('DEBUG', `Permission request recorded for ${toolName}`);
+  }
+
+  private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const toolUseId = input.tool_use_id;
+    if (!toolUseId) return;
+
+    const pending = session.pendingToolCalls.get(toolUseId);
+    if (!pending) return;
+
+    resolvePermissionIfPending(pending, true);
+
+    pending.tool.result = jsonStr(input.tool_response);
+    pending.tool.end();
+
+    session.pendingToolCalls.delete(toolUseId);
+  }
+
+  private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const toolUseId = input.tool_use_id;
+    if (!toolUseId) return;
+
+    const error = input.error;
+
+    const pending = session.pendingToolCalls.get(toolUseId);
+    if (!pending) return;
+
+    resolvePermissionIfPending(pending, false);
+
+    pending.tool.result = error;
+    pending.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(error) });
+    pending.tool.end({ error: new Error(error) });
+
+    session.pendingToolCalls.delete(toolUseId);
   }
 
   private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
@@ -682,6 +848,21 @@ export class GlobalDaemon {
       `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
+    if (currentTurn) {
+      const calls = currentTurn.assistantCalls();
+      if (session.activeChat) {
+        this.finalizeActiveChatSpan(session, calls);
+      }
+      for (let i = 0; i < calls.length; i++) {
+        const key = chatMessageKey(calls[i], i);
+        if (session.emittedChatSpanResponseKeys.has(key)) continue;
+        this.emitChatSpanForResponse(session, calls, key);
+      }
+    } else if (session.activeChat) {
+      session.activeChat.llm.end();
+      session.activeChat = undefined;
+    }
+
     const parsedTexts = currentTurn?.textBlocks() ?? [];
     const lastMessage = input.last_assistant_message ?? '';
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
@@ -731,6 +912,37 @@ export class GlobalDaemon {
   }
 
   private finalizeOpenTurn(session: SessionState, orphanReason: string): void {
+    for (const [toolUseId, pending] of session.pendingToolCalls) {
+      resolvePermissionIfPending(pending, false);
+      pending.tool.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+      pending.tool.end({ error: new Error(`tool did not complete (${orphanReason})`) });
+      this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
+    }
+    session.pendingToolCalls.clear();
+
+    if (session.activeChat) {
+      let finalized = false;
+      if (session.currentTurn) {
+        let parsed: ParsedSession | null = null;
+        try {
+          parsed = parseSessionFd(session.transcript.getFd());
+        } catch {
+          parsed = null;
+        }
+        const lastTurn = parsed?.turns.at(-1);
+        if (lastTurn) {
+          this.finalizeActiveChatSpan(session, lastTurn.assistantCalls());
+          finalized = true;
+        }
+      }
+      if (session.activeChat) {
+        session.activeChat.llm.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+        session.activeChat.llm.end();
+        session.activeChat = undefined;
+      }
+      this.log('DEBUG', finalized ? `Finalized active chat span` : `Closed orphaned chat span`);
+    }
+
     if (session.currentTurn) {
       session.currentTurn.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
       session.currentTurn.end();
@@ -835,6 +1047,20 @@ export class GlobalDaemon {
     const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve();
     const next = prev.then(fn).catch((err) => this.log('ERROR', `Queue error for session ${sessionId}: ${err}`));
     this.sessionQueues.set(sessionId, next);
+  }
+
+  private errorTypeFor(error: unknown): string {
+    if (typeof error === 'string') {
+      const trimmed = error.trim();
+      if (!trimmed) return 'tool_error';
+      const match = trimmed.match(/^[A-Z][A-Za-z_]*Error/);
+      return match ? match[0] : 'tool_error';
+    }
+    if (error && typeof error === 'object' && 'type' in error) {
+      const t = (error as Record<string, unknown>)['type'];
+      if (typeof t === 'string' && t) return t;
+    }
+    return 'tool_error';
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', msg: string): void {
