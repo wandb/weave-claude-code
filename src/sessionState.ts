@@ -8,7 +8,7 @@ import { VERSION } from './setup.js';
 import { parseSessionFd, extractAssistantTextBlocks, isTextBlock } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import { sha256Hex } from './utils.js';
-import { buildIntegrationAttrs, addPermissionResolvedEvent } from './genaiSpans.js';
+import { ATTR, buildIntegrationAttrs, addPermissionResolvedEvent } from './genaiSpans.js';
 import type { CompactionAttrs } from './genaiSpans.js';
 
 /** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
@@ -285,7 +285,11 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     meta: { claude_code_app_version: claudeCodeAppVersion },
   });
   const conversation = options.tracingEnabled
-    ? weave.startConversation({ conversationId, agentName: options.agentName, attributes: integrationAttrs })
+    ? weave.startConversation({
+        conversationId,
+        agentName: options.agentName,
+        attributes: { ...integrationAttrs, [ATTR.WEAVE_PLUGIN_VERSION]: VERSION },
+      })
     : undefined;
 
   return {
