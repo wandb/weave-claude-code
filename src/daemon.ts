@@ -625,7 +625,6 @@ export class GlobalDaemon {
       [ATTR.WEAVE_CWD]: session.cwd,
       [ATTR.WEAVE_SOURCE]: session.source,
       [ATTR.WEAVE_PLUGIN_VERSION]: VERSION,
-      [ATTR.WEAVE_TURN_NUMBER]: session.turnNumber,
     });
     session.currentTurn = turn;
     return turn;
