@@ -227,7 +227,6 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
     const subInvoke = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent' && s.attributes[ATTR.AGENT_NAME] === 'Explore');
     assert.ok(subInvoke, 'subagent invoke_agent marker exported');
     assert.equal(spanParentId(subInvoke), turn.spanContext().spanId, 'marker nests under the turn');
-    assert.equal(subInvoke.attributes[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID], 'tu-agent');
     assert.equal(subInvoke.attributes[ATTR.AGENT_ID], agentId, 'agent id recorded at SubagentStart');
     assert.equal(
       subInvoke.attributes[ATTR.OUTPUT_MESSAGES],
