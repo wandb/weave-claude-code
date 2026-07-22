@@ -3,61 +3,39 @@
 // SPDX-PackageName: weave-claude-code
 
 import * as fs from 'fs';
+import type { SDKAssistantMessage } from '@anthropic-ai/claude-agent-sdk';
 
-export interface UsageSummary {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-}
+type AnthropicMessage = SDKAssistantMessage['message'];
+type AnthropicUsage = AnthropicMessage['usage'];
+type OptionalUsageKey = 'cache_read_input_tokens' | 'cache_creation_input_tokens';
 
-/**
- * Per-API-call detail for a single assistant message in the transcript.
- * Each entry corresponds to one LLM invocation within a turn, used to emit
- * one `chat <model>` span per call at Stop time.
- */
-export interface AssistantCallDetail {
-  timestamp: string;            // ISO timestamp of the assistant message
-  prevTimestamp?: string;       // ISO timestamp of preceding transcript line (proxy for "request started")
+/** The normalized subset of Anthropic usage serialized by Claude Code. */
+export type UsageSummary = Pick<AnthropicUsage, 'input_tokens' | 'output_tokens'>
+  & Partial<{ [Key in OptionalUsageKey]: NonNullable<AnthropicUsage[Key]> }>;
+
+/** One provider response. Claude Code may serialize its content across several
+ * adjacent assistant records; the parser folds records sharing a response id. */
+export interface AssistantResponse {
+  startTime?: string;
+  endTime?: string;
   model?: string;
-  usage: UsageSummary;          // per-call usage
-  reasoningTokens?: number;     // reasoning/thinking tokens, if any
-  contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
-  responseId?: string;          // provider message id
-  finishReason?: string;        // stop_reason / finish_reason if present
+  usage: UsageSummary;
+  reasoningTokens?: number;
+  content: unknown[];
+  id?: string;
+  finishReason?: string;
 }
 
-export interface Turn {
-  totalUsage(): UsageSummary;
-  primaryModel(): string | undefined;
-  textBlocks(): string[];
-  assistantCalls(): AssistantCallDetail[];
+export interface ParsedTurn {
+  startTime?: string;
+  userText?: string;
+  model?: string;
+  text: string[];
+  responses: AssistantResponse[];
 }
 
 export interface ParsedSession {
-  turns: Turn[];
-}
-
-export function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
-  return {
-    input_tokens: raw['input_tokens'] ?? 0,
-    output_tokens: raw['output_tokens'] ?? 0,
-    cache_read_input_tokens: raw['cache_read_input_tokens'],
-    cache_creation_input_tokens: raw['cache_creation_input_tokens'],
-  };
-}
-
-export function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
-  return {
-    input_tokens: a.input_tokens + b.input_tokens,
-    output_tokens: a.output_tokens + b.output_tokens,
-    cache_read_input_tokens: (a.cache_read_input_tokens ?? 0) + (b.cache_read_input_tokens ?? 0),
-    cache_creation_input_tokens: (a.cache_creation_input_tokens ?? 0) + (b.cache_creation_input_tokens ?? 0),
-  };
-}
-
-export function parseSessionFile(filePath: string): ParsedSession | null {
-  return parseSessionReader(() => fs.readFileSync(filePath, 'utf8'));
+  turns: ParsedTurn[];
 }
 
 export function parseSessionFd(fd: number): ParsedSession | null {
@@ -68,9 +46,8 @@ function parseSessionReader(read: () => string): ParsedSession | null {
   try {
     const lines = read()
       .split('\n')
-      .filter(l => l.trim())
-      .map(l => JSON.parse(l) as unknown);
-
+      .filter(line => line.trim())
+      .map(line => JSON.parse(line) as unknown);
     return buildSession(lines);
   } catch {
     return null;
@@ -78,127 +55,185 @@ function parseSessionReader(read: () => string): ParsedSession | null {
 }
 
 function readUtf8FromFd(fd: number): string {
-  const stat = fs.fstatSync(fd);
-  const size = stat.size;
-  if (size === 0) {
-    return '';
-  }
+  const size = fs.fstatSync(fd).size;
+  if (size === 0) return '';
 
   const buffer = Buffer.allocUnsafe(size);
   let bytesRead = 0;
-
   while (bytesRead < size) {
-    const n = fs.readSync(fd, buffer, bytesRead, size - bytesRead, bytesRead);
-    if (n === 0) break;
-    bytesRead += n;
+    const count = fs.readSync(fd, buffer, bytesRead, size - bytesRead, bytesRead);
+    if (count === 0) break;
+    bytesRead += count;
   }
-
   return buffer.toString('utf8', 0, bytesRead);
 }
 
-interface AssistantLine {
+type TranscriptLine = {
+  message?: Record<string, unknown>;
+  type?: string;
+  role?: string;
+  timestamp?: string;
+};
+
+type AssistantLine = {
   line: Record<string, unknown>;
-  prevTimestamp?: string;
+  previousTimestamp?: string;
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
-function buildSession(lines: unknown[]): ParsedSession {
-  const turns: Turn[] = [];
-  let currentAssistantLines: AssistantLine[] = [];
-  let prevTimestamp: string | undefined;
-
-  for (const line of lines) {
-    const entry = line as Record<string, unknown>;
-    const message = entry['message'] as Record<string, unknown> | undefined;
-    const type = entry['type'] as string | undefined;
-    const role = (message?.['role'] as string | undefined) ?? type;
-    const timestamp = entry['timestamp'] as string | undefined;
-
-    if (role === 'assistant') {
-      currentAssistantLines.push({ line: entry, prevTimestamp });
-    } else if (role === 'user') {
-      const rawContent = message?.['content'];
-      const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
-
-      // A user message with text content marks the end of the previous turn.
-      const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
-      if (hasText && currentAssistantLines.length > 0) {
-        turns.push(buildTurn(currentAssistantLines));
-        currentAssistantLines = [];
-      }
-    }
-
-    if (timestamp) prevTimestamp = timestamp;
-  }
-
-  if (currentAssistantLines.length > 0) {
-    turns.push(buildTurn(currentAssistantLines));
-  }
-
-  return { turns };
-}
-
-function buildTurn(assistantLines: AssistantLine[]): Turn {
-  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
-    const message = line['message'] as Record<string, unknown> | undefined;
-    const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
-    const usage = rawToUsageSummary(rawUsage);
-    const reasoningTokens = typeof rawUsage['reasoning_tokens'] === 'number' ? rawUsage['reasoning_tokens'] : undefined;
-    const model = (message?.['model'] ?? line['model']) as string | undefined;
-    const rawContent = message?.['content'];
-    // `content` is either an array of blocks (the common assistant shape), a
-    // bare string (legacy single-text format), or missing. Fall back to [] for
-    // the missing / unknown case so downstream code sees a well-typed empty
-    // list instead of `undefined`.
-    const contentBlocks: unknown[] = Array.isArray(rawContent)
-      ? (rawContent as unknown[])
-      : typeof rawContent === 'string'
-        ? [{ type: 'text', text: rawContent }]
-        : [];
-    const responseId = (message?.['id'] ?? line['id']) as string | undefined;
-    const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
-    const timestamp = (line['timestamp'] as string | undefined) ?? '';
-
-    return {
-      timestamp,
-      prevTimestamp,
-      model,
-      usage,
-      reasoningTokens,
-      contentBlocks,
-      responseId,
-      finishReason: stopReason,
-    };
-  });
-
-  const totalUsageValue = calls.reduce<UsageSummary>(
-    (acc, call) => addUsage(acc, call.usage),
-    { input_tokens: 0, output_tokens: 0 },
-  );
-
-  const model = calls.map(call => call.model).filter(Boolean).pop();
-
-  const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
-
+function readTranscriptLine(value: unknown): TranscriptLine {
+  if (!isObject(value)) return {};
+  const message = isObject(value['message']) ? value['message'] : undefined;
   return {
-    totalUsage: () => totalUsageValue,
-    primaryModel: () => model,
-    textBlocks: () => texts,
-    assistantCalls: () => calls,
+    message,
+    type: typeof value['type'] === 'string' ? value['type'] : undefined,
+    role: typeof message?.['role'] === 'string' ? message['role'] : undefined,
+    timestamp: typeof value['timestamp'] === 'string' ? value['timestamp'] : undefined,
   };
 }
 
-// The assistant content-block shapes we act on (Anthropic Messages API).
-// Blocks reach us as `unknown` from the transcript; the guards below narrow the
-// ones we care about. Any other block type falls through every guard and is
-// ignored.
-type TextBlock = { type: 'text'; text: string };
-type ThinkingBlock = { type: 'thinking'; thinking: string };
-type RedactedThinkingBlock = { type: 'redacted_thinking'; data?: string };
-type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input?: unknown };
+function buildSession(lines: unknown[]): ParsedSession {
+  const turns: ParsedTurn[] = [];
+  let assistantLines: AssistantLine[] = [];
+  let turnStarted = false;
+  let turnStartTime: string | undefined;
+  let turnUserText: string | undefined;
+  let previousTimestamp: string | undefined;
 
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null;
+  for (const value of lines) {
+    const decoded = readTranscriptLine(value);
+    const role = decoded.role ?? decoded.type;
+
+    if (role === 'assistant' && isObject(value)) {
+      assistantLines.push({ line: value, previousTimestamp });
+    } else if (role === 'user') {
+      const content = decoded.message?.['content'];
+      // Typed prompts are bare strings. Array-form user content is injected
+      // context (tool results, skills, reminders), so it stays in this turn.
+      if (typeof content === 'string' && content) {
+        if (turnStarted || assistantLines.length > 0) {
+          turns.push(buildTurn(assistantLines, turnStartTime, turnUserText));
+        }
+        assistantLines = [];
+        turnStarted = true;
+        turnStartTime = decoded.timestamp;
+        turnUserText = content;
+      }
+    }
+
+    if (decoded.timestamp) previousTimestamp = decoded.timestamp;
+  }
+
+  if (turnStarted || assistantLines.length > 0) {
+    turns.push(buildTurn(assistantLines, turnStartTime, turnUserText));
+  }
+  return { turns };
 }
+
+function readUsage(value: unknown): Record<string, number> {
+  if (!isObject(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
+  );
+}
+
+function toUsage(raw: Record<string, number>): UsageSummary {
+  return {
+    input_tokens: raw['input_tokens'] ?? 0,
+    output_tokens: raw['output_tokens'] ?? 0,
+    cache_read_input_tokens: raw['cache_read_input_tokens'],
+    cache_creation_input_tokens: raw['cache_creation_input_tokens'],
+  };
+}
+
+function buildTurn(
+  lines: AssistantLine[],
+  startTime?: string,
+  userText?: string,
+): ParsedTurn {
+  const responses: AssistantResponse[] = [];
+
+  for (const { line, previousTimestamp } of lines) {
+    const { message, timestamp } = readTranscriptLine(line);
+    const rawUsage = readUsage(message?.['usage'] ?? line['usage']);
+    const rawContent = message?.['content'];
+    const content = Array.isArray(rawContent)
+      ? rawContent
+      : typeof rawContent === 'string'
+        ? [{ type: 'text', text: rawContent }]
+        : [];
+    const idValue = message?.['id'] ?? line['id'];
+    const modelValue = message?.['model'] ?? line['model'];
+    const finishValue = message?.['stop_reason'] ?? message?.['finish_reason'];
+    const id = typeof idValue === 'string' ? idValue : undefined;
+    const model = typeof modelValue === 'string' ? modelValue : undefined;
+    const finishReason = typeof finishValue === 'string' ? finishValue : undefined;
+    const reasoningTokens = rawUsage['reasoning_tokens'];
+
+    const previous = responses.at(-1);
+    if (id && previous?.id === id) {
+      previous.content.push(...content);
+      previous.endTime = timestamp;
+      previous.usage = toUsage(rawUsage);
+      previous.reasoningTokens = reasoningTokens ?? previous.reasoningTokens;
+      previous.model = model ?? previous.model;
+      previous.finishReason = finishReason ?? previous.finishReason;
+      continue;
+    }
+
+    responses.push({
+      startTime: previousTimestamp,
+      endTime: timestamp,
+      model,
+      usage: toUsage(rawUsage),
+      reasoningTokens,
+      content,
+      id,
+      finishReason,
+    });
+  }
+
+  return {
+    startTime: startTime ?? responses.at(0)?.startTime,
+    userText,
+    model: responses.filter(response => response.model).at(-1)?.model,
+    text: responses.flatMap(response => extractAssistantTextBlocks(response.content)),
+    responses,
+  };
+}
+
+/** Flatten responses in transcript order. Useful when a live span remembers the
+ * response offset at which its prompt began. */
+export function assistantResponses(session: ParsedSession): AssistantResponse[] {
+  return session.turns.flatMap(turn => turn.responses);
+}
+
+export function lastAssistantTextEndsWith(session: ParsedSession, suffix: string): boolean {
+  const response = assistantResponses(session).at(-1);
+  return response !== undefined
+    && extractAssistantTextBlocks(response.content).join('\n').trimEnd().endsWith(suffix);
+}
+
+type AnthropicContentBlock = AnthropicMessage['content'][number];
+type AnthropicContentBlockFor<Type extends AnthropicContentBlock['type']> = Extract<
+  AnthropicContentBlock,
+  { type: Type }
+>;
+type TextBlock = Pick<AnthropicContentBlockFor<'text'>, 'type' | 'text'>;
+type ThinkingBlock = Pick<
+  AnthropicContentBlockFor<'thinking'>,
+  'type' | 'thinking'
+>;
+type RedactedThinkingBlock = Pick<
+  AnthropicContentBlockFor<'redacted_thinking'>,
+  'type'
+>;
+type AnthropicToolUseBlock = AnthropicContentBlockFor<'tool_use'>;
+type ToolUseBlock = Pick<AnthropicToolUseBlock, 'type' | 'id' | 'name'>
+  & Partial<Pick<AnthropicToolUseBlock, 'input'>>;
 
 export function isTextBlock(block: unknown): block is TextBlock {
   return isObject(block) && block['type'] === 'text' && typeof block['text'] === 'string';
@@ -213,23 +248,17 @@ export function isRedactedThinkingBlock(block: unknown): block is RedactedThinki
 }
 
 export function isToolUseBlock(block: unknown): block is ToolUseBlock {
-  return isObject(block) && block['type'] === 'tool_use'
-    && typeof block['id'] === 'string' && typeof block['name'] === 'string';
+  return isObject(block)
+    && block['type'] === 'tool_use'
+    && typeof block['id'] === 'string'
+    && typeof block['name'] === 'string';
 }
 
-/**
- * Pull human-readable text out of assistant `content` blocks. Accepts the raw
- * union (string entries, `{type: 'text', text}` objects, etc.) and returns
- * only non-empty text. `thinking` and other block types are skipped.
- */
 export function extractAssistantTextBlocks(blocks: unknown[]): string[] {
-  const out: string[] = [];
+  const text: string[] = [];
   for (const block of blocks) {
-    if (typeof block === 'string' && block.trim()) {
-      out.push(block);
-    } else if (isTextBlock(block) && block.text.trim()) {
-      out.push(block.text);
-    }
+    if (typeof block === 'string' && block.trim()) text.push(block);
+    else if (isTextBlock(block) && block.text.trim()) text.push(block.text);
   }
-  return out;
+  return text;
 }

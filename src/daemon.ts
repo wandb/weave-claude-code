@@ -24,7 +24,7 @@ import type {
 import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog } from './utils.js';
-import { parseSessionFd } from './parser.js';
+import { lastAssistantTextEndsWith, parseSessionFd } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
@@ -35,11 +35,7 @@ import {
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import type { DaemonConfig } from './config.js';
-import {
-  lastAssistantTextEndsWith,
-  newSessionState,
-  upsertInstruction,
-} from './sessionState.js';
+import { newSessionState, upsertInstruction } from './sessionState.js';
 import type {
   SessionState,
   LoadedInstruction,
@@ -675,14 +671,14 @@ export class GlobalDaemon {
       finalAssistantMessage,
     );
     const currentTurn = parsedSession?.turns.at(-1);
-    const model = currentTurn?.primaryModel();
+    const model = currentTurn?.model;
     const transcriptTurns = parsedSession?.turns.length ?? 0;
     this.log(
       'DEBUG',
       `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
-    const parsedTexts = currentTurn?.textBlocks() ?? [];
+    const parsedTexts = currentTurn?.text ?? [];
     const lastMessage = input.last_assistant_message ?? '';
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
@@ -690,7 +686,8 @@ export class GlobalDaemon {
     if (assistantMessages.length) {
       turnAttrs[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(assistantMessages);
     }
-    const finishReasons = currentTurn?.assistantCalls().map(c => c.finishReason).filter((r): r is string => !!r);
+    const finishReasons = currentTurn?.responses.map(response => response.finishReason)
+      .filter((reason): reason is string => reason !== undefined);
     if (finishReasons?.length) {
       turnAttrs[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
     }
