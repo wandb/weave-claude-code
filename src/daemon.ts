@@ -75,6 +75,9 @@ type ControlMessage = {
 /** Raw hook-event payload forwarded by hook-handler.sh. */
 type HookPayload = Record<string, unknown>;
 
+/** SDK span handle that can explicitly parent a tool across hook frames. */
+type ToolParent = Pick<weave.Turn, 'startTool'>;
+
 function isControlMessage(payload: unknown): payload is ControlMessage {
   if (typeof payload !== 'object' || payload === null) return false;
   const cmd = (payload as Record<string, unknown>).command;
@@ -640,9 +643,7 @@ export class GlobalDaemon {
 
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     const tracker = agentId ? session.subagents.byAgentId(agentId) : undefined;
-    const parent: weave.Turn | weave.SubAgent | weave.LLM | undefined = agentId
-      ? tracker?.subAgent ?? session.currentTurn
-      : this.advanceMainAgentChatSpan(session, toolUseId) ?? session.currentTurn;
+    const parent = this.resolveToolParent(session, agentId, toolUseId);
     if (!parent) {
       this.log('ERROR', `PreToolUse: no parent for session=${sessionId} tool=${toolName}`);
       return;
@@ -658,6 +659,23 @@ export class GlobalDaemon {
     if (tracker) toolAttrs[ATTR.AGENT_NAME] = tracker.subagentType;
     tool.setAttributes(toolAttrs);
     session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
+  }
+
+  /**
+   * Resolve the explicit SDK handle for a tool hook. Subagent tools nest under
+   * their invoke_agent marker; main-agent tools nest under the response's chat
+   * span when transcript correlation succeeds. Both paths fall back to the
+   * current turn.
+   */
+  private resolveToolParent(
+    session: SessionState,
+    agentId: string | undefined,
+    toolUseId: string,
+  ): ToolParent | undefined {
+    if (agentId) {
+      return session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn;
+    }
+    return this.advanceMainAgentChatSpan(session, toolUseId) ?? session.currentTurn;
   }
 
   private advanceMainAgentChatSpan(session: SessionState, toolUseId: string): weave.LLM | undefined {
