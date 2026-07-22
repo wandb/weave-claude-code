@@ -44,6 +44,13 @@ import type { DaemonConfig } from './config.js';
 import { emitChatSpans } from './chatSpans.js';
 import { newSessionState, turnForPrompt } from './sessionState.js';
 import type { SessionState, TurnTrace } from './sessionState.js';
+import {
+  beginCall,
+  finalizeOpenCalls,
+  openCalls,
+  settleCall,
+} from './callSpans.js';
+import type { CallOutcome } from './callSpans.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -59,6 +66,12 @@ type ControlMessage = {
 
 /** Raw hook-event payload forwarded by hook-handler.sh. */
 type HookPayload = Record<string, unknown>;
+
+type HookInputFor<Event extends HookInput['hook_event_name']> = Extract<
+  HookInput,
+  { hook_event_name: Event }
+>;
+type PostToolResultHookInput = HookInputFor<'PostToolUse' | 'PostToolUseFailure'>;
 
 function isControlMessage(payload: unknown): payload is ControlMessage {
   if (typeof payload !== 'object' || payload === null) return false;
@@ -350,6 +363,7 @@ export class GlobalDaemon {
           break;
         case 'PostToolUse':
         case 'PostToolUseFailure':
+          await this.handlePostToolResult(sessionId, input);
           break;
         case 'SubagentStart':
           await this.handleSubagentStart(sessionId, input);
@@ -658,7 +672,21 @@ export class GlobalDaemon {
         parseSessionFd(session.transcript.getFd()) ?? { turns: [] },
       ).length;
       responseOffsetFloor = previous.responseLimit;
-      this.finalizeTurn(session, previous, 'superseded_by_next_prompt');
+      const hasBackgroundWork = openCalls(session.calls)
+        .some(call => call.promptId === previous.promptId);
+      if (input.prompt_id === undefined) {
+        // Legacy streams cannot identify concurrent prompts. Treat the next
+        // prompt as a hard boundary and orphan any still-open child calls.
+        this.recordFinalTurnOutput(
+          previous,
+          'superseded_by_next_prompt',
+          this.parseTranscript(session),
+        );
+        this.finalizeCalls(session, 'superseded_by_next_prompt');
+        this.endTurn(session, previous);
+      } else if (!hasBackgroundWork) {
+        this.finalizeTurn(session, previous, 'superseded_by_next_prompt');
+      }
     }
 
     const turn = this.startSessionTurn(session, {
@@ -677,9 +705,49 @@ export class GlobalDaemon {
   }
 
   private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
+    if (input.tool_name === 'Agent' || input.agent_id) return;
+    const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) return;
-    this.log('DEBUG', `PreToolUse (not yet traced): session=${sessionId} tool=${input.tool_name}`);
+
+    const turn = this.ensureTurn(session, input.prompt_id);
+    const call = beginCall(session.calls, turn.span, {
+      toolUseId: input.tool_use_id,
+      toolName: input.tool_name,
+      toolInput: this.asRecord(input.tool_input),
+      promptId: turn.promptId,
+    });
+    if (call) turn.phase = 'active';
+  }
+
+  /** Recreate a tool span when its exact terminal hook is the first event
+   * observed after a daemon restart. */
+  private recoverCall(session: SessionState, input: PostToolResultHookInput): void {
+    if (session.calls.byToolUseId.has(input.tool_use_id)
+      || session.calls.toolUseTombstones.has(input.tool_use_id)) return;
+
+    const turn = this.ensureTurn(session, input.prompt_id);
+    beginCall(session.calls, turn.span, {
+      toolUseId: input.tool_use_id,
+      toolName: input.tool_name,
+      toolInput: this.asRecord(input.tool_input),
+      promptId: turn.promptId,
+    });
+  }
+
+  private async handlePostToolResult(
+    sessionId: string,
+    input: PostToolResultHookInput,
+  ): Promise<void> {
+    if (input.tool_name === 'Agent' || input.agent_id) return;
+    const session = await this.getOrReconstructSession(sessionId, input);
+    if (!session || session.calls.toolUseTombstones.has(input.tool_use_id)) return;
+
+    const outcome: CallOutcome = input.hook_event_name === 'PostToolUse'
+      ? { kind: 'success', value: input.tool_response }
+      : { kind: 'failure', error: input.error };
+    this.recoverCall(session, input);
+    settleCall(session.calls, input.tool_use_id, outcome);
+    this.finalizeIdleSupersededTurns(session);
   }
 
   private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
@@ -847,7 +915,7 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} turns=${session.turns.size}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} calls=${openCalls(session.calls).length} turns=${session.turns.size}`,
     );
     this.finalizeSession(session, 'session_ended', parsed);
 
@@ -888,9 +956,24 @@ export class GlobalDaemon {
     orphanReason: string,
     parsed = this.parseTranscript(session),
   ): void {
+    const turns = [...session.turns];
+    for (const turn of turns) this.recordFinalTurnOutput(turn, orphanReason, parsed);
+    this.finalizeCalls(session, orphanReason);
+    for (const turn of turns) this.endTurn(session, turn);
+  }
+
+  private finalizeCalls(session: SessionState, orphanReason: string): void {
+    for (const toolUseId of finalizeOpenCalls(session.calls, orphanReason)) {
+      this.log('DEBUG', `Closed pending call: ${toolUseId}`);
+    }
+  }
+
+  private finalizeIdleSupersededTurns(session: SessionState): void {
+    const activePrompts = new Set(openCalls(session.calls).map(call => call.promptId));
     for (const turn of [...session.turns]) {
-      this.recordFinalTurnOutput(turn, orphanReason, parsed);
-      this.endTurn(session, turn);
+      if (turn.responseLimit !== undefined && !activePrompts.has(turn.promptId)) {
+        this.finalizeTurn(session, turn, 'superseded_by_next_prompt');
+      }
     }
   }
 
@@ -908,11 +991,12 @@ export class GlobalDaemon {
     void this.shutdown('inactivity');
   }
 
-  /** A blockable Stop leaves its root reopenable but quiescent. Later call
-   * state extends this predicate so real background work still pins the daemon. */
+  /** A blockable Stop leaves its root reopenable but quiescent. Open calls and
+   * active roots still pin the daemon while work can produce more events. */
   private hasInFlightWork(): boolean {
     for (const s of this.sessions.values()) {
-      if ([...s.turns].some(turn => turn.phase === 'active')) return true;
+      if (openCalls(s.calls).length > 0
+        || [...s.turns].some(turn => turn.phase === 'active')) return true;
     }
     return false;
   }
@@ -950,6 +1034,12 @@ export class GlobalDaemon {
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }
 
   /** Retry parseSessionFile while the transcript writer catches up to Stop.
    *  If `finalAssistantMessage` is set, require the last assistant call's
