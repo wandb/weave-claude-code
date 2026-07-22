@@ -94,18 +94,11 @@ export function writeKnownMarketplace(home: string, source: Record<string, unkno
   );
 }
 
-// GenAI span harness: the daemon emits through the SDK's process-global state,
-// so each test file inits `weave` once with an in-memory OTLP exporter (offline)
-// and resets the exporter between tests.
-
 let genaiExporter: InMemorySpanExporter | undefined;
 
-/** Init `weave` with an in-memory exporter (once per test process); call
- *  `exporter.reset()` at the start of each test to isolate spans. */
 export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   if (!genaiExporter) {
-    // weave.init() requires a key (WANDB_API_KEY/~/.netrc) even offline; resolve
-    // fake creds the way the daemon does so the bridge stays hermetic on CI.
+    // weave.init requires credentials even with an in-memory exporter.
     const settings: Settings = {
       log_file: '', daemon_socket: '', weave_project: 'e/p', wandb_api_key: 'fake-key-for-test',
       agent_name: null, debug: false, installed_at: '', version: '0.0.0-test',
@@ -119,15 +112,11 @@ export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   return genaiExporter;
 }
 
-/** The daemon surface the genai tests drive: the (private) routeEvent entry
- *  point production feeds from the socket, plus drain for shutdown tests. */
 export type DaemonDriver = {
   routeEvent(p: Record<string, unknown>): Promise<void>;
   drain(reason: string): Promise<void>;
 };
 
-/** GlobalDaemon with tracing marked enabled (SDK inited via `initWeaveInMemory`),
- *  skipping the real socket/`start()`; viewed through the DaemonDriver seam. */
 export function makeGenaiDaemon(agentName = 'claude-code'): DaemonDriver {
   const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
   const d = new GlobalDaemon('/tmp/unused.sock', logFile, {
@@ -137,8 +126,6 @@ export function makeGenaiDaemon(agentName = 'claude-code'): DaemonDriver {
   return d as unknown as DaemonDriver;
 }
 
-/** One JSONL transcript line for a user text message. `version` mirrors the
- *  CC CLI version field real transcripts carry on their head line. */
 export function transcriptUserLine(text: string, opts: { version?: string; timestamp?: string } = {}): string {
   return JSON.stringify({
     type: 'user',
@@ -148,7 +135,6 @@ export function transcriptUserLine(text: string, opts: { version?: string; times
   });
 }
 
-/** One JSONL transcript line for a single-text assistant response. */
 export function transcriptAssistantLine(
   text: string,
   usage: Record<string, number>,
@@ -168,18 +154,15 @@ export function transcriptAssistantLine(
   });
 }
 
-/** Flush any spans buffered in the SDK so the in-memory exporter has them. */
 export function flushWeave(): Promise<void> {
   return weave.flushOTel();
 }
 
-/** Parent span id: weave's provider exposes `parentSpanId` (older providers used
- *  `parentSpanContext`), so read whichever is present. */
+/** Support both current and older OTel parent-span fields. */
 export function spanParentId(s: ReadableSpan): string | undefined {
   return (s as unknown as { parentSpanId?: string }).parentSpanId ?? s.parentSpanContext?.spanId;
 }
 
-/** Direct children of `parent`, ordered by span start time. */
 export function childrenOf(spans: ReadableSpan[], parent: ReadableSpan): ReadableSpan[] {
   const parentId = parent.spanContext().spanId;
   return spans

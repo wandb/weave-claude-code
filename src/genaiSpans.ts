@@ -61,8 +61,6 @@ export const ATTR = {
   WEAVE_CWD: 'weave.claude_code.cwd',
   WEAVE_SOURCE: 'weave.claude_code.source',
   WEAVE_PLUGIN_VERSION: 'weave.claude_code.plugin.version',
-  WEAVE_TURN_NUMBER: 'weave.claude_code.turn.number',
-  WEAVE_TURN_TOOL_COUNT: 'weave.claude_code.turn.tool_count',
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
@@ -283,11 +281,6 @@ export function toolDisplayName(toolName: string, input: Record<string, unknown>
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LEGACY: baggage plumbing and hand-rolled span builders. Unreferenced after
-// the SDK swap in daemon.ts; kept out of this diff and deleted in the next PR.
-// ─────────────────────────────────────────────────────────────────────────────
-
 /** Common prefix for all integration-identity attributes. The span processor
  *  copies baggage entries under this prefix onto each span. */
 export const WEAVE_INTEGRATION_PREFIX = 'weave.integration.';
@@ -381,7 +374,6 @@ type TurnSpanArgs = {
    *  resume share `gen_ai.conversation.id`). For fresh sessions, equals
    *  `sessionId`. */
   conversationId: string;
-  turnNumber: number;
   prompt: string;
   cwd: string;
   source: string;
@@ -414,7 +406,6 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
     [ATTR.WEAVE_CWD]: args.cwd,
     [ATTR.WEAVE_SOURCE]: args.source,
     [ATTR.WEAVE_PLUGIN_VERSION]: args.pluginVersion,
-    [ATTR.WEAVE_TURN_NUMBER]: args.turnNumber,
     [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: args.prompt }]),
   };
   if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;

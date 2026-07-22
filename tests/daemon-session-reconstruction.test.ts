@@ -66,24 +66,3 @@ test('UserPromptSubmit for an unknown session reconstructs it from transcript_pa
     await d.stop();
   }
 });
-
-test('reconstructed session continues turn numbering from the transcript', async () => {
-  const d = await startTestDaemon();
-  try {
-    const sessionId = 'recon-sess-002';
-    // Three completed turns already on disk → the resumed turn is turn 4.
-    const transcript = writeTranscript(d.home, sessionId, 3);
-
-    await d.send({
-      hook_event_name: 'UserPromptSubmit',
-      session_id: sessionId,
-      transcript_path: transcript,
-      prompt: 'fourth prompt',
-    });
-
-    const ok = await d.waitForLog(/Created turn span \(turn 4\)/, 3000);
-    assert.ok(ok, `expected the reconstructed turn to be numbered 4; log was:\n${d.readLog()}`);
-  } finally {
-    await d.stop();
-  }
-});

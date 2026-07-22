@@ -2,10 +2,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// The resolved agent name (settings `agent_name` / `WEAVE_AGENT_NAME`) is passed
-// to `weave.startTurn`, which sets it as `gen_ai.agent.name` (the span name stays
-// `invoke_agent`), driving Weave's Agents-view grouping.
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -33,7 +29,6 @@ test('turn span: agentName drives gen_ai.agent.name', async () => {
     try {
       await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/tmp' });
       await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'hello' });
-      // The turn span only exports on end; SessionEnd finalizes an open turn.
       await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
       await flushWeave();
 

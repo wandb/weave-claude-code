@@ -13,8 +13,6 @@ import type {
   InstructionsLoadedHookInput,
   UserPromptSubmitHookInput,
   PreToolUseHookInput,
-  PostToolUseHookInput,
-  PostToolUseFailureHookInput,
   PermissionRequestHookInput,
   SubagentStartHookInput,
   SubagentStopHookInput,
@@ -81,15 +79,9 @@ function daemonEntryPath(): string {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GlobalDaemon
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Idle window before self-reap; fires only with nothing in flight. Long enough
-// that mid-session gaps don't strand a resumed session. WEAVE_INACTIVITY_MS overrides.
+// Keep resumed sessions warm across long idle gaps.
 const INACTIVITY_TIMEOUT_MS = 120 * 60 * 1_000;  // 120 minutes
-// Ceiling on holding past the idle timeout while work is in flight, so a stuck
-// session or silent teammate can't pin the daemon forever (see checkInactivity).
+// Bound how long stuck in-flight work can keep the daemon alive.
 const INFLIGHT_HOLD_MAX_MS = 60 * 60 * 1_000;   // 60 minutes
 const CONNECTION_TIMEOUT_MS = 5_000;            // 5 seconds per connection
 
@@ -108,7 +100,6 @@ export class GlobalDaemon {
    *  hook can fire before SessionStart). Keyed by session_id; drained into the
    *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
   private pendingInstructions = new Map<string, LoadedInstruction[]>();
-  /** True once `weave.init` has completed. All span emission is gated on it. */
   private tracingEnabled = false;
 
   constructor(
@@ -142,12 +133,9 @@ export class GlobalDaemon {
 
     process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
     process.on('SIGINT',  () => void this.shutdown('SIGINT'));
-    // Without SIGHUP, Node exits on terminal close with no JS handler, leaving
-    // the socket inode behind for the next hook to mistake for a live daemon.
-    // Routing it through shutdown() unlinks it.
+    // Route terminal-close cleanup through shutdown to remove the socket inode.
     process.on('SIGHUP',  () => void this.shutdown('SIGHUP'));
-    // Remove the inode on any non-signal exit; SIGKILL/OOM aren't coverable and
-    // are handled by the hook handler's probe at the next event.
+    // The next hook's socket probe handles cleanup after SIGKILL or OOM.
     process.on('exit', () => {
       try { if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath); } catch { /* nothing more we can do */ }
     });
@@ -228,14 +216,11 @@ export class GlobalDaemon {
       throw new Error(`Invalid weave_project format: '${this.config.weaveProject}' (expected entity/project)`);
     }
 
-    // The SDK reads apiKey/host from env only (weave login() writes netrc; wrong
-    // for a daemon): WF_TRACE_SERVER_URL aims the OTLP exporter, WANDB_API_KEY
-    // auths. WANDB_BASE_URL must stay unset or a wrong trace URL is derived.
+    // weave.init reads the exporter endpoint and API key from the environment.
     process.env['WF_TRACE_SERVER_URL'] = this.config.baseUrl;
     process.env['WANDB_API_KEY'] = this.config.apiKey;
 
-    // Route OTel diagnostics into the daemon log; the batch exporter otherwise
-    // fails silently (a bad key or unreachable host drops every span unlogged).
+    // Surface exporter failures in the daemon log.
     const otelDiag = (message: string, ...args: unknown[]) =>
       this.log('ERROR', `otel: ${message}${args.length ? ` ${args.map(String).join(' ')}` : ''}`);
     diag.setLogger(
@@ -331,8 +316,6 @@ export class GlobalDaemon {
   // ── event routing ─────────────────────────────────────────────────────────
 
   private async routeEvent(payload: HookPayload): Promise<void> {
-    // Validate the socket's raw hook JSON against the SDK schema once, so the
-    // handlers get typed, discriminated inputs instead of re-casting per field.
     const input = payload as HookInput;
     const sessionId = input.session_id;
     if (!sessionId) {
@@ -342,14 +325,10 @@ export class GlobalDaemon {
 
     this.log('INFO', `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`);
 
-    // Each event runs in its own isolated frame so the SDK's single-active
-    // guards (one Conversation/Turn/LLM per frame) never trip across concurrent
-    // sessions; identity flows through the held handles, not the frame.
+    // Isolate SDK active-span state across concurrent sessions.
     await weave.runIsolated(() => this.dispatchEvent(input, sessionId));
   }
 
-  /** Run one hook event's handler, narrowing `input` via the discriminant; split
-   *  from `routeEvent` so it runs inside the isolated per-event context. */
   private async dispatchEvent(input: HookInput, sessionId: string): Promise<void> {
     try {
       switch (input.hook_event_name) {
@@ -370,10 +349,7 @@ export class GlobalDaemon {
           await this.handlePermissionRequest(sessionId, input);
           break;
         case 'PostToolUse':
-          await this.handlePostToolUse(sessionId, input);
-          break;
         case 'PostToolUseFailure':
-          await this.handlePostToolUseFailure(sessionId, input);
           break;
         case 'SubagentStart':
           await this.handleSubagentStart(sessionId, input);
@@ -433,7 +409,6 @@ export class GlobalDaemon {
       cwd,
       source,
       initialRequestModel,
-      turnNumber: 0,
       agentName: this.config.agentName,
       tracingEnabled: this.tracingEnabled,
     });
@@ -448,9 +423,6 @@ export class GlobalDaemon {
     );
   }
 
-  /** Canonical `gen_ai.conversation.id`: root of the `forkedFrom.sessionId` chain,
-   *  so `--continue`/`--resume` sessions stitch to the original. Sibling-file walk;
-   *  the first read retries (SessionStart races the flush); depth-capped. */
   private async resolveConversationId(
     sessionId: string,
     transcriptPath: string,
@@ -510,9 +482,6 @@ export class GlobalDaemon {
     return current;
   }
 
-  /** Return the tracked session, reconstructing it from the event's
-   *  `transcript_path` when this daemon never saw its SessionStart (a session
-   *  outliving a daemon restart would otherwise go untraced). */
   private async getOrReconstructSession(
     sessionId: string,
     input: HookInput,
@@ -539,15 +508,6 @@ export class GlobalDaemon {
     const initialRequestModel = raw['model'] as string | undefined;
     const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
 
-    // Seed the turn counter from the turns already on disk so numbering
-    // continues across the restart instead of resetting to 1.
-    let priorTurns = 0;
-    try {
-      priorTurns = parseSessionFd(transcript.getFd())?.turns.length ?? 0;
-    } catch (err) {
-      this.log('DEBUG', `Reconstruct ${sessionId}: could not count prior turns: ${err}`);
-    }
-
     const session = newSessionState({
       sessionId,
       conversationId,
@@ -555,7 +515,6 @@ export class GlobalDaemon {
       cwd,
       source,
       initialRequestModel,
-      turnNumber: priorTurns,
       agentName: this.config.agentName,
       tracingEnabled: this.tracingEnabled,
     });
@@ -563,16 +522,12 @@ export class GlobalDaemon {
     this.drainPendingInstructions(session);
     this.log(
       'INFO',
-      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId}, prior_turns=${priorTurns})`,
+      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId})`,
     );
     return session;
   }
 
-  /** Capture one instruction file for `gen_ai.system_instructions`. Only
-   *  `file_path` arrives, so read it here (sync preserves load order). Early
-   *  files buffer; reconstructing would no-op the real SessionStart. */
   private handleInstructionsLoaded(sessionId: string, input: InstructionsLoadedHookInput): void {
-    // No tracing means no turn to set these on; skip reads nothing will consume.
     if (!this.tracingEnabled) return;
     const filePath = input.file_path;
     let content: string;
@@ -609,9 +564,6 @@ export class GlobalDaemon {
     this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
-  /** Open a turn under the session's conversation, with per-turn session metadata
-   *  (queryable without a session-level span). Each turn roots its own trace; the
-   *  conversation handle seeds conversation.id + identity onto the whole subtree. */
   private startSessionTurn(session: SessionState, userMessage?: string): weave.Turn | undefined {
     if (!session.conversation) return undefined;
     const turn = session.conversation.startTurn({
@@ -630,8 +582,6 @@ export class GlobalDaemon {
   }
 
   private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
-    // Reconstruct if this daemon never saw SessionStart (e.g. a fresh daemon
-    // took over mid-session) so the rest of the session stays traced.
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) {
       this.log('ERROR', `Unknown session (no transcript_path to reconstruct): ${sessionId}`);
@@ -642,15 +592,12 @@ export class GlobalDaemon {
     const prompt = input.prompt;
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} turn_number=${session.turnNumber} prompt=${snippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} prompt=${snippet(prompt, 120)}`,
     );
 
-    // A user interrupt ends a turn with no Stop hook; close any still-open turn
-    // as superseded before the new one overwrites the handle and leaks the root.
+    // Close interrupted turns that never received a Stop hook.
     this.finalizeOpenTurn(session, 'superseded_by_next_prompt');
 
-    session.turnNumber += 1;
-    session.turnToolCalls = 0;
     const turn = this.startSessionTurn(session, prompt);
     if (!turn) return;
 
@@ -660,59 +607,33 @@ export class GlobalDaemon {
       session.pendingCompaction = undefined;
     }
 
-    this.log('INFO', `Created turn span (turn ${session.turnNumber})`);
+    this.log('INFO', 'Created turn span');
   }
 
-  /** Parked: chat/tool spans (and the Agent-dispatch marker) land later in this
-   *  stack; until then tool calls only feed the turn's tool-count attribute. */
   private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracingEnabled) return;
     this.log('DEBUG', `PreToolUse (not yet traced): session=${sessionId} tool=${input.tool_name}`);
   }
 
-  private countToolCall(session: SessionState, toolName: string): void {
-    session.totalToolCalls += 1;
-    session.turnToolCalls += 1;
-    session.toolCounts[toolName] = (session.toolCounts[toolName] ?? 0) + 1;
-  }
-
-  /** Parked: the permission span event lands with tool spans later in this stack. */
   private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     this.log('DEBUG', `PermissionRequest (not yet traced): session=${sessionId} tool=${input.tool_name}`);
   }
 
-  private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session || !input.tool_name) return;
-    // Parked: tool spans land later in this stack; count for the turn attrs.
-    this.countToolCall(session, input.tool_name);
-  }
-
-  private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session || !input.tool_name) return;
-    // Parked: tool spans land later in this stack; count for the turn attrs.
-    this.countToolCall(session, input.tool_name);
-  }
-
-  /** Parked: subagent `invoke_agent` markers land later in this stack. */
   private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.tracingEnabled) return;
     this.log('DEBUG', `SubagentStart (not yet traced): session=${sessionId} agent=${input.agent_id}`);
   }
 
-  /** Parked: subagent `invoke_agent` markers land later in this stack. */
   private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session || !this.tracingEnabled) return;
     this.log('DEBUG', `SubagentStop (not yet traced): session=${sessionId} agent=${input.agent_id}`);
   }
 
-  /** Parked: teammate tracing lands later in this stack. */
   private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
     if (!this.tracingEnabled) return;
     this.log('DEBUG', `TeammateIdle (not yet traced): session=${sessionId} teammate=${input.teammate_name}`);
@@ -722,8 +643,7 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Live CC payloads carry the compaction summary + item counts the backend
-    // wants, but the SDK type doesn't declare them; read them off the raw record.
+    // Claude Code sends compaction fields that are absent from the SDK type.
     const raw = input as Record<string, unknown>;
     const summary = raw['summary'] ?? raw['compaction_summary'];
     const itemsBefore = raw['items_before'];
@@ -736,7 +656,7 @@ export class GlobalDaemon {
 
     if (session.currentTurn) {
       setCompactionAttrs(session.currentTurn, attrs);
-      this.log('INFO', `PreCompact attached to active turn ${session.turnNumber} (session ${sessionId})`);
+      this.log('INFO', `PreCompact attached to active turn (session ${sessionId})`);
     } else {
       // Buffer until the next UserPromptSubmit opens a turn span.
       session.pendingCompaction = attrs;
@@ -748,8 +668,7 @@ export class GlobalDaemon {
     const session = this.sessions.get(sessionId);
     if (!session?.currentTurn) return;
 
-    // Pass last_assistant_message so the retry waits for the synthesis to
-    // flush; otherwise the final chat span drops when the read races the writer.
+    // Wait for transcript synthesis to flush before reading the final response.
     const finalAssistantMessage = input.last_assistant_message;
     const parsedSession = await this.parseSessionFileWithRetry(
       session.transcript,
@@ -763,14 +682,11 @@ export class GlobalDaemon {
       `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
-    // Parked: per-response chat spans land later in this stack; the turn root
-    // carries the parsed output/model until then.
-
     const parsedTexts = currentTurn?.textBlocks() ?? [];
     const lastMessage = input.last_assistant_message ?? '';
     const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
 
-    const turnAttrs: Attributes = { [ATTR.WEAVE_TURN_TOOL_COUNT]: session.turnToolCalls };
+    const turnAttrs: Attributes = {};
     if (assistantMessages.length) {
       turnAttrs[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(assistantMessages);
     }
@@ -778,16 +694,15 @@ export class GlobalDaemon {
     if (finishReasons?.length) {
       turnAttrs[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
     }
-    session.currentTurn.setAttributes(turnAttrs);
-    // record(), not setAttributes: Turn.end() re-emits its internal request
-    // model, which would clobber a raw attribute write of the parsed model.
+    if (Object.keys(turnAttrs).length) session.currentTurn.setAttributes(turnAttrs);
+    // Turn.end() re-emits its request model, so update it through record().
     if (model) {
       session.currentTurn.record({ model });
     }
     session.currentTurn.end();
     session.currentTurn = undefined;
 
-    this.log('INFO', `Finished turn ${session.turnNumber} (${session.turnToolCalls} tools)`);
+    this.log('INFO', 'Finished turn');
   }
 
   private async handleSessionEnd(sessionId: string, input: SessionEndHookInput): Promise<void> {
@@ -799,7 +714,7 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} turns=${session.turnNumber} total_tools=${session.totalToolCalls} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
     );
 
     this.finalizeSession(session, 'session_ended');
@@ -811,16 +726,10 @@ export class GlobalDaemon {
     session.transcript.close();
   }
 
-  /** End every still-open span on the session, setting `orphan_reason`; finalizing
-   *  at shutdown keeps an interrupted turn's root exported. Idempotent. (Only the
-   *  turn root exists at this point in the stack.) */
   private finalizeSession(session: SessionState, orphanReason: string): void {
     this.finalizeOpenTurn(session, orphanReason);
   }
 
-  /** Close the still-open turn (root) span, setting `orphanReason`. Also called at
-   *  UserPromptSubmit when an interrupt ended the turn with no Stop hook, else the
-   *  next turn overwrites the handle and leaks the root unexported. */
   private finalizeOpenTurn(session: SessionState, orphanReason: string): void {
     if (session.currentTurn) {
       session.currentTurn.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
@@ -835,8 +744,7 @@ export class GlobalDaemon {
   private checkInactivity(): void {
     const idle = Date.now() - this.lastActivity;
     if (idle <= this.inactivityMs) return;
-    // Hold open while work is in flight (open turn/tool/subagent) so it isn't cut
-    // off; the INFLIGHT_HOLD_MAX_MS ceiling stops a stuck session pinning us.
+    // Keep in-flight work alive up to the hard hold limit.
     if (idle < INFLIGHT_HOLD_MAX_MS && this.hasInFlightWork()) {
       this.log('DEBUG', 'Inactivity timeout reached but work in flight — staying up');
       return;
@@ -864,13 +772,9 @@ export class GlobalDaemon {
     process.exit(0);
   }
 
-  /** Shutdown minus the final `process.exit` (split out for tests). Sessions are
-   *  finalized before `weave.flushOTel()` so the just-ended roots make the final
-   *  export batch instead of being left rootless. */
   private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
-    // Per-session try: one bad session must not abort the flush below.
     for (const session of this.sessions.values()) {
       try {
         this.finalizeSession(session, 'daemon_shutdown');
