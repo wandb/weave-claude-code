@@ -24,22 +24,26 @@ import type {
 import * as weave from 'weave';
 import { loadSettings, VERSION } from './setup.js';
 import { appendToLog } from './utils.js';
-import { lastAssistantTextEndsWith, parseSessionFd } from './parser.js';
+import {
+  assistantResponses,
+  extractAssistantTextBlocks,
+  lastAssistantTextEndsWith,
+  parseSessionFd,
+} from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import {
   ATTR,
   CompactionAttrs,
   setCompactionAttrs,
   assistantOutputMessages,
+  parseTimestamp,
   snippet,
 } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import type { DaemonConfig } from './config.js';
-import { newSessionState, upsertInstruction } from './sessionState.js';
-import type {
-  SessionState,
-  LoadedInstruction,
-} from './sessionState.js';
+import { emitChatSpans } from './chatSpans.js';
+import { newSessionState, turnForPrompt } from './sessionState.js';
+import type { SessionState, TurnTrace } from './sessionState.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -95,7 +99,7 @@ export class GlobalDaemon {
   /** InstructionsLoaded files that arrived before their session existed (the
    *  hook can fire before SessionStart). Keyed by session_id; drained into the
    *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
-  private pendingInstructions = new Map<string, LoadedInstruction[]>();
+  private pendingInstructions = new Map<string, Map<string, string>>();
   private tracingEnabled = false;
 
   constructor(
@@ -375,8 +379,32 @@ export class GlobalDaemon {
 
   // ── event handlers ────────────────────────────────────────────────────────
 
+  private async buildSession(
+    sessionId: string,
+    transcript: TranscriptFile,
+    options: { source: string; cwd: string; initialRequestModel?: string },
+  ): Promise<SessionState> {
+    const conversationId = await this.resolveConversationId(
+      sessionId,
+      transcript.resolvedPath,
+      options.source,
+    );
+    const session = newSessionState({
+      sessionId,
+      conversationId,
+      transcript,
+      cwd: options.cwd,
+      source: options.source,
+      initialRequestModel: options.initialRequestModel,
+      agentName: this.config.agentName,
+    });
+    this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
+    return session;
+  }
+
   private async handleSessionStart(sessionId: string, input: SessionStartHookInput): Promise<void> {
-    if (this.sessions.has(sessionId)) return; // idempotent
+    if (!this.tracingEnabled || this.sessions.has(sessionId)) return;
 
     const rawPath = input.transcript_path;
     if (!rawPath) {
@@ -392,30 +420,17 @@ export class GlobalDaemon {
       return;
     }
 
-    const source = input.source;
-    const initialRequestModel = input.model;
-    const cwd = input.cwd;
-
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
+    const session = await this.buildSession(sessionId, transcript, {
+      source: input.source,
+      cwd: input.cwd,
+      initialRequestModel: input.model,
     });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
 
-    const resumed = conversationId !== sessionId;
-    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
+    const resumed = session.conversationId !== sessionId;
+    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${session.conversationId})` : ''}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} conversation=${conversationId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} conversation=${session.conversationId} source=${session.source} model=${session.initialRequestModel ?? 'unknown'} cwd=${session.cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
     );
   }
 
@@ -482,6 +497,7 @@ export class GlobalDaemon {
     sessionId: string,
     input: HookInput,
   ): Promise<SessionState | undefined> {
+    if (!this.tracingEnabled) return undefined;
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
 
@@ -502,23 +518,14 @@ export class GlobalDaemon {
     const source = (raw['source'] as string | undefined) ?? 'reconstructed';
     const cwd = input.cwd;
     const initialRequestModel = raw['model'] as string | undefined;
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
+    const session = await this.buildSession(sessionId, transcript, {
       source,
+      cwd,
       initialRequestModel,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
     });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
     this.log(
       'INFO',
-      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId})`,
+      `Session reconstructed after restart: ${sessionId} (conversation=${session.conversationId})`,
     );
     return session;
   }
@@ -534,14 +541,13 @@ export class GlobalDaemon {
       return;
     }
 
-    const instruction: LoadedInstruction = { filePath, content };
     const session = this.sessions.get(sessionId);
     if (session) {
-      upsertInstruction(session.systemInstructions, instruction);
+      session.systemInstructions.set(filePath, content);
     } else {
       // Session not set up yet; buffer until SessionStart / reconstruct drains it.
-      const pending = this.pendingInstructions.get(sessionId) ?? [];
-      upsertInstruction(pending, instruction);
+      const pending = this.pendingInstructions.get(sessionId) ?? new Map();
+      pending.set(filePath, content);
       this.pendingInstructions.set(sessionId, pending);
     }
     this.log(
@@ -555,26 +561,83 @@ export class GlobalDaemon {
   private drainPendingInstructions(session: SessionState): void {
     const pending = this.pendingInstructions.get(session.sessionId);
     this.pendingInstructions.delete(session.sessionId);
-    if (!pending?.length) return;
-    for (const instruction of pending) upsertInstruction(session.systemInstructions, instruction);
-    this.log('DEBUG', `Drained ${pending.length} buffered instruction file(s) into session ${session.sessionId}`);
+    if (!pending?.size) return;
+    for (const [filePath, content] of pending) session.systemInstructions.set(filePath, content);
+    this.log('DEBUG', `Drained ${pending.size} buffered instruction file(s) into session ${session.sessionId}`);
   }
 
-  private startSessionTurn(session: SessionState, userMessage?: string): weave.Turn | undefined {
-    if (!session.conversation) return undefined;
-    const turn = session.conversation.startTurn({
+  private transcriptCursor(
+    session: SessionState,
+    options: {
+      userMessage?: string;
+      recoverCurrentTurn?: boolean;
+      responseOffsetFloor?: number;
+    },
+  ): { responseOffset: number; startTime?: Date; userText?: string } {
+    const parsed = parseSessionFd(session.transcript.getFd());
+    if (!parsed) return { responseOffset: 0, userText: options.userMessage };
+
+    const responses = assistantResponses(parsed);
+    const current = parsed.turns.at(-1);
+    const transcriptHasPrompt = options.userMessage !== undefined
+      && current?.userText === options.userMessage;
+    const includeCurrent = options.recoverCurrentTurn || transcriptHasPrompt;
+    const responseOffset = includeCurrent
+      ? responses.length - (current?.responses.length ?? 0)
+      : responses.length;
+    return {
+      responseOffset: Math.max(responseOffset, options.responseOffsetFloor ?? 0),
+      startTime: includeCurrent ? parseTimestamp(current?.startTime) : undefined,
+      userText: options.userMessage ?? (includeCurrent ? current?.userText : undefined),
+    };
+  }
+
+  private startSessionTurn(
+    session: SessionState,
+    options: {
+      promptId?: string;
+      userMessage?: string;
+      recoverCurrentTurn?: boolean;
+      responseOffsetFloor?: number;
+      makeCurrent?: boolean;
+    } = {},
+  ): TurnTrace {
+    const cursor = this.transcriptCursor(session, options);
+    const span = session.conversation.startTurn({
       agentVersion: VERSION,
       model: session.initialRequestModel,
-      userMessage,
-      systemInstructions: session.systemInstructions.map((i) => i.content),
-      startTime: new Date(),
+      userMessage: cursor.userText,
+      systemInstructions: [...session.systemInstructions.values()],
+      startTime: cursor.startTime,
     });
-    turn.setAttributes({
+    span.setAttributes({
       [ATTR.WEAVE_CWD]: session.cwd,
       [ATTR.WEAVE_SOURCE]: session.source,
     });
-    session.currentTurn = turn;
+    const turn: TurnTrace = {
+      span,
+      promptId: options.promptId,
+      userText: cursor.userText,
+      phase: 'active',
+      responseOffset: cursor.responseOffset,
+      seenResponses: new Set(),
+    };
+    session.turns.add(turn);
+    if (options.makeCurrent !== false) session.currentTurn = turn;
+    if (options.promptId !== undefined) {
+      session.turnsByPromptId.set(options.promptId, turn);
+    }
     return turn;
+  }
+
+  private ensureTurn(session: SessionState, promptId: string | undefined): TurnTrace {
+    return turnForPrompt(session, promptId) ?? this.startSessionTurn(session, {
+      promptId,
+      // A protocol prompt_id cannot safely be joined to the last transcript
+      // turn. Legacy hooks have no competing identity and may recover it.
+      recoverCurrentTurn: promptId === undefined,
+      makeCurrent: !session.currentTurn || session.currentTurn.promptId === promptId,
+    });
   }
 
   private async handleUserPromptSubmit(sessionId: string, input: UserPromptSubmitHookInput): Promise<void> {
@@ -583,23 +646,32 @@ export class GlobalDaemon {
       this.log('ERROR', `Unknown session (no transcript_path to reconstruct): ${sessionId}`);
       return;
     }
-    if (!this.tracingEnabled) return;
-
     const prompt = input.prompt;
+    const previous = session.currentTurn;
+    if (input.prompt_id !== undefined && session.turnsByPromptId.has(input.prompt_id)) return;
     this.log(
       'DEBUG',
-      `UserPromptSubmit: session=${sessionId} current_turn=${session.currentTurn ? 'open' : 'none'} prompt=${snippet(prompt, 120)}`,
+      `UserPromptSubmit: session=${sessionId} current_turn=${previous ? 'open' : 'none'} prompt=${snippet(prompt, 120)}`,
     );
 
-    // Close interrupted turns that never received a Stop hook.
-    this.finalizeOpenTurn(session, 'superseded_by_next_prompt');
+    let responseOffsetFloor: number | undefined;
+    if (previous) {
+      previous.responseLimit ??= assistantResponses(
+        parseSessionFd(session.transcript.getFd()) ?? { turns: [] },
+      ).length;
+      responseOffsetFloor = previous.responseLimit;
+      this.finalizeTurn(session, previous, 'superseded_by_next_prompt');
+    }
 
-    const turn = this.startSessionTurn(session, prompt);
-    if (!turn) return;
+    const turn = this.startSessionTurn(session, {
+      promptId: input.prompt_id,
+      userMessage: prompt,
+      responseOffsetFloor,
+    });
 
     // Drain compaction attrs buffered while no turn was open.
     if (session.pendingCompaction) {
-      setCompactionAttrs(turn, session.pendingCompaction);
+      setCompactionAttrs(turn.span, session.pendingCompaction);
       session.pendingCompaction = undefined;
     }
 
@@ -650,8 +722,9 @@ export class GlobalDaemon {
       itemsAfter: typeof itemsAfter === 'number' ? itemsAfter : undefined,
     };
 
-    if (session.currentTurn) {
-      setCompactionAttrs(session.currentTurn, attrs);
+    const turn = turnForPrompt(session, input.prompt_id);
+    if (turn) {
+      setCompactionAttrs(turn.span, attrs);
       this.log('INFO', `PreCompact attached to active turn (session ${sessionId})`);
     } else {
       // Buffer until the next UserPromptSubmit opens a turn span.
@@ -660,79 +733,157 @@ export class GlobalDaemon {
     }
   }
 
-  private async handleStop(sessionId: string, input: StopHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session?.currentTurn) return;
+  private responsesForTurn(
+    parsed: NonNullable<ReturnType<typeof parseSessionFd>>,
+    turn: TurnTrace,
+  ) {
+    return assistantResponses(parsed).slice(turn.responseOffset, turn.responseLimit);
+  }
 
-    // Wait for transcript synthesis to flush before reading the final response.
-    const finalAssistantMessage = input.last_assistant_message;
-    const parsedSession = await this.parseSessionFileWithRetry(
+  private recordTurnOutput(
+    turn: TurnTrace,
+    responses: ReturnType<typeof assistantResponses>,
+    options: { lastMessage?: string; orphanReason?: string } = {},
+  ): void {
+    emitChatSpans(turn.span, responses, { seen: turn.seenResponses });
+
+    const text = responses.flatMap(response => extractAssistantTextBlocks(response.content));
+    if (!text.length && options.lastMessage) text.push(options.lastMessage);
+    const attributes: Attributes = {};
+    if (text.length) attributes[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(text);
+    const finishReasons = responses
+      .map(response => response.finishReason)
+      .filter((reason): reason is string => Boolean(reason));
+    if (finishReasons.length) attributes[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
+    if (options.orphanReason) attributes[ATTR.WEAVE_ORPHAN_REASON] = options.orphanReason;
+    if (Object.keys(attributes).length) turn.span.setAttributes(attributes);
+
+    const model = responses.filter(response => response.model).at(-1)?.model;
+    if (model) turn.span.record({ model });
+  }
+
+  private endTurn(session: SessionState, turn: TurnTrace): void {
+    turn.span.end();
+    session.turns.delete(turn);
+    if (turn.promptId !== undefined
+      && session.turnsByPromptId.get(turn.promptId) === turn) {
+      session.turnsByPromptId.delete(turn.promptId);
+    }
+    if (session.currentTurn === turn) session.currentTurn = undefined;
+  }
+
+  private async handleStop(sessionId: string, input: StopHookInput): Promise<void> {
+    const session = await this.getOrReconstructSession(sessionId, input);
+    if (!session) return;
+    const turn = turnForPrompt(session, input.prompt_id)
+      ?? this.ensureTurn(session, input.prompt_id);
+
+    const parsed = await this.parseSessionFileWithRetry(
       session.transcript,
-      finalAssistantMessage,
+      input.last_assistant_message,
     );
-    const currentTurn = parsedSession?.turns.at(-1);
-    const model = currentTurn?.model;
-    const transcriptTurns = parsedSession?.turns.length ?? 0;
+    const responses = parsed ? this.responsesForTurn(parsed, turn) : [];
+    const model = responses.filter(response => response.model).at(-1)?.model;
     this.log(
       'DEBUG',
-      `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} transcript_turns=${transcriptTurns} parsed_model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
+      `Stop: session=${sessionId} transcript_path=${session.transcript.resolvedPath} responses=${responses.length} model=${model ?? 'unknown'} last_assistant_message_present=${Boolean(input.last_assistant_message)}`,
     );
 
-    const parsedTexts = currentTurn?.text ?? [];
-    const lastMessage = input.last_assistant_message ?? '';
-    const assistantMessages = parsedTexts.length > 0 ? parsedTexts : (lastMessage ? [lastMessage] : []);
-
-    const turnAttrs: Attributes = {};
-    if (assistantMessages.length) {
-      turnAttrs[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(assistantMessages);
-    }
-    const finishReasons = currentTurn?.responses.map(response => response.finishReason)
-      .filter((reason): reason is string => reason !== undefined);
-    if (finishReasons?.length) {
-      turnAttrs[ATTR.RESPONSE_FINISH_REASONS] = finishReasons;
-    }
-    if (Object.keys(turnAttrs).length) session.currentTurn.setAttributes(turnAttrs);
-    // Turn.end() re-emits its request model, so update it through record().
-    if (model) {
-      session.currentTurn.record({ model });
-    }
-    session.currentTurn.end();
-    session.currentTurn = undefined;
-
-    this.log('INFO', 'Finished turn');
+    // Stop hooks are blockable. Snapshot output now, but retain the root so a
+    // continuation can add responses under the same prompt.
+    this.recordTurnOutput(turn, responses, {
+      lastMessage: input.last_assistant_message,
+    });
+    turn.phase = 'stopped';
+    this.log('INFO', 'Recorded turn stop snapshot');
   }
 
   private async handleSessionEnd(sessionId: string, input: SessionEndHookInput): Promise<void> {
-    // Discard any never-drained instruction buffer (e.g. a session that emitted
-    // InstructionsLoaded but never SessionStart) so the map can't leak.
     this.pendingInstructions.delete(sessionId);
-    const session = this.sessions.get(sessionId);
+    const session = this.sessions.get(sessionId)
+      ?? await this.getOrReconstructSession(sessionId, input);
     if (!session) return;
+
+    const parsed = this.parseTranscript(session);
+    const finalTranscriptTurn = parsed?.turns.at(-1);
+    if (parsed && finalTranscriptTurn) {
+      let turn = input.prompt_id === undefined
+        ? [...session.turns].find(candidate =>
+          candidate.userText !== undefined
+          && candidate.userText === finalTranscriptTurn.userText)
+          ?? (session.currentTurn?.promptId === undefined ? session.currentTurn : undefined)
+        : turnForPrompt(session, input.prompt_id);
+      const legacyTurn = session.currentTurn;
+      if (!turn && input.prompt_id !== undefined && legacyTurn && legacyTurn.promptId === undefined) {
+        turn = legacyTurn;
+        turn.promptId = input.prompt_id;
+        session.turnsByPromptId.set(input.prompt_id, turn);
+      }
+      const stoppedUnknownPrompt = input.prompt_id === undefined
+        && session.currentTurn?.promptId !== undefined
+        && session.currentTurn.phase === 'stopped';
+      if (!turn && !stoppedUnknownPrompt) {
+        turn = this.startSessionTurn(session, {
+          promptId: input.prompt_id,
+          userMessage: finalTranscriptTurn.userText,
+          recoverCurrentTurn: true,
+        });
+      }
+      if (turn && turn.responseLimit === undefined) {
+        turn.responseOffset = Math.max(
+          turn.responseOffset,
+          assistantResponses(parsed).length - finalTranscriptTurn.responses.length,
+        );
+        turn.userText ??= finalTranscriptTurn.userText;
+      }
+    }
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} turns=${session.turns.size}`,
     );
-
-    this.finalizeSession(session, 'session_ended');
-
-    this.log('INFO', `Finished session ${sessionId}`);
+    this.finalizeSession(session, 'session_ended', parsed);
 
     this.sessions.delete(sessionId);
     this.sessionQueues.delete(sessionId);
     session.transcript.close();
+    this.log('INFO', `Finished session ${sessionId}`);
   }
 
-  private finalizeSession(session: SessionState, orphanReason: string): void {
-    this.finalizeOpenTurn(session, orphanReason);
+  private parseTranscript(
+    session: SessionState,
+  ): ReturnType<typeof parseSessionFd> {
+    try {
+      return parseSessionFd(session.transcript.getFd());
+    } catch (error) {
+      this.log('DEBUG', `Could not recover chat spans while closing turn: ${error}`);
+      return null;
+    }
   }
 
-  private finalizeOpenTurn(session: SessionState, orphanReason: string): void {
-    if (session.currentTurn) {
-      session.currentTurn.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
-      session.currentTurn.end();
-      session.currentTurn = undefined;
-      this.log('DEBUG', `Closed orphaned turn span (${orphanReason})`);
+  private recordFinalTurnOutput(
+    turn: TurnTrace,
+    orphanReason: string,
+    parsed: ReturnType<typeof parseSessionFd>,
+  ): void {
+    const responses = parsed ? this.responsesForTurn(parsed, turn) : [];
+    const actualOrphanReason = turn.phase === 'active' ? orphanReason : undefined;
+    this.recordTurnOutput(turn, responses, { orphanReason: actualOrphanReason });
+  }
+
+  private finalizeTurn(session: SessionState, turn: TurnTrace, orphanReason: string): void {
+    this.recordFinalTurnOutput(turn, orphanReason, this.parseTranscript(session));
+    this.endTurn(session, turn);
+  }
+
+  private finalizeSession(
+    session: SessionState,
+    orphanReason: string,
+    parsed = this.parseTranscript(session),
+  ): void {
+    for (const turn of [...session.turns]) {
+      this.recordFinalTurnOutput(turn, orphanReason, parsed);
+      this.endTurn(session, turn);
     }
   }
 
@@ -750,14 +901,11 @@ export class GlobalDaemon {
     void this.shutdown('inactivity');
   }
 
-  /** True if any session has work in flight: an open turn span, a pending tool
-   *  call, or a tracked subagent. Keeps the daemon alive across the inactivity
-   *  timeout so in-flight work isn't cut off mid-flight (see checkInactivity). */
+  /** A blockable Stop leaves its root reopenable but quiescent. Later call
+   * state extends this predicate so real background work still pins the daemon. */
   private hasInFlightWork(): boolean {
     for (const s of this.sessions.values()) {
-      if (s.currentTurn) return true;
-      if (s.pendingToolCalls.size > 0) return true;
-      if (s.subagents.size() > 0) return true;
+      if ([...s.turns].some(turn => turn.phase === 'active')) return true;
     }
     return false;
   }
