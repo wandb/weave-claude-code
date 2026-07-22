@@ -830,11 +830,21 @@ export class GlobalDaemon {
         });
       }
       if (turn && turn.responseLimit === undefined) {
-        turn.responseOffset = Math.max(
-          turn.responseOffset,
-          assistantResponses(parsed).length - finalTranscriptTurn.responses.length,
-        );
-        turn.userText ??= finalTranscriptTurn.userText;
+        const finalResponseOffset = assistantResponses(parsed).length
+          - finalTranscriptTurn.responses.length;
+        if (turn.userText === undefined) {
+          // An exact prompt_id can safely bind a root reconstructed from an
+          // earlier terminal hook to the final transcript turn.
+          turn.responseOffset = finalResponseOffset;
+          turn.userText = finalTranscriptTurn.userText;
+          if (turn.userText !== undefined) {
+            turn.span.record({
+              messages: [{ role: 'user', parts: [{ type: 'text', content: turn.userText }] }],
+            });
+          }
+        } else {
+          turn.responseOffset = Math.max(turn.responseOffset, finalResponseOffset);
+        }
       }
     }
 
