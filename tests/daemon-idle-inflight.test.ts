@@ -2,14 +2,9 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// The daemon idles out after a quiet window, but the inactivity check only held
-// it open for in-flight cross-session *team* work. A plain long-running tool or
-// turn (longer than the timeout, with no other session active) tripped the
-// timeout mid-flight: the daemon exited, dropped the still-open turn/tool spans,
-// and the resumed work landed on a fresh, amnesiac daemon.
-//
-// The fix: also hold the daemon open while any session has an open turn span, a
-// pending tool call, or a tracked subagent.
+// Active root work pins the daemon across its idle window. A blockable Stop
+// keeps that root reopenable but makes it quiescent; later call-state slices
+// extend the same predicate for tools and subagents.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -56,7 +51,7 @@ test('daemon stays up past the inactivity timeout while a turn span is open', as
   }
 });
 
-test('daemon still idles out once the turn closes and nothing is in flight', async () => {
+test('daemon idles out once a stopped turn is quiescent', async () => {
   const d = await startTestDaemon({ env: { WEAVE_INACTIVITY_MS: '1000' } });
   try {
     const sessionId = 'inflight-002';
@@ -65,10 +60,10 @@ test('daemon still idles out once the turn closes and nothing is in flight', asy
     await d.send({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, transcript_path: transcript, prompt: 'a quick task' });
     await d.send({ hook_event_name: 'Stop', session_id: sessionId, transcript_path: transcript });
 
-    // Turn span closed → nothing in flight → the daemon must still decide to
-    // idle out (the in-flight hold must not pin it open forever).
+    // Stop is blockable and retains the root for a continuation, but without
+    // active work it must not pin the daemon open indefinitely.
     const shuttingDown = await d.waitForLog(/Inactivity timeout — shutting down/, 3500);
-    assert.ok(shuttingDown, `daemon should idle out after the turn closes; log was:\n${d.readLog()}`);
+    assert.ok(shuttingDown, `daemon should idle out after the turn becomes quiescent; log was:\n${d.readLog()}`);
   } finally {
     await d.stop();
   }
