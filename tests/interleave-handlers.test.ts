@@ -12,6 +12,7 @@ import { ATTR } from '../src/genaiSpans.ts';
 import { childrenOf, flushWeave, initWeaveInMemory, makeGenaiDaemon } from './helpers.ts';
 
 const USAGE = { input_tokens: 100, output_tokens: 1508, cache_read_input_tokens: 400 };
+const TOOL_CALL_ID = 'gen_ai.tool.call.id';
 
 function aLine(id: string, ts: string, block: Record<string, unknown>, stop?: string) {
   return {
@@ -86,7 +87,7 @@ test('handlers: Stop emits each chat once; text + tool output parts preserve int
 
     const turn = spans.find(s => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent');
     assert.ok(turn, 'main-agent turn exported');
-    const tool = spans.find(s => s.attributes[ATTR.TOOL_CALL_ID] === 'tool_1');
+    const tool = spans.find(s => s.attributes[TOOL_CALL_ID] === 'tool_1');
     assert.ok(tool, 'execute_tool span exported');
     assert.ok(childrenOf(spans, turn).includes(tool), 'main-agent tool nests directly under the turn');
 
@@ -141,7 +142,7 @@ test('handlers: Stop emits multiple tool-calling responses once under the turn',
     assert.ok(turn, 'main-agent turn exported');
     const toolIds = childrenOf(spans, turn)
       .filter(s => s.attributes[ATTR.OPERATION_NAME] === 'execute_tool')
-      .map(s => s.attributes[ATTR.TOOL_CALL_ID])
+      .map(s => s.attributes[TOOL_CALL_ID])
       .sort();
     assert.deepEqual(toolIds, ['tool_A', 'tool_B'], 'both main-agent tools nest directly under the turn');
   } finally {
