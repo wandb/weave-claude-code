@@ -13,6 +13,7 @@ import type { CompactionAttrs } from './genaiSpans.js';
 
 /** Stores the tool span opened at PreToolUse so PostToolUse can close it. */
 export type PendingToolCall = {
+  kind: 'tool';
   tool: weave.Tool;
   toolName: string;
   toolInput: Record<string, unknown>;
@@ -20,10 +21,17 @@ export type PendingToolCall = {
   permissionRequested?: boolean;
 }
 
-type ActiveChat = {
-  responseKey: string;
-  llm: weave.LLM;
+/** Agent dispatch opened at PreToolUse and settled at PostToolUse. */
+export type PendingSubagentCall = {
+  kind: 'subagent';
+  subAgent: weave.SubAgent;
+  subagentType: string;
+  promptHash: string;
+  /** Added when SubagentStart bridges this call to agent-scoped hooks. */
+  agentId?: string;
 }
+
+export type PendingCall = PendingToolCall | PendingSubagentCall;
 
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 export function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
@@ -90,26 +98,6 @@ export async function readSubagentFirstLineWithRetry(
   return undefined;
 }
 
-export type SubagentTracker = {
-  subagentType: string;
-  detectedAt: Date;
-  toolUseId?: string;
-  subAgent?: weave.SubAgent;
-  agentId?: string;
-  promptHash?: string;
-  ended?: boolean;
-  transcriptPath?: string;
-  pendingTeammateIdle?: boolean;
-  teamName?: string;
-}
-
-export type TeamMember = {
-  subAgent: weave.SubAgent;
-  conversation: weave.Conversation;
-  coordinatorTranscriptPath: string;
-  emitted: boolean;
-}
-
 export type SessionState = {
   sessionId: string;
   conversationId: string;
@@ -122,67 +110,15 @@ export type SessionState = {
 
   currentTurn?: weave.Turn;
 
-  pendingToolCalls: Map<string, PendingToolCall>;
-  subagents: SubagentTracking;
-
-  activeChat?: ActiveChat;
-  emittedChatSpanResponseKeys: Set<string>;
+  /** Calls owned by tool_use_id from PreToolUse through PostToolUse. */
+  pendingCalls: Map<string, PendingCall>;
+  /** Secondary agent_id index used only while subagent hooks are active. */
+  activeSubagents: Map<string, PendingSubagentCall>;
 
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
 
   systemInstructions: LoadedInstruction[];
-}
-
-export class SubagentTracking {
-  private trackers: SubagentTracker[] = [];
-
-  /** Add a pending tracker at PreToolUse, before SubagentStart correlates an agent_id. */
-  add(tracker: SubagentTracker): void {
-    this.trackers.push(tracker);
-  }
-
-  findUnmatchedByContent(promptHash: string, subagentType: string): SubagentTracker | undefined {
-    let best: SubagentTracker | undefined;
-    for (const t of this.trackers) {
-      if (t.agentId) continue;
-      if (t.promptHash !== promptHash) continue;
-      if (t.subagentType !== subagentType) continue;
-      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
-    }
-    return best;
-  }
-
-  byAgentId(agentId: string): SubagentTracker | undefined {
-    return this.trackers.find(t => t.agentId === agentId);
-  }
-
-  findPendingTeammateIdle(subagentType: string): SubagentTracker | undefined {
-    let best: SubagentTracker | undefined;
-    for (const t of this.trackers) {
-      if (!t.pendingTeammateIdle) continue;
-      if (t.subagentType !== subagentType) continue;
-      if (!best || t.detectedAt.getTime() < best.detectedAt.getTime()) best = t;
-    }
-    return best;
-  }
-
-  byToolUseId(toolUseId: string): SubagentTracker | undefined {
-    return this.trackers.find(t => t.toolUseId === toolUseId);
-  }
-
-  remove(tracker: SubagentTracker): void {
-    const idx = this.trackers.indexOf(tracker);
-    if (idx >= 0) this.trackers.splice(idx, 1);
-  }
-
-  size(): number {
-    return this.trackers.length;
-  }
-
-  all(): SubagentTracker[] {
-    return [...this.trackers];
-  }
 }
 
 type NewSessionStateOptions = {
@@ -223,9 +159,8 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     source,
     initialRequestModel,
     conversation,
-    pendingToolCalls: new Map(),
-    subagents: new SubagentTracking(),
-    emittedChatSpanResponseKeys: new Set(),
+    pendingCalls: new Map(),
+    activeSubagents: new Map(),
     systemInstructions: [],
   };
 }

@@ -4,7 +4,6 @@
 
 import * as weave from 'weave';
 import type { AssistantCallDetail } from './parser.js';
-import { isToolUseBlock } from './parser.js';
 import {
   ATTR,
   buildUsage,
@@ -29,21 +28,6 @@ export function callsForResponseKey(
     if (chatMessageKey(calls[i], i) === key) group.push(calls[i]);
   }
   return group;
-}
-
-/** Response key of the call carrying `tool_use` block `toolUseId`; undefined if unflushed. */
-export function findToolUseResponseKey(
-  calls: AssistantCallDetail[],
-  toolUseId: string,
-): string | undefined {
-  for (let ci = 0; ci < calls.length; ci++) {
-    for (const block of calls[ci].contentBlocks) {
-      if (isToolUseBlock(block) && block.id === toolUseId) {
-        return chatMessageKey(calls[ci], ci);
-      }
-    }
-  }
-  return undefined;
 }
 
 export function parseIsoOrNow(ts: string | undefined): Date {
