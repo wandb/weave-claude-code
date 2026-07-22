@@ -86,3 +86,52 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('ambiguous correlation does not manufacture a duplicate subagent marker', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sid = 'sub-nest-ambiguous';
+  const agentId = 'ambiguous-agent';
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-subnest-ambiguous-'));
+  const coordPath = path.join(dir, `${sid}.jsonl`);
+  fs.writeFileSync(coordPath, userLine('dispatch two explorers') + '\n');
+
+  const subPath = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
+  fs.mkdirSync(path.dirname(subPath), { recursive: true });
+  fs.writeFileSync(subPath, userLine('prompt not present on either dispatch') + '\n'
+    + assistantLine('ambiguous result', { input_tokens: 20, output_tokens: 5 }) + '\n');
+
+  const d = makeGenaiDaemon();
+  try {
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: coordPath, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'dispatch two explorers' });
+    for (const [toolUseId, prompt] of [['tu-agent-a', 'first task'], ['tu-agent-b', 'second task']] as const) {
+      await d.routeEvent({
+        hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: toolUseId,
+        tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt },
+      });
+    }
+
+    await d.routeEvent({ hook_event_name: 'SubagentStart', session_id: sid, agent_id: agentId, agent_type: 'Explore' });
+    await d.routeEvent({ hook_event_name: 'SubagentStop', session_id: sid, agent_id: agentId, agent_transcript_path: subPath, agent_type: 'Explore' });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tu-agent-a', tool_response: 'first result' });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tu-agent-b', tool_response: 'second result' });
+    await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await flushWeave();
+
+    const spans = exporter.getFinishedSpans();
+    const turn = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+      && s.attributes[ATTR.AGENT_NAME] === 'claude-code');
+    assert.ok(turn, 'coordinator turn exported');
+    const subagents = spans.filter((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+      && s.attributes[ATTR.AGENT_NAME] === 'Explore');
+    assert.equal(subagents.length, 2, 'only the two actual Agent dispatches produce markers');
+
+    const chat = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'chat'
+      && s.attributes[ATTR.AGENT_NAME] === 'Explore');
+    assert.ok(chat, 'ambiguous subagent chat still exported');
+    assert.equal(spanParentId(chat), turn.spanContext().spanId, 'ambiguous chat safely falls back to the turn');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

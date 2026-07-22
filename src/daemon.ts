@@ -58,7 +58,7 @@ import {
 } from './sessionState.js';
 import type {
   PendingToolCall,
-  SubagentTracker,
+  PendingSubagentCall,
   SessionState,
   LoadedInstruction,
 } from './sessionState.js';
@@ -646,7 +646,7 @@ export class GlobalDaemon {
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     if (toolName === 'Agent' && toolInput['subagent_type']) {
       const spawnParent: weave.Turn | weave.SubAgent | undefined = agentId
-        ? session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn
+        ? session.activeSubagents.get(agentId)?.subAgent ?? session.currentTurn
         : session.currentTurn;
       if (!spawnParent) {
         this.log('ERROR', `PreToolUse(Agent): no parent for session=${sessionId}`);
@@ -658,10 +658,9 @@ export class GlobalDaemon {
       if (prompt) {
         subAgent.setAttributes({ [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) });
       }
-      session.subagents.add({
-        toolUseId,
+      session.pendingCalls.set(toolUseId, {
+        kind: 'subagent',
         subagentType,
-        detectedAt: new Date(),
         subAgent,
         promptHash: hashPrompt(prompt),
       });
@@ -685,7 +684,7 @@ export class GlobalDaemon {
       toolAttrs[ATTR.AGENT_NAME] = parent.name;
     }
     tool.setAttributes(toolAttrs);
-    session.pendingToolCalls.set(toolUseId, { tool, toolName, toolInput });
+    session.pendingCalls.set(toolUseId, { kind: 'tool', tool, toolName, toolInput });
   }
 
   private resolveToolParent(
@@ -693,7 +692,7 @@ export class GlobalDaemon {
     agentId: string | undefined,
   ): ToolParent | undefined {
     if (!agentId) return session.currentTurn;
-    return session.subagents.byAgentId(agentId)?.subAgent ?? session.currentTurn;
+    return session.activeSubagents.get(agentId)?.subAgent ?? session.currentTurn;
   }
 
   private async handlePermissionRequest(sessionId: string, input: PermissionRequestHookInput): Promise<void> {
@@ -704,7 +703,8 @@ export class GlobalDaemon {
     if (!toolName) return;
 
     let pending: PendingToolCall | undefined;
-    for (const call of session.pendingToolCalls.values()) {
+    for (const call of session.pendingCalls.values()) {
+      if (call.kind !== 'tool') continue;
       if (call.toolName === toolName && !call.permissionRequested && deepEqual(call.toolInput, input.tool_input)) {
         pending = call;
         break;
@@ -724,70 +724,40 @@ export class GlobalDaemon {
     this.log('DEBUG', `Permission request recorded for ${toolName}`);
   }
 
-  private settleSubagentDispatch(
-    session: SessionState,
-    toolUseId: string,
-    output: unknown,
-    failure: boolean,
-  ): boolean {
-    const tracker = session.subagents.byToolUseId(toolUseId);
-    if (!tracker?.subAgent) return false;
-    this.closeSubagent(tracker, output, failure);
-    session.subagents.remove(tracker);
-    return true;
-  }
-
   private async handlePostToolUse(sessionId: string, input: PostToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const toolUseId = input.tool_use_id;
-    if (!toolUseId) return;
-
-    if (this.settleSubagentDispatch(session, toolUseId, input.tool_response, /*failure*/ false)) return;
-
-    const pending = session.pendingToolCalls.get(toolUseId);
-    if (!pending) return;
-
-    resolvePermissionIfPending(pending, true);
-
-    pending.tool.result = jsonStr(input.tool_response);
-    pending.tool.end();
-
-    session.pendingToolCalls.delete(toolUseId);
+    if (!session || !input.tool_use_id) return;
+    this.settleCall(session, input.tool_use_id, input.tool_response, false);
   }
 
   private async handlePostToolUseFailure(sessionId: string, input: PostToolUseFailureHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const toolUseId = input.tool_use_id;
-    if (!toolUseId) return;
-
-    const error = input.error;
-
-    if (this.settleSubagentDispatch(session, toolUseId, error, /*failure*/ true)) return;
-
-    const pending = session.pendingToolCalls.get(toolUseId);
-    if (!pending) return;
-
-    resolvePermissionIfPending(pending, false);
-
-    pending.tool.result = error;
-    pending.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(error) });
-    pending.tool.end({ error: new Error(error) });
-
-    session.pendingToolCalls.delete(toolUseId);
+    if (!session || !input.tool_use_id) return;
+    this.settleCall(session, input.tool_use_id, input.error, true);
   }
 
-  private closeSubagent(
-    tracker: SubagentTracker,
-    output: unknown,
-    failure: boolean,
-  ): void {
-    const sub = tracker.subAgent;
-    if (!sub || tracker.ended) return;
+  private settleCall(session: SessionState, toolUseId: string, output: unknown, failure: boolean): void {
+    const call = session.pendingCalls.get(toolUseId);
+    if (!call) return;
 
+    if (call.kind === 'subagent') {
+      this.closeSubagent(call.subAgent, output, failure);
+      if (call.agentId) session.activeSubagents.delete(call.agentId);
+    } else {
+      resolvePermissionIfPending(call, !failure);
+      call.tool.result = failure ? String(output) : jsonStr(output);
+      if (failure) {
+        call.tool.setAttributes({ [ATTR.ERROR_TYPE]: this.errorTypeFor(output) });
+        call.tool.end({ error: new Error(String(output)) });
+      } else {
+        call.tool.end();
+      }
+    }
+
+    session.pendingCalls.delete(toolUseId);
+  }
+
+  private closeSubagent(sub: weave.SubAgent, output: unknown, failure: boolean): void {
     if (output !== undefined && output !== null && output !== '') {
       const outputText = typeof output === 'string' ? output : jsonStr(output);
       sub.setAttributes({ [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages([outputText]) });
@@ -798,7 +768,24 @@ export class GlobalDaemon {
     } else {
       sub.end();
     }
-    tracker.ended = true;
+  }
+
+  private matchPendingSubagent(
+    session: SessionState,
+    subagentType: string,
+    prompt: string | undefined,
+  ): { call: PendingSubagentCall | undefined; candidateCount: number } {
+    const promptHash = prompt === undefined ? undefined : hashPrompt(prompt);
+    let exact: PendingSubagentCall | undefined;
+    let only: PendingSubagentCall | undefined;
+    let candidateCount = 0;
+    for (const call of session.pendingCalls.values()) {
+      if (call.kind !== 'subagent' || call.agentId || call.subagentType !== subagentType) continue;
+      candidateCount++;
+      only = call;
+      if (!exact && promptHash !== undefined && call.promptHash === promptHash) exact = call;
+    }
+    return { call: exact ?? (candidateCount === 1 ? only : undefined), candidateCount };
   }
 
   private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
@@ -814,70 +801,34 @@ export class GlobalDaemon {
     const subagentPath = computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     const firstLine = await readSubagentFirstLineWithRetry(subagentPath);
     const firingPrompt = extractUserMessageContent(firstLine);
-
-    let bestTracker: SubagentTracker | undefined;
-    if (firingPrompt !== undefined) {
-      bestTracker = session.subagents.findUnmatchedByContent(hashPrompt(firingPrompt), agentType);
+    const { call } = this.matchPendingSubagent(session, agentType, firingPrompt);
+    if (!call) {
+      const reason = firingPrompt === undefined ? 'transcript unavailable' : 'dispatch correlation ambiguous';
+      this.log('ERROR', `SubagentStart: ${reason}; leaving agentId=${agentId} type=${agentType} unbound`);
+      return;
     }
 
-    const matched = !!bestTracker;
-    if (!bestTracker) {
-      const reason = firingPrompt === undefined
-        ? 'transcript line 1 missing or non-user'
-        : `no tracker matches (promptHash, type=${agentType})`;
-      this.log('ERROR', `SubagentStart: ${reason}; creating orphan for agentId=${agentId} path=${subagentPath}`);
-      bestTracker = {
-        subagentType: agentType,
-        detectedAt: new Date(),
-        transcriptPath: subagentPath,
-      };
-      if (session.currentTurn) {
-        bestTracker.subAgent = this.startOrphanSubagent(session.currentTurn, agentType, reason);
-      }
-      session.subagents.add(bestTracker);
-    }
-
-    bestTracker.agentId = agentId;
-    if (bestTracker.subAgent) bestTracker.subAgent.record({ agentId });
-
-    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} matched=${matched}`);
+    call.agentId = agentId;
+    call.subAgent.record({ agentId });
+    session.activeSubagents.set(agentId, call);
+    this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType}`);
   }
 
-  private startOrphanSubagent(turn: weave.Turn, agentType: string, orphanReason: string): weave.SubAgent {
-    const subAgent = turn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
-    subAgent.setAttributes({
-      [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
-      [ATTR.WEAVE_ORPHAN_REASON]: orphanReason,
-    });
-    return subAgent;
-  }
-
-  private getOrReconstructTurn(session: SessionState): weave.Turn | undefined {
-    if (session.currentTurn) return session.currentTurn;
-    const turn = this.startSessionTurn(session);
-    if (turn) this.log('INFO', 'Reconstructed turn span after restart');
-    return turn;
-  }
-
-  private recoverSubagentTracker(
+  private recoverSubagent(
     session: SessionState,
     agentId: string,
     agentType: string,
-  ): SubagentTracker | undefined {
-    const turn = this.getOrReconstructTurn(session);
+  ): weave.SubAgent | undefined {
+    const turn = session.currentTurn ?? this.startSessionTurn(session);
     if (!turn) return undefined;
-    const subAgent = this.startOrphanSubagent(turn, agentType, 'recovered at SubagentStop after daemon restart (no tracker)');
+    const subAgent = turn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
+    subAgent.setAttributes({
+      [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
+      [ATTR.WEAVE_ORPHAN_REASON]: 'recovered at SubagentStop after daemon restart',
+    });
     subAgent.record({ agentId });
-    const tracker: SubagentTracker = {
-      subagentType: agentType,
-      detectedAt: new Date(),
-      agentId,
-      subAgent,
-      transcriptPath: computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId),
-    };
-    session.subagents.add(tracker);
     this.log('INFO', `SubagentStop: recovered subagent agentId=${agentId} type=${agentType} after restart`);
-    return tracker;
+    return subAgent;
   }
 
   private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
@@ -887,21 +838,33 @@ export class GlobalDaemon {
     const agentId = input.agent_id;
     if (!agentId) return;
 
-    const tracker = session.subagents.byAgentId(agentId)
-      ?? this.recoverSubagentTracker(session, agentId, input.agent_type);
-    if (!tracker) {
-      this.log('ERROR', `SubagentStop: no tracker for agentId=${agentId} and none recoverable`);
-      return;
+    const agentType = input.agent_type;
+    const agentTranscriptPath = input.agent_transcript_path
+      ?? computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
+    let tracked = session.activeSubagents.get(agentId);
+    let candidateCount = 0;
+    if (!tracked) {
+      const firstLine = await readSubagentFirstLineWithRetry(agentTranscriptPath);
+      const match = this.matchPendingSubagent(session, agentType, extractUserMessageContent(firstLine));
+      tracked = match.call;
+      candidateCount = match.candidateCount;
+      if (tracked) {
+        tracked.agentId = agentId;
+        tracked.subAgent.record({ agentId });
+        this.log('INFO', `SubagentStop: late-matched agentId=${agentId} type=${agentType}`);
+      }
     }
 
-    const chatParent = tracker.subAgent ?? session.currentTurn;
+    // With no plausible live dispatch, this is restart recovery. If multiple
+    // dispatches are ambiguous, keep their markers intact and flatten the chat
+    // under the turn rather than manufacture a duplicate invoke_agent span.
+    const recovered = !tracked && candidateCount === 0
+      ? this.recoverSubagent(session, agentId, agentType)
+      : undefined;
+    const chatParent = tracked?.subAgent ?? recovered ?? session.currentTurn;
 
-    const agentTranscriptPath =
-      input.agent_transcript_path ??
-      tracker.transcriptPath ??
-      computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     let model: string | undefined;
-    let lastAssistantText: string | undefined;
+    let lastAssistantText = input.last_assistant_message;
     if (agentTranscriptPath && chatParent) {
       let agentTranscript: TranscriptFile | undefined;
       try {
@@ -910,10 +873,10 @@ export class GlobalDaemon {
         // Earlier turns may be coordinator pre-context, so emit only the last turn.
         const lastTurn = parsed?.turns.at(-1);
         model = lastTurn?.primaryModel();
-        lastAssistantText = lastTurn?.textBlocks().join('\n');
+        lastAssistantText ??= lastTurn?.textBlocks().join('\n');
 
         if (lastTurn) {
-          this.emitChatSpans(chatParent, lastTurn.assistantCalls(), tracker.subagentType);
+          this.emitChatSpans(chatParent, lastTurn.assistantCalls(), agentType);
         }
       } catch (err) {
         this.log('DEBUG', `SubagentStop: could not parse transcript: ${err}`);
@@ -922,24 +885,11 @@ export class GlobalDaemon {
       }
     }
 
-    if (tracker.subAgent) {
-      if (model) {
-        tracker.subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
-      }
-      // Matched subagents close on PostToolUse with the canonical tool response.
-      if (!tracker.ended && !tracker.toolUseId) {
-        this.closeSubagent(tracker, lastAssistantText, /*failure*/ false);
-      }
-    }
-
-    this.log(
-      'DEBUG',
-      `Subagent stopped: agentId=${agentId} type=${tracker.subagentType} model=${model ?? 'unknown'} wall_clock=${Date.now() - tracker.detectedAt.getTime()}ms`,
-    );
-
-    if (!tracker.toolUseId) {
-      session.subagents.remove(tracker);
-    }
+    const subAgent = tracked?.subAgent ?? recovered;
+    if (model && subAgent) subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
+    if (recovered) this.closeSubagent(recovered, lastAssistantText, false);
+    session.activeSubagents.delete(agentId);
+    this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${agentType} model=${model ?? 'unknown'}`);
   }
 
   private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
@@ -1042,10 +992,10 @@ export class GlobalDaemon {
 
     this.log(
       'DEBUG',
-      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} pending_tools=${session.pendingToolCalls.size} open_subagents=${session.subagents.size()}`,
+      `SessionEnd: session=${sessionId} reason=${input.reason} transcript_path=${session.transcript.resolvedPath} pending_calls=${session.pendingCalls.size} active_subagents=${session.activeSubagents.size}`,
     );
 
-    this.finalizeSession(session, 'session_ended');
+    this.finalizeOpenTurn(session, 'session_ended');
 
     this.log('INFO', `Finished session ${sessionId}`);
 
@@ -1054,27 +1004,16 @@ export class GlobalDaemon {
     session.transcript.close();
   }
 
-  private finalizeSession(session: SessionState, orphanReason: string): void {
-    this.finalizeOpenTurn(session, orphanReason);
-
-    for (const tracker of session.subagents.all()) {
-      if (tracker.subAgent && !tracker.ended) {
-        tracker.subAgent.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
-        tracker.subAgent.end({ error: new Error('subagent did not complete before shutdown') });
-        tracker.ended = true;
-      }
-      this.log('DEBUG', `Subagent tracker not stopped: ${tracker.agentId ?? '(unmatched)'} type=${tracker.subagentType}`);
-    }
-  }
-
   private finalizeOpenTurn(session: SessionState, orphanReason: string): void {
-    for (const [toolUseId, pending] of session.pendingToolCalls) {
-      resolvePermissionIfPending(pending, false);
-      pending.tool.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
-      pending.tool.end({ error: new Error(`tool did not complete (${orphanReason})`) });
-      this.log('DEBUG', `Closed orphaned tool span: ${toolUseId} (${pending.toolName})`);
+    for (const [toolUseId, call] of session.pendingCalls) {
+      const span = call.kind === 'tool' ? call.tool : call.subAgent;
+      if (call.kind === 'tool') resolvePermissionIfPending(call, false);
+      span.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+      span.end({ error: new Error(`call did not complete (${orphanReason})`) });
+      this.log('DEBUG', `Closed orphaned call: ${toolUseId}`);
     }
-    session.pendingToolCalls.clear();
+    session.pendingCalls.clear();
+    session.activeSubagents.clear();
 
     if (session.currentTurn) {
       try {
@@ -1103,14 +1042,13 @@ export class GlobalDaemon {
     void this.shutdown('inactivity');
   }
 
-  /** True if any session has work in flight: an open turn span, a pending tool
-   *  call, or a tracked subagent. Keeps the daemon alive across the inactivity
+  /** True if any session has work in flight: an open turn span or pending call.
+   *  Keeps the daemon alive across the inactivity
    *  timeout so in-flight work isn't cut off mid-flight (see checkInactivity). */
   private hasInFlightWork(): boolean {
     for (const s of this.sessions.values()) {
       if (s.currentTurn) return true;
-      if (s.pendingToolCalls.size > 0) return true;
-      if (s.subagents.size() > 0) return true;
+      if (s.pendingCalls.size > 0) return true;
     }
     return false;
   }
@@ -1127,7 +1065,7 @@ export class GlobalDaemon {
     this.server?.close();
     for (const session of this.sessions.values()) {
       try {
-        this.finalizeSession(session, 'daemon_shutdown');
+        this.finalizeOpenTurn(session, 'daemon_shutdown');
       } catch (err) {
         this.log('ERROR', `Error finalizing session ${session.sessionId} at shutdown: ${err}`);
       }
