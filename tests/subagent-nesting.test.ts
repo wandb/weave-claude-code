@@ -135,3 +135,67 @@ test('ambiguous correlation does not manufacture a duplicate subagent marker', a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('recursive dispatch: a subagent spawning a subagent nests the child under its own marker', async () => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sid = 'sub-nest-002';
+  const outerPrompt = 'do the outer task';
+  const innerPrompt = 'do the inner task';
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.weave-subnest2-'));
+  const coordPath = path.join(dir, `${sid}.jsonl`);
+  fs.writeFileSync(coordPath, userLine('kick off') + '\n');
+  for (const [agentId, prompt] of [['outer-1', outerPrompt], ['inner-1', innerPrompt]] as const) {
+    const transcript = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(transcript, userLine(prompt) + '\n'
+      + assistantLine('done', { input_tokens: 10, output_tokens: 5 }) + '\n');
+  }
+
+  const d = makeGenaiDaemon();
+  try {
+    await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: coordPath, source: 'startup', cwd: '/x' });
+    await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'kick off' });
+    await d.routeEvent({
+      hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'tu-outer',
+      tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose', prompt: outerPrompt },
+    });
+    await d.routeEvent({ hook_event_name: 'SubagentStart', session_id: sid, agent_id: 'outer-1', agent_type: 'general-purpose' });
+    await d.routeEvent({
+      hook_event_name: 'PreToolUse', session_id: sid, agent_id: 'outer-1', tool_use_id: 'tu-inner',
+      tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: innerPrompt },
+    });
+    await d.routeEvent({ hook_event_name: 'SubagentStart', session_id: sid, agent_id: 'inner-1', agent_type: 'Explore' });
+    await d.routeEvent({
+      hook_event_name: 'PreToolUse', session_id: sid, agent_id: 'inner-1', tool_use_id: 'tu-read',
+      tool_name: 'Read', tool_input: { file_path: '/f.ts' },
+    });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, agent_id: 'inner-1', tool_use_id: 'tu-read', tool_response: 'ok' });
+    await d.routeEvent({ hook_event_name: 'SubagentStop', session_id: sid, agent_id: 'inner-1', agent_transcript_path: path.join(dir, sid, 'subagents', 'agent-inner-1.jsonl'), agent_type: 'Explore' });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, agent_id: 'outer-1', tool_use_id: 'tu-inner', tool_response: 'inner done' });
+    await d.routeEvent({ hook_event_name: 'SubagentStop', session_id: sid, agent_id: 'outer-1', agent_transcript_path: path.join(dir, sid, 'subagents', 'agent-outer-1.jsonl'), agent_type: 'general-purpose' });
+    await d.routeEvent({ hook_event_name: 'PostToolUse', session_id: sid, tool_use_id: 'tu-outer', tool_response: 'outer done' });
+    await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await flushWeave();
+
+    const spans = exporter.getFinishedSpans();
+    const turn = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+      && s.attributes[ATTR.AGENT_NAME] === 'claude-code');
+    const outer = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+      && s.attributes[ATTR.AGENT_NAME] === 'general-purpose');
+    const inner = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+      && s.attributes[ATTR.AGENT_NAME] === 'Explore');
+    assert.ok(turn && outer && inner, 'turn + both markers exported');
+    assert.equal(spanParentId(outer), turn.spanContext().spanId, 'outer marker nests under the turn');
+    assert.equal(spanParentId(inner), outer.spanContext().spanId, 'inner marker nests under the outer marker');
+    assert.equal(inner.attributes[ATTR.AGENT_ID], 'inner-1', 'inner marker matched');
+    assert.equal(inner.attributes[ATTR.WEAVE_ORPHAN_REASON], undefined, 'no orphan fallback');
+
+    const readTool = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'execute_tool'
+      && s.attributes['gen_ai.tool.name'] === 'Read');
+    assert.ok(readTool, 'inner tool exported');
+    assert.equal(spanParentId(readTool), inner.spanContext().spanId, 'inner tool nests under inner marker');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
