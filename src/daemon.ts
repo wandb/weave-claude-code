@@ -697,9 +697,10 @@ export class GlobalDaemon {
       const subagentType = toolInput['subagent_type'] as string;
       const prompt = typeof toolInput['prompt'] === 'string' ? toolInput['prompt'] : '';
       const subAgent = spawner.startSubagent({ name: subagentType, agentVersion: VERSION, startTime: new Date() });
-      if (prompt) {
-        subAgent.setAttributes({ [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) });
-      }
+      subAgent.setAttributes({
+        [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: toolUseId,
+        ...(prompt ? { [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) } : {}),
+      });
       const call: PendingSubagentCall = {
         kind: 'subagent',
         subagentType,

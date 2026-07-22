@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Config-drift detection over the socket: `status` asks the live daemon for the
-// fingerprint of the config it loaded, and warns when settings.json now
-// resolves to something different. Nothing is written to disk.
-//
-// Sockets live under /tmp (macOS 104-char path cap); see stale-daemon-socket.test.ts.
+// Consolidated config-resolution / CLI tests. Covers:
+//  - agent_name resolution: default, set, get/show, WEAVE_AGENT_NAME override
+//  - `config set` masking of wandb_api_key vs. full echo of non-secret keys
+//  - config-drift detection over the socket (fingerprint, fake daemon, real daemon)
+//  - trace base URL resolution across WANDB_BASE_URL / WF_TRACE_SERVER_URL combos
+// Each test keeps its original setup/teardown; the socket-drift and base-url
+// helpers are distinct per concern and are not shared.
 
 import { test, suite, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +19,105 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveDaemonConfig, daemonConfigFingerprint } from '../src/config.ts';
+import { seedConfigHome, runCli } from './helpers.ts';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// agent_name resolution
+//
+// `config` support for the customizable top-level agent name.
+// The seed settings file deliberately OMITS agent_name to mirror an install
+// from before the field existed; `get` must still resolve to the default
+// rather than error with "Unknown key".
+
+test('config agent_name: default, set, get/show, and env-var override', async () => {
+  const { home } = seedConfigHome('agentname');
+  try {
+    // get on a file missing the key resolves to the default, not an error.
+    const def = await runCli(home, ['config', 'get', 'agent_name']);
+    assert.equal(def.code, 0);
+    assert.equal(def.stdout.trim(), 'claude-code');
+
+    // set, then get/show reflect the value (surrounding whitespace is trimmed
+    // at resolution time, so the effective value is clean).
+    const set = await runCli(home, ['config', 'set', 'agent_name', '  my-team-bot  ']);
+    assert.equal(set.code, 0);
+    assert.equal((await runCli(home, ['config', 'get', 'agent_name'])).stdout.trim(), 'my-team-bot');
+    assert.match((await runCli(home, ['config', 'show'])).stdout, /agent_name:\s+my-team-bot \[settings\.json\]/);
+
+    // WEAVE_AGENT_NAME overrides the settings file.
+    const env = { WEAVE_AGENT_NAME: 'from-env' };
+    assert.equal((await runCli(home, ['config', 'get', 'agent_name'], env)).stdout.trim(), 'from-env');
+    assert.match((await runCli(home, ['config', 'show'], env)).stdout, /agent_name:\s+from-env \[WEAVE_AGENT_NAME env var\]/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `config set` secret masking
+//
+// `config set` must mask wandb_api_key in stdout (it didn't, see #66) but
+// must still echo non-sensitive keys in full and persist the full secret.
+
+const SECRET = 'wandb_v1_SUPERSECRETvalueDoNotLeak0123456789';
+
+test('config set: masks wandb_api_key, echoes weave_project in full', async () => {
+  const { home, settingsFile } = seedConfigHome('cfgset-mask');
+  try {
+    const apiKey = await runCli(home, ['config', 'set', 'wandb_api_key', SECRET]);
+    assert.equal(apiKey.code, 0);
+    assert.equal(apiKey.stdout.includes(SECRET), false, `stdout leaked the secret:\n${apiKey.stdout}`);
+    assert.match(apiKey.stdout, /wand…/);
+    assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).wandb_api_key, SECRET);
+
+    const project = await runCli(home, ['config', 'set', 'weave_project', 'my-entity/my-project']);
+    assert.equal(project.code, 0);
+    assert.match(project.stdout, /my-entity\/my-project/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// trace base URL resolution
+//
+// The daemon exports OTLP spans to the Weave trace server, not the wandb API
+// host. SaaS `api.wandb.ai` has no OTLP route, so setting `WANDB_BASE_URL` to
+// it (the wandb SDK default) must not silently misroute traces.
+
+const SETTINGS = { weave_project: 'e/p', wandb_api_key: 'k' };
+const baseUrlFor = (env: Record<string, string>): string =>
+  resolveDaemonConfig(SETTINGS as never, env).baseUrl;
+
+test('trace base URL resolution across env combinations', () => {
+  // Unset → SaaS trace server default.
+  assert.equal(baseUrlFor({}), 'https://trace.wandb.ai');
+
+  // SaaS API host (and trailing-slash / scheme-case variants) remap to the
+  // trace server rather than the routeless api host.
+  assert.equal(baseUrlFor({ WANDB_BASE_URL: 'https://api.wandb.ai' }), 'https://trace.wandb.ai');
+  assert.equal(baseUrlFor({ WANDB_BASE_URL: 'https://api.wandb.ai/' }), 'https://trace.wandb.ai');
+  assert.equal(baseUrlFor({ WANDB_BASE_URL: 'HTTPS://API.WANDB.AI' }), 'https://trace.wandb.ai');
+
+  // Self-hosted / dedicated base URL passes through unchanged (trailing slash trimmed).
+  assert.equal(baseUrlFor({ WANDB_BASE_URL: 'https://my.wandb.io' }), 'https://my.wandb.io');
+  assert.equal(baseUrlFor({ WANDB_BASE_URL: 'https://my.wandb.io/' }), 'https://my.wandb.io');
+
+  // Explicit trace server URL wins over WANDB_BASE_URL and is not remapped.
+  assert.equal(
+    baseUrlFor({ WF_TRACE_SERVER_URL: 'https://trace.example.io/', WANDB_BASE_URL: 'https://api.wandb.ai' }),
+    'https://trace.example.io',
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// config-drift detection over the socket
+//
+// `status` asks the live daemon for the fingerprint of the config it loaded,
+// and warns when settings.json now resolves to something different. Nothing is
+// written to disk.
+//
+// Sockets live under /tmp (macOS 104-char path cap); see stale-daemon-socket.test.ts.
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -85,7 +186,6 @@ async function waitFor(predicate: () => boolean, timeoutMs = 8000): Promise<void
   throw new Error(`waitFor timeout after ${timeoutMs}ms`);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 suite('daemonConfigFingerprint', () => {
   test('is stable for identical config and changes when agent_name changes', () => {
     const base = { weaveProject: 'e/p', apiKey: 'k', baseUrl: 'https://x', agentName: 'goober', debug: false };
@@ -100,7 +200,6 @@ suite('daemonConfigFingerprint', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 suite('status config-drift warning (socket query)', () => {
   test('warns when the daemon reports a different config than settings.json', async () => {
     const home = fs.mkdtempSync(path.join(scratch, 'drift-'));
@@ -142,7 +241,6 @@ suite('status config-drift warning (socket query)', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 suite('status config-drift against a real daemon', () => {
   test('no drift initially, then drift after settings.json changes', async () => {
     const home = fs.mkdtempSync(path.join(scratch, 'real-'));
