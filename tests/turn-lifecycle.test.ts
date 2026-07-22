@@ -337,3 +337,35 @@ test('restart-first Stop does not claim another transcript prompt', async (t) =>
   assert.equal(turns(spans).length, 1);
   assert.equal(chats(spans).length, 0);
 });
+
+test('SessionEnd binds a restart-first root with the same prompt_id', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-stop-same-prompt-restart';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(
+    userEntry('final prompt'),
+    assistantEntry('final-response', 'finished'),
+  );
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'Stop', session_id: sessionId, prompt_id: 'prompt-a',
+    transcript_path: transcript.file, cwd: '/x',
+  });
+  await daemon.routeEvent({
+    hook_event_name: 'SessionEnd', session_id: sessionId, prompt_id: 'prompt-a',
+    transcript_path: transcript.file, reason: 'clear',
+  });
+  await flushWeave();
+
+  const spans = exporter.getFinishedSpans();
+  const [turn] = turns(spans);
+  const chat = spans.find(span => span.attributes[ATTR.RESPONSE_ID] === 'final-response');
+  assert.ok(turn && chat);
+  assert.equal(
+    turn.attributes[ATTR.INPUT_MESSAGES],
+    JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'final prompt' }] }]),
+  );
+  assert.equal(spanParentId(chat), turn.spanContext().spanId);
+});
