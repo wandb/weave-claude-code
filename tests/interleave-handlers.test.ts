@@ -51,7 +51,7 @@ function partsOf(span: ReadableSpan): Array<Record<string, unknown>> {
   return msgs[0]?.parts ?? [];
 }
 
-test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool interleave, usage once, no double-emit', async () => {
+test('handlers: Stop emits each chat once; text + tool output parts preserve interleave', async () => {
   const exporter = await initWeaveInMemory();
   exporter.reset();
   const sid = 'sess-A';
@@ -82,8 +82,13 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
       { type: 'text', content: 'first I will edit' },
       { type: 'tool_call', toolCallId: 'tool_1', toolName: 'Edit', arguments: '{}' },
     ], 'msgA: text then tool_call, in transcript order, as output parts');
-    const aKids = childrenOf(spans, chatA).map(s => s.attributes[ATTR.OPERATION_NAME]);
-    assert.deepEqual(aKids, ['execute_tool'], 'msgA: the execute_tool span nests under the chat span');
+    assert.equal(childrenOf(spans, chatA).length, 0, 'chat span does not own tool execution');
+
+    const turn = spans.find(s => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent');
+    assert.ok(turn, 'main-agent turn exported');
+    const tool = spans.find(s => s.attributes[ATTR.TOOL_CALL_ID] === 'tool_1');
+    assert.ok(tool, 'execute_tool span exported');
+    assert.ok(childrenOf(spans, turn).includes(tool), 'main-agent tool nests directly under the turn');
 
     assert.equal(chatA.attributes[ATTR.USAGE_OUTPUT_TOKENS], 1508);
     assert.equal(chatA.attributes[ATTR.USAGE_INPUT_TOKENS], 100 + 400);
@@ -96,7 +101,7 @@ test('handlers: PreToolUse opens the chat span, Stop finalizes; text + tool inte
   }
 });
 
-test('handlers: a new response transitions and finalizes the previous chat span', async () => {
+test('handlers: Stop emits multiple tool-calling responses once under the turn', async () => {
   const exporter = await initWeaveInMemory();
   exporter.reset();
   const sid = 'sess-B';
@@ -122,16 +127,23 @@ test('handlers: a new response transitions and finalizes the previous chat span'
     await flushWeave();
 
     const spans = exporter.getFinishedSpans();
-    assert.equal(chatByResponse(spans, 'msgA').length, 1, 'msgA finalized exactly once at the transition');
-    assert.equal(chatByResponse(spans, 'msgB').length, 1, 'msgB finalized exactly once at Stop');
+    assert.equal(chatByResponse(spans, 'msgA').length, 1, 'msgA emitted exactly once');
+    assert.equal(chatByResponse(spans, 'msgB').length, 1, 'msgB emitted exactly once');
 
     for (const id of ['msgA', 'msgB']) {
       const chat = chatByResponse(spans, id)[0];
       const parts = partsOf(chat).map(p => p['type']);
       assert.deepEqual(parts, ['text', 'tool_call'], `${id}: text + tool_call output parts`);
-      const kids = childrenOf(spans, chat).map(s => s.attributes[ATTR.OPERATION_NAME]);
-      assert.deepEqual(kids, ['execute_tool'], `${id}: execute_tool nests under its chat span`);
+      assert.equal(childrenOf(spans, chat).length, 0, `${id}: chat does not own tool execution`);
     }
+
+    const turn = spans.find(s => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent');
+    assert.ok(turn, 'main-agent turn exported');
+    const toolIds = childrenOf(spans, turn)
+      .filter(s => s.attributes[ATTR.OPERATION_NAME] === 'execute_tool')
+      .map(s => s.attributes[ATTR.TOOL_CALL_ID])
+      .sort();
+    assert.deepEqual(toolIds, ['tool_A', 'tool_B'], 'both main-agent tools nest directly under the turn');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

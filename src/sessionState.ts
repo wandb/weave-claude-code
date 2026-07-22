@@ -20,11 +20,6 @@ export type PendingToolCall = {
   permissionRequested?: boolean;
 }
 
-type ActiveChat = {
-  responseKey: string;
-  llm: weave.LLM;
-}
-
 /** Emit `weave.permission_resolved` on a pending tool call's span, if one was requested. */
 export function resolvePermissionIfPending(pending: PendingToolCall, approved: boolean): void {
   if (!pending.permissionRequested) return;
@@ -125,9 +120,6 @@ export type SessionState = {
   pendingToolCalls: Map<string, PendingToolCall>;
   subagents: SubagentTracking;
 
-  activeChat?: ActiveChat;
-  emittedChatSpanResponseKeys: Set<string>;
-
   /** Compaction attrs buffered while no turn span is open. Drained on next UserPromptSubmit. */
   pendingCompaction?: CompactionAttrs;
 
@@ -225,7 +217,6 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     conversation,
     pendingToolCalls: new Map(),
     subagents: new SubagentTracking(),
-    emittedChatSpanResponseKeys: new Set(),
     systemInstructions: [],
   };
 }
