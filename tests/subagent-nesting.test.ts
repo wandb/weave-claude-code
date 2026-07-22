@@ -2,13 +2,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// The matched subagent path end-to-end: PreToolUse(Agent) opens the
-// invoke_agent marker under the turn, SubagentStart correlates the agent_id by
-// firing-prompt hash, the subagent's own tools and chat spans nest under the
-// marker (weave 0.16.3 Subagent parents children), and PostToolUse(Agent)
-// closes the marker with the tool's canonical return. Conversation id and
-// integration identity must reach every nested span through the handle chain.
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -39,8 +32,6 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
   const coordPath = path.join(dir, `${sid}.jsonl`);
   fs.writeFileSync(coordPath, userLine('kick off') + '\n');
 
-  // Subagent transcript at the derived path; line 1 is the firing prompt
-  // (byte-identical to the Agent tool's prompt) for content-based correlation.
   const subPath = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
   fs.mkdirSync(path.dirname(subPath), { recursive: true });
   fs.writeFileSync(subPath, userLine(firingPrompt) + '\n' + assistantLine('found it', { input_tokens: 120, output_tokens: 30 }) + '\n');
@@ -54,7 +45,6 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
       tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: firingPrompt, description: 'Find it' },
     });
     await d.routeEvent({ hook_event_name: 'SubagentStart', session_id: sid, agent_id: agentId, agent_type: 'Explore' });
-    // The subagent runs its own tool.
     await d.routeEvent({
       hook_event_name: 'PreToolUse', session_id: sid, agent_id: agentId, tool_use_id: 'tu-read',
       tool_name: 'Read', tool_input: { file_path: '/flaky.test.ts' },
@@ -71,7 +61,6 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
     const subInvoke = spans.find((s) => s.attributes[ATTR.OPERATION_NAME] === 'invoke_agent' && s.attributes[ATTR.AGENT_NAME] === 'Explore');
     assert.ok(subInvoke, 'subagent invoke_agent marker exported');
     assert.equal(spanParentId(subInvoke), turn.spanContext().spanId, 'marker nests under the turn');
-    assert.equal(subInvoke.attributes[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID], 'tu-agent');
     assert.equal(subInvoke.attributes[ATTR.AGENT_ID], agentId, 'agent id recorded at SubagentStart');
     assert.equal(
       subInvoke.attributes[ATTR.OUTPUT_MESSAGES],
@@ -89,7 +78,6 @@ test('matched subagent: tools and chats nest under its invoke_agent marker with 
     assert.equal(spanParentId(chat), subInvoke.spanContext().spanId, 'subagent chat nests under the marker');
     assert.equal(chat.attributes[ATTR.USAGE_INPUT_TOKENS], 120);
 
-    // Identity flows through the handle chain to every nested span.
     for (const s of [subInvoke, readTool, chat]) {
       assert.equal(s.attributes[ATTR.CONVERSATION_ID], sid, `${s.name}: conversation id`);
       assert.equal(s.attributes['weave.integration.name'], 'weave-claude-code', `${s.name}: integration name`);

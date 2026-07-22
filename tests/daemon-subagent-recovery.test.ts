@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Regression for subagent spans dropped after a daemon restart: reconstruction
-// (#92) rebuilds the session but not its subagent trackers, so handleSubagentStop
-// found no tracker and dropped the subagent's spans. These drive the real
-// routeEvent with an in-memory exporter and assert the recovered span tree.
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -28,18 +23,15 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
   const sid = 'sub-recover-001';
   const agentId = 'a1234567890abcdef';
 
-  // Main transcript: the in-progress turn the subagent ran under, already on disk.
   const mainPath = path.join(dir, `${sid}.jsonl`);
   fs.writeFileSync(mainPath, transcriptUserLine('spawn a subagent') + '\n' + transcriptAssistantLine('working', { input_tokens: 10, output_tokens: 5 }) + '\n');
 
-  // Subagent transcript where the daemon derives it (agentId-based sibling dir).
   const subPath = path.join(dir, sid, 'subagents', `agent-${agentId}.jsonl`);
   fs.mkdirSync(path.dirname(subPath), { recursive: true });
   fs.writeFileSync(subPath, transcriptUserLine('do the subtask') + '\n' + transcriptAssistantLine('subtask done', { input_tokens: 200, output_tokens: 40 }) + '\n');
 
   const d = makeGenaiDaemon();
   try {
-    // Fresh daemon that only sees the subagent's completion, not its start.
     await d.routeEvent({
       hook_event_name: 'SubagentStop',
       session_id: sid,
@@ -48,7 +40,6 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
       agent_transcript_path: subPath,
       agent_type: 'general-purpose',
     });
-    // SessionEnd closes the reconstructed turn so it exports.
     await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid });
     await flushWeave();
 
@@ -60,8 +51,6 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
     );
     assert.ok(subInvoke, `expected a recovered subagent invoke_agent span; got: ${names}`);
 
-    // The subagent's chat spans nest under its invoke_agent marker — and carry
-    // its tokens.
     const chat = spans.find(
       (s) => s.attributes['gen_ai.operation.name'] === 'chat' && s.attributes['gen_ai.agent.name'] === 'general-purpose',
     );
@@ -69,7 +58,6 @@ test('SubagentStop with no tracker (post-restart) recovers the subagent invoke_a
     assert.ok(Number(chat.attributes['gen_ai.usage.output_tokens']) > 0, 'chat span carries the subagent token usage');
     assert.equal(spanParentId(chat), subInvoke.spanContext().spanId, 'subagent chat nests under the subagent invoke_agent span');
 
-    // Recovery reconstructs the turn; the subagent nests under it.
     const turn = spans.find(
       (s) => s.attributes['gen_ai.operation.name'] === 'invoke_agent' && s.attributes['gen_ai.agent.name'] === 'claude-code',
     );
@@ -95,8 +83,6 @@ test('recovery reuses an already-open turn span instead of creating a spurious s
 
   const d = makeGenaiDaemon();
   try {
-    // UserPromptSubmit reconstructs the session and opens a turn first; recovery
-    // must nest under that existing turn, not create a second one.
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, transcript_path: mainPath, prompt: 'go' });
     await d.routeEvent({
       hook_event_name: 'SubagentStop', session_id: sid, transcript_path: mainPath,

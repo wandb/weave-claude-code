@@ -2,18 +2,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// A turn's root span (`invoke_agent`) is created at UserPromptSubmit and only
-// ended at Stop or SessionEnd. When the daemon exits for any other reason
-// (inactivity timeout, SIGTERM/SIGINT/SIGHUP, or a restart control message), its
-// already-ended children (completed tool spans, finalized chat spans, closed
-// subagent spans) have been exported, but the still-open root had not. The
-// result was a rootless trace: tool spans with no user turn to attribute them
-// to.
-//
-// The fix finalizes every live session (ending its turn root) inside the
-// shutdown drain, before the exporter is flushed. These tests drive a turn to a
-// mid-flight state, run the drain, and assert the root is exported.
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -42,7 +30,6 @@ function makeTranscript(sessionId: string): { file: string; append: (line: unkno
   return { file, dir, append: (line: unknown) => fs.appendFileSync(file, JSON.stringify(line) + '\n') };
 }
 
-/** Drive a session to a mid-turn state: turn open, one tool completed. */
 async function openTurnWithOneCompletedTool(d: Harness, sid: string, append: (l: unknown) => void, file: string) {
   append(userText('2026-01-01T00:00:00.000Z', 'do the thing'));
   await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
@@ -62,8 +49,6 @@ test('daemon shutdown mid-turn exports the turn root span (children are not left
   try {
     await openTurnWithOneCompletedTool(d, sid, append, file);
 
-    // Neither Stop nor SessionEnd fired: the daemon exits (inactivity / signal
-    // / restart). The drain must finalize the open turn before flushing.
     await d.drain('inactivity');
     await flushWeave();
 
@@ -77,7 +62,6 @@ test('daemon shutdown mid-turn exports the turn root span (children are not left
     assert.equal(root!.attributes[ATTR.CONVERSATION_ID], sid);
     assert.equal(root!.attributes[ATTR.WEAVE_ORPHAN_REASON], 'daemon_shutdown');
 
-    // The trace is well-formed: the child shares the exported root's trace id.
     assert.equal(tool!.spanContext().traceId, root!.spanContext().traceId, 'child and root share one trace');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -95,8 +79,6 @@ test('daemon shutdown ends an open subagent invoke_agent span under the same tra
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'spawn a reviewer' });
 
-    // Agent tool with subagent_type opens a nested invoke_agent span (Subagent)
-    // that a mid-flight shutdown would otherwise leave open.
     append(aLine('msgA', '2026-01-01T00:00:02.000Z', { type: 'tool_use', id: 'agent_1', name: 'Agent', input: { subagent_type: 'code-reviewer', prompt: 'review' } }, 'tool_use'));
     await d.routeEvent({ hook_event_name: 'PreToolUse', session_id: sid, tool_use_id: 'agent_1', tool_name: 'Agent', tool_input: { subagent_type: 'code-reviewer', prompt: 'review' } });
 
