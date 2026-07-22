@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Shared test helpers. The first occurrence lived inline in
-// marketplace-ref-drift.test.ts; extracted here once a second test
-// (install-source-local.test.ts) needed the same helper.
-
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import * as weave from 'weave';
 
-import { MARKETPLACE_NAME } from '../src/setup.ts';
+import { MARKETPLACE_NAME, type Settings } from '../src/setup.ts';
+import { GlobalDaemon } from '../src/daemon.ts';
+import { resolveApiKey, resolveProject } from '../src/config.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -94,14 +94,85 @@ export function writeKnownMarketplace(home: string, source: Record<string, unkno
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Daemon integration harness
-//
-// Spawns the real daemon (via tsx) in a throwaway $HOME, talks to it over its
-// UNIX socket, and reads its debug log. WANDB_BASE_URL points at a refused port
-// so the OTel exporter never reaches real wandb.ai. Used by the daemon-lifecycle
-// tests (session reconstruction, in-flight idle hold, startup race).
-// ─────────────────────────────────────────────────────────────────────────────
+let genaiExporter: InMemorySpanExporter | undefined;
+
+export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
+  if (!genaiExporter) {
+    // weave.init requires credentials even with an in-memory exporter.
+    const settings: Settings = {
+      log_file: '', daemon_socket: '', weave_project: 'e/p', wandb_api_key: 'fake-key-for-test',
+      agent_name: null, debug: false, installed_at: '', version: '0.0.0-test',
+    };
+    process.env.WANDB_API_KEY = resolveApiKey(settings).value ?? '';
+    genaiExporter = new InMemorySpanExporter();
+    await weave.init(resolveProject(settings).value ?? 'e/p', {
+      genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) },
+    });
+  }
+  return genaiExporter;
+}
+
+export type DaemonDriver = {
+  routeEvent(p: Record<string, unknown>): Promise<void>;
+  drain(reason: string): Promise<void>;
+};
+
+export function makeGenaiDaemon(agentName = 'claude-code'): DaemonDriver {
+  const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
+  const d = new GlobalDaemon('/tmp/unused.sock', logFile, {
+    weaveProject: 'e/p', apiKey: 'k', baseUrl: 'https://x', agentName, debug: false,
+  });
+  (d as unknown as { tracingEnabled: boolean }).tracingEnabled = true;
+  return d as unknown as DaemonDriver;
+}
+
+export function transcriptUserLine(text: string, opts: { version?: string; timestamp?: string } = {}): string {
+  return JSON.stringify({
+    type: 'user',
+    ...(opts.version ? { version: opts.version } : {}),
+    ...(opts.timestamp ? { timestamp: opts.timestamp } : {}),
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  });
+}
+
+export function transcriptAssistantLine(
+  text: string,
+  usage: Record<string, number>,
+  opts: { id?: string; model?: string; timestamp?: string } = {},
+): string {
+  return JSON.stringify({
+    type: 'assistant',
+    ...(opts.timestamp ? { timestamp: opts.timestamp } : {}),
+    message: {
+      role: 'assistant',
+      id: opts.id ?? 'm1',
+      model: opts.model ?? 'claude-opus-4-8',
+      usage,
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text }],
+    },
+  });
+}
+
+export function flushWeave(): Promise<void> {
+  return weave.flushOTel();
+}
+
+/** Support both current and older OTel parent-span fields. */
+export function spanParentId(s: ReadableSpan): string | undefined {
+  return (s as unknown as { parentSpanId?: string }).parentSpanId ?? s.parentSpanContext?.spanId;
+}
+
+export function childrenOf(spans: ReadableSpan[], parent: ReadableSpan): ReadableSpan[] {
+  const parentId = parent.spanContext().spanId;
+  return spans
+    .filter(s => spanParentId(s) === parentId)
+    .sort((a, b) => hrToNs(a.startTime) - hrToNs(b.startTime));
+}
+
+function hrToNs(t: [number, number]): number {
+  return t[0] * 1e9 + t[1];
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));

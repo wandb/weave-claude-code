@@ -17,7 +17,7 @@ import {
   trace,
 } from '@opentelemetry/api';
 import type { ReadableSpan, Span as SdkSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
-import type { MessagePart, Usage } from 'weave';
+import type { MessagePart, Tool, Turn, Usage } from 'weave';
 import { extractAssistantTextBlocks } from './parser.js';
 import type { AssistantCallDetail } from './parser.js';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
@@ -61,8 +61,6 @@ export const ATTR = {
   WEAVE_CWD: 'weave.claude_code.cwd',
   WEAVE_SOURCE: 'weave.claude_code.source',
   WEAVE_PLUGIN_VERSION: 'weave.claude_code.plugin.version',
-  WEAVE_TURN_NUMBER: 'weave.claude_code.turn.number',
-  WEAVE_TURN_TOOL_COUNT: 'weave.claude_code.turn.tool_count',
   WEAVE_ORPHAN_REASON: 'weave.claude_code.orphan_reason',
   WEAVE_DISPLAY_NAME: 'weave.claude_code.display_name',
 
@@ -102,11 +100,11 @@ export const ATTR = {
  *  `agent_name` / `WEAVE_AGENT_NAME`. */
 export const DEFAULT_AGENT_NAME = 'claude-code';
 
-export const INTEGRATION_NAME = 'weave-claude-code';
+const INTEGRATION_NAME = 'weave-claude-code';
 
 /** Free-form integration metadata prefix: new fields (e.g.
  *  `claude_code_app_version`) need no new attribute constant. */
-export const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
+const WEAVE_INTEGRATION_META_PREFIX = 'weave.integration.meta.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -214,28 +212,18 @@ export function buildUsage(usage: UsageSummary, reasoningTokens?: number): Usage
 // Span events
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface PermissionRequestEventArgs {
-  suggestions?: unknown;
-  timestamp: Date;
-}
-
 /** Added at PermissionRequest time. */
-export function addPermissionRequestEvent(toolSpan: Span, args: PermissionRequestEventArgs): void {
+export function addPermissionRequestEvent(tool: Tool, args: { suggestions?: unknown; timestamp: Date }): void {
   const attrs: Attributes = {};
   if (args.suggestions !== undefined) {
     attrs[ATTR.EVT_PERMISSION_SUGGESTIONS] = jsonStr(args.suggestions);
   }
-  toolSpan.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
-}
-
-export interface PermissionResolvedEventArgs {
-  approved: boolean;
-  timestamp: Date;
+  tool.addEvent(ATTR.EVT_PERMISSION_REQUEST, attrs, args.timestamp);
 }
 
 /** Added at PostToolUse[Failure] with the request outcome. */
-export function addPermissionResolvedEvent(toolSpan: Span, args: PermissionResolvedEventArgs): void {
-  toolSpan.addEvent(
+export function addPermissionResolvedEvent(tool: Tool, args: { approved: boolean; timestamp: Date }): void {
+  tool.addEvent(
     ATTR.EVT_PERMISSION_RESOLVED,
     { [ATTR.EVT_PERMISSION_APPROVED]: args.approved },
     args.timestamp,
@@ -250,10 +238,12 @@ export interface CompactionAttrs {
 
 /** Set `weave.compaction.*` on a turn (backend renders a context_compacted card).
  *  Session-level, but with no session span it rides the open (or next) turn. */
-export function setCompactionAttrs(turnSpan: Span, attrs: CompactionAttrs): void {
-  if (attrs.summary !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_SUMMARY, attrs.summary);
-  if (attrs.itemsBefore !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_BEFORE, attrs.itemsBefore);
-  if (attrs.itemsAfter !== undefined) turnSpan.setAttribute(ATTR.COMPACTION_ITEMS_AFTER, attrs.itemsAfter);
+export function setCompactionAttrs(turn: Turn, attrs: CompactionAttrs): void {
+  const out: Attributes = {};
+  if (attrs.summary !== undefined) out[ATTR.COMPACTION_SUMMARY] = attrs.summary;
+  if (attrs.itemsBefore !== undefined) out[ATTR.COMPACTION_ITEMS_BEFORE] = attrs.itemsBefore;
+  if (attrs.itemsAfter !== undefined) out[ATTR.COMPACTION_ITEMS_AFTER] = attrs.itemsAfter;
+  if (Object.keys(out).length) turn.setAttributes(out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,11 +280,6 @@ export function toolDisplayName(toolName: string, input: Record<string, unknown>
     }
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LEGACY: baggage plumbing and hand-rolled span builders, still used by
-// daemon.ts; deleted once the SDK swap (next PRs in this stack) lands.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /** Common prefix for all integration-identity attributes. The span processor
  *  copies baggage entries under this prefix onto each span. */
@@ -389,7 +374,6 @@ type TurnSpanArgs = {
    *  resume share `gen_ai.conversation.id`). For fresh sessions, equals
    *  `sessionId`. */
   conversationId: string;
-  turnNumber: number;
   prompt: string;
   cwd: string;
   source: string;
@@ -422,7 +406,6 @@ export function startTurnSpan(tracer: Tracer, args: TurnSpanArgs): Span {
     [ATTR.WEAVE_CWD]: args.cwd,
     [ATTR.WEAVE_SOURCE]: args.source,
     [ATTR.WEAVE_PLUGIN_VERSION]: args.pluginVersion,
-    [ATTR.WEAVE_TURN_NUMBER]: args.turnNumber,
     [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: args.prompt }]),
   };
   if (args.requestModel) attrs[ATTR.REQUEST_MODEL] = args.requestModel;
