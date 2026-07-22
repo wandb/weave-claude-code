@@ -43,6 +43,7 @@ import type { DaemonConfig } from './config.js';
 import {
   chatMessageKey,
   callsForResponseKey,
+  parseIsoOrNow,
   openChatForGroup,
   recordChat,
 } from './chatSpans.js';
@@ -50,6 +51,7 @@ import {
   resolvePermissionIfPending,
   hashPrompt,
   computeSubagentTranscriptPath,
+  subagentsDirFor,
   extractUserMessageContent,
   lastAssistantTextEndsWith,
   readSubagentFirstLineWithRetry,
@@ -80,6 +82,22 @@ type ControlMessage = {
 type HookPayload = Record<string, unknown>;
 
 type ToolParent = weave.Turn | weave.SubAgent;
+
+type TeamMember = {
+  toolUseId: string;
+  call: PendingSubagentCall;
+  conversation: weave.Conversation;
+  coordinatorTranscriptPath: string;
+  ownerSessionId: string;
+};
+
+type IdleSubagent = {
+  sessionId: string;
+  subAgent: weave.SubAgent;
+  conversation: weave.Conversation;
+  subagentType: string;
+  transcriptPath: string;
+};
 
 function isControlMessage(payload: unknown): payload is ControlMessage {
   if (typeof payload !== 'object' || payload === null) return false;
@@ -122,6 +140,12 @@ export class GlobalDaemon {
    *  session at SessionStart / reconstruction and cleared (also on SessionEnd). */
   private pendingInstructions = new Map<string, LoadedInstruction[]>();
   private tracingEnabled = false;
+  /** Cross-session team members awaiting TeammateIdle, queued by team + name. */
+  private teamMembers = new Map<string, TeamMember[]>();
+  /** Agent calls whose span completion belongs to TeammateIdle, not PostToolUse. */
+  private teamDispatches = new Set<PendingSubagentCall>();
+  /** Unmatched per-session teammates awaiting TeammateIdle. */
+  private idleSubagents = new Map<string, IdleSubagent>();
 
   constructor(
     private readonly socketPath: string,
@@ -658,12 +682,32 @@ export class GlobalDaemon {
       if (prompt) {
         subAgent.setAttributes({ [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) });
       }
-      session.pendingCalls.set(toolUseId, {
+      const call: PendingSubagentCall = {
         kind: 'subagent',
         subagentType,
         subAgent,
         promptHash: hashPrompt(prompt),
-      });
+      };
+      session.pendingCalls.set(toolUseId, call);
+
+      const teamName = typeof toolInput['team_name'] === 'string' ? toolInput['team_name'] : undefined;
+      const memberName = typeof toolInput['name'] === 'string' && toolInput['name']
+        ? toolInput['name']
+        : subagentType;
+      if (teamName && session.conversation) {
+        const key = `${teamName}::${memberName}`;
+        const queue = this.teamMembers.get(key) ?? [];
+        queue.push({
+          toolUseId,
+          call,
+          conversation: session.conversation,
+          coordinatorTranscriptPath: session.transcript.resolvedPath,
+          ownerSessionId: sessionId,
+        });
+        this.teamMembers.set(key, queue);
+        this.teamDispatches.add(call);
+        this.log('INFO', `Team member registered: ${key} (cross-session nesting, queue depth ${queue.length})`);
+      }
       return;
     }
 
@@ -741,8 +785,12 @@ export class GlobalDaemon {
     if (!call) return;
 
     if (call.kind === 'subagent') {
-      this.closeSubagent(call.subAgent, output, failure);
-      if (call.agentId) session.activeSubagents.delete(call.agentId);
+      // Team dispatches are complete only when TeammateIdle supplies the
+      // teammate transcript. PostToolUse merely acknowledges the dispatch.
+      if (!this.teamDispatches.has(call)) {
+        this.closeSubagent(call.subAgent, output, failure);
+        if (call.agentId) session.activeSubagents.delete(call.agentId);
+      }
     } else {
       resolvePermissionIfPending(call, !failure);
       call.tool.result = failure ? String(output) : jsonStr(output);
@@ -801,9 +849,29 @@ export class GlobalDaemon {
     const subagentPath = computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
     const firstLine = await readSubagentFirstLineWithRetry(subagentPath);
     const firingPrompt = extractUserMessageContent(firstLine);
-    const { call } = this.matchPendingSubagent(session, agentType, firingPrompt);
+    const { call, candidateCount } = this.matchPendingSubagent(session, agentType, firingPrompt);
     if (!call) {
       const reason = firingPrompt === undefined ? 'transcript unavailable' : 'dispatch correlation ambiguous';
+      // A start with no plausible dispatch is the per-session teammate shape:
+      // keep one marker open until TeammateIdle emits its full transcript. Do
+      // not do this for ambiguous live dispatches, which would duplicate them.
+      if (candidateCount === 0 && session.currentTurn && session.conversation) {
+        const subAgent = session.currentTurn.startSubagent({ name: agentType, agentVersion: VERSION, startTime: new Date() });
+        subAgent.setAttributes({
+          [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${agentType}`,
+          [ATTR.WEAVE_ORPHAN_REASON]: 'awaiting TeammateIdle without Agent dispatch',
+        });
+        subAgent.record({ agentId });
+        this.idleSubagents.set(`${sessionId}::${agentId}`, {
+          sessionId,
+          subAgent,
+          conversation: session.conversation,
+          subagentType: agentType,
+          transcriptPath: subagentPath,
+        });
+        this.log('INFO', `Subagent started: agentId=${agentId} type=${agentType} awaiting TeammateIdle`);
+        return;
+      }
       this.log('ERROR', `SubagentStart: ${reason}; leaving agentId=${agentId} type=${agentType} unbound`);
       return;
     }
@@ -841,6 +909,13 @@ export class GlobalDaemon {
     const agentType = input.agent_type;
     const agentTranscriptPath = input.agent_transcript_path
       ?? computeSubagentTranscriptPath(session.transcript.resolvedPath, agentId);
+    const idle = this.idleSubagents.get(`${sessionId}::${agentId}`);
+    if (idle) {
+      idle.transcriptPath = agentTranscriptPath;
+      this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${idle.subagentType} awaiting TeammateIdle`);
+      return;
+    }
+
     let tracked = session.activeSubagents.get(agentId);
     let candidateCount = 0;
     if (!tracked) {
@@ -853,6 +928,12 @@ export class GlobalDaemon {
         tracked.subAgent.record({ agentId });
         this.log('INFO', `SubagentStop: late-matched agentId=${agentId} type=${agentType}`);
       }
+    }
+
+    if (tracked && this.teamDispatches.has(tracked)) {
+      session.activeSubagents.delete(agentId);
+      this.log('DEBUG', `Subagent stopped: agentId=${agentId} type=${agentType} awaiting TeammateIdle`);
+      return;
     }
 
     // With no plausible live dispatch, this is restart recovery. If multiple
@@ -894,7 +975,131 @@ export class GlobalDaemon {
 
   private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
     if (!this.tracingEnabled) return;
-    this.log('DEBUG', `TeammateIdle (not yet traced): session=${sessionId} teammate=${input.teammate_name}`);
+    const session = this.sessions.get(sessionId);
+    const agentType = input.teammate_name;
+    const teamName = input.team_name;
+    const key = `${teamName}::${agentType}`;
+    const queue = this.teamMembers.get(key);
+
+    // Agent teams run the teammate in a different session. The coordinator's
+    // Agent dispatch registered this FIFO entry before that session existed.
+    if (queue?.length) {
+      const member = queue.shift()!;
+      if (!queue.length) this.teamMembers.delete(key);
+
+      const idleTranscript = session?.transcript.resolvedPath ?? input.transcript_path;
+      const teammateTranscriptPath = this.resolveTeammateTranscript(
+        member.coordinatorTranscriptPath,
+        agentType,
+        idleTranscript,
+      );
+      this.emitTeammateTurnTrace(member.call.subAgent, member.conversation, agentType, teammateTranscriptPath);
+      this.teamDispatches.delete(member.call);
+      const owner = this.sessions.get(member.ownerSessionId);
+      owner?.pendingCalls.delete(member.toolUseId);
+      if (member.call.agentId) owner?.activeSubagents.delete(member.call.agentId);
+      this.log('INFO', `TeammateIdle: traced ${agentType} team=${teamName} (cross-session) transcript=${teammateTranscriptPath ?? '(none)'} (queue depth now ${queue.length})`);
+      return;
+    }
+
+    if (this.teamMembers.size > 0) {
+      this.log('INFO', `TeammateIdle: no team entry for ${key} (registered: ${[...this.teamMembers.keys()].join(', ')}) — check teammate_name === Agent.name`);
+    }
+
+    // A same-session teammate has no Agent dispatch to bridge from. Consume the
+    // oldest unmatched marker of this type that SubagentStart left behind.
+    const idleEntry = [...this.idleSubagents].find(([, candidate]) =>
+      candidate.sessionId === sessionId && candidate.subagentType === agentType,
+    );
+    if (!idleEntry) {
+      this.log('DEBUG', `TeammateIdle: no pending tracker for ${agentType} team=${teamName} — skipping`);
+      return;
+    }
+
+    const [idleKey, candidate] = idleEntry;
+    const model = this.emitTeammateTurnTrace(
+      candidate.subAgent,
+      candidate.conversation,
+      agentType,
+      candidate.transcriptPath,
+    );
+    this.idleSubagents.delete(idleKey);
+    this.log('INFO', `TeammateIdle: traced ${agentType} model=${model ?? 'unknown'} path=${candidate.transcriptPath}`);
+  }
+
+  /** Find the teammate transcript paired with its coordinator-side Agent call. */
+  private resolveTeammateTranscript(
+    coordinatorTranscriptPath: string,
+    teammateName: string,
+    idleTranscriptPath: string | undefined,
+  ): string | undefined {
+    try {
+      const subagentsDir = subagentsDirFor(coordinatorTranscriptPath);
+      if (fs.existsSync(subagentsDir)) {
+        let best: { path: string; mtime: number } | undefined;
+        for (const meta of fs.readdirSync(subagentsDir).filter(f => f.endsWith('.meta.json'))) {
+          try {
+            const info = JSON.parse(fs.readFileSync(path.join(subagentsDir, meta), 'utf8')) as { agentType?: string };
+            if (info.agentType !== teammateName) continue;
+            const transcriptPath = path.join(subagentsDir, meta.replace(/\.meta\.json$/, '.jsonl'));
+            if (!fs.existsSync(transcriptPath)) continue;
+            const mtime = fs.statSync(transcriptPath).mtimeMs;
+            if (!best || mtime > best.mtime) best = { path: transcriptPath, mtime };
+          } catch { /* skip malformed metadata */ }
+        }
+        if (best) return best.path;
+      }
+    } catch (err) {
+      this.log('DEBUG', `resolveTeammateTranscript(${teammateName}): ${err}`);
+    }
+    return idleTranscriptPath;
+  }
+
+  /** Emit all teammate turns in a fresh trace, then close its dispatch marker. */
+  private emitTeammateTurnTrace(
+    subAgent: weave.SubAgent,
+    conversation: weave.Conversation,
+    agentType: string,
+    transcriptPath: string | undefined,
+  ): string | undefined {
+    let model: string | undefined;
+    let lastAssistantText: string | undefined;
+    let transcript: TranscriptFile | undefined;
+    try {
+      if (!transcriptPath) throw new Error('no teammate transcript path');
+      transcript = new TranscriptFile(transcriptPath);
+      const parsed = parseSessionFd(transcript.getFd());
+      if (parsed?.turns.length) {
+        const calls = parsed.turns.flatMap(turn => turn.assistantCalls());
+        const first = calls[0];
+        const turn = conversation.startTurn({
+          agentName: agentType,
+          agentVersion: VERSION,
+          startTime: parseIsoOrNow(first?.prevTimestamp ?? first?.timestamp),
+        });
+        turn.setAttributes({ [ATTR.WEAVE_DISPLAY_NAME]: `Teammate: ${agentType}` });
+        try {
+          for (const parsedTurn of parsed.turns) {
+            this.emitChatSpans(turn, parsedTurn.assistantCalls(), agentType);
+          }
+        } finally {
+          turn.end({ endTime: parseIsoOrNow(calls.at(-1)?.timestamp) });
+        }
+        const lastTurn = parsed.turns.at(-1);
+        model = lastTurn?.primaryModel();
+        lastAssistantText = lastTurn?.textBlocks().join('\n');
+      }
+    } catch (err) {
+      this.log('DEBUG', `emitTeammateTurnTrace: could not parse ${transcriptPath}: ${err}`);
+    } finally {
+      transcript?.close();
+    }
+    if (model) subAgent.setAttributes({ [ATTR.RESPONSE_MODEL]: model });
+    if (lastAssistantText) {
+      subAgent.setAttributes({ [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages([lastAssistantText]) });
+    }
+    subAgent.end();
+    return model;
   }
 
   private emitChatSpans(
@@ -996,6 +1201,7 @@ export class GlobalDaemon {
     );
 
     this.finalizeOpenTurn(session, 'session_ended');
+    this.finalizeIdleSubagents(sessionId, 'session_ended');
 
     this.log('INFO', `Finished session ${sessionId}`);
 
@@ -1006,6 +1212,10 @@ export class GlobalDaemon {
 
   private finalizeOpenTurn(session: SessionState, orphanReason: string): void {
     for (const [toolUseId, call] of session.pendingCalls) {
+      if (call.kind === 'subagent' && this.teamDispatches.has(call)) {
+        this.log('DEBUG', `Deferred team call to TeammateIdle: ${toolUseId}`);
+        continue;
+      }
       const span = call.kind === 'tool' ? call.tool : call.subAgent;
       if (call.kind === 'tool') resolvePermissionIfPending(call, false);
       span.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
@@ -1034,6 +1244,10 @@ export class GlobalDaemon {
   private checkInactivity(): void {
     const idle = Date.now() - this.lastActivity;
     if (idle <= this.inactivityMs) return;
+    if (idle < INFLIGHT_HOLD_MAX_MS && (this.teamMembers.size > 0 || this.idleSubagents.size > 0)) {
+      this.log('DEBUG', 'Inactivity timeout reached but team correlation in flight — staying up');
+      return;
+    }
     if (idle < INFLIGHT_HOLD_MAX_MS && this.hasInFlightWork()) {
       this.log('DEBUG', 'Inactivity timeout reached but work in flight — staying up');
       return;
@@ -1063,13 +1277,22 @@ export class GlobalDaemon {
   private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
     this.server?.close();
+    for (const queue of this.teamMembers.values()) {
+      for (const member of queue) {
+        member.call.subAgent.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: 'daemon_shutdown' });
+        member.call.subAgent.end({ error: new Error('teammate did not complete before shutdown') });
+      }
+    }
+    this.teamMembers.clear();
     for (const session of this.sessions.values()) {
       try {
         this.finalizeOpenTurn(session, 'daemon_shutdown');
+        this.finalizeIdleSubagents(session.sessionId, 'daemon_shutdown');
       } catch (err) {
         this.log('ERROR', `Error finalizing session ${session.sessionId} at shutdown: ${err}`);
       }
     }
+    this.teamDispatches.clear();
     if (this.tracingEnabled) {
       try {
         await weave.flushOTel();
@@ -1082,6 +1305,15 @@ export class GlobalDaemon {
     }
     if (fs.existsSync(this.socketPath)) {
       fs.unlinkSync(this.socketPath);
+    }
+  }
+
+  private finalizeIdleSubagents(sessionId: string, orphanReason: string): void {
+    for (const [key, idle] of this.idleSubagents) {
+      if (idle.sessionId !== sessionId) continue;
+      idle.subAgent.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: orphanReason });
+      idle.subAgent.end({ error: new Error(`teammate did not complete (${orphanReason})`) });
+      this.idleSubagents.delete(key);
     }
   }
 
