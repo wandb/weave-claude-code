@@ -71,6 +71,7 @@ test('subagent topology: marker owns its chat, tools, identity, and canonical re
   assert.equal(spanParentId(chat), agent.spanContext().spanId);
   assert.equal(spanParentId(tool), agent.spanContext().spanId);
   assert.equal(agent.attributes[ATTR.AGENT_ID], agentId);
+  assert.equal(agent.attributes[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID], 'agent-call');
   assert.equal(agent.attributes[ATTR.OUTPUT_MESSAGES], JSON.stringify([
     { role: 'assistant', content: 'canonical result' },
   ]));
@@ -150,7 +151,60 @@ test('Agent Post before SubagentStop does not create a recovered duplicate', asy
   );
 });
 
-test('exact prompt selects the right call among same-type Agent dispatches', async (t) => {
+test('a recovered Agent consumes only its first matching post-first result', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sid = 'sub-two-post-first';
+  const agentId = 'recovered-first-agent';
+  const transcript = makeTranscript(t, sid, sid);
+  transcript.append(userEntry('dispatch twice'));
+  const subPath = transcript.subagent(
+    agentId,
+    userEntry('same task'),
+    assistantEntry('recovered-first-msg', { type: 'text', text: 'first done' }),
+  );
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: transcript.file, source: 'startup', cwd: '/x' });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'dispatch twice' });
+  await daemon.routeEvent({
+    hook_event_name: 'SubagentStart', session_id: sid,
+    agent_id: agentId, agent_type: 'Explore',
+  });
+  for (const [toolUseId, toolResponse] of [['first-result', 'first result'], ['second-result', 'second result']]) {
+    await daemon.routeEvent({
+      hook_event_name: 'PostToolUse', session_id: sid,
+      tool_use_id: toolUseId, tool_name: 'Agent',
+      tool_input: { subagent_type: 'Explore', prompt: 'same task' },
+      tool_response: toolResponse,
+    });
+  }
+  await daemon.routeEvent({
+    hook_event_name: 'SubagentStop', session_id: sid,
+    agent_id: agentId, agent_type: 'Explore', agent_transcript_path: subPath,
+  });
+  await finish(daemon, sid);
+
+  const spans = exporter.getFinishedSpans();
+  const agents = spans.filter(span => span.attributes[ATTR.OPERATION_NAME] === 'invoke_agent'
+    && span.attributes[ATTR.AGENT_NAME] === 'Explore');
+  const recovered = agents.find(span => span.attributes[ATTR.AGENT_ID] === agentId);
+  const later = agents.find(span => span !== recovered);
+  assert.equal(agents.length, 2);
+  assert.ok(recovered && later);
+  assert.equal(recovered.attributes[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID], 'first-result');
+  assert.equal(later.attributes[ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID], 'second-result');
+  assert.equal(
+    recovered.attributes[ATTR.OUTPUT_MESSAGES],
+    JSON.stringify([{ role: 'assistant', content: 'first result' }]),
+  );
+  assert.equal(
+    later.attributes[ATTR.OUTPUT_MESSAGES],
+    JSON.stringify([{ role: 'assistant', content: 'second result' }]),
+  );
+});
+
+test('exact prompt beyond the first 64 KiB selects the right Agent dispatch', async (t) => {
   const exporter = await initWeaveInMemory();
   exporter.reset();
   const sid = 'sub-exact-prompt';
@@ -161,7 +215,10 @@ test('exact prompt selects the right call among same-type Agent dispatches', asy
     agentId,
     {
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: '<system-reminder>context</system-reminder>' }] },
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: `<system-reminder>${'x'.repeat(70 * 1024)}</system-reminder>` }],
+      },
     },
     userEntry('second task'),
     assistantEntry('exact-msg', { type: 'text', text: 'second done' }),

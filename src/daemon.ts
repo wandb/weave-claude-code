@@ -59,6 +59,7 @@ import {
   openCalls,
   recordAgentStop,
   recoverAgentCall,
+  responseKeysForAgent,
   settleCall,
   settleRecoveredAgent,
 } from './callSpans.js';
@@ -962,8 +963,8 @@ export class GlobalDaemon {
       return;
     }
 
-    const seen = session.seenAgentResponses.get(input.agent_id) ?? new Set<string>();
-    session.seenAgentResponses.set(input.agent_id, seen);
+    const lifecycle = match.kind === 'found' ? match.call : recovered;
+    const seen = responseKeysForAgent(session.calls, input.agent_id, lifecycle);
     const transcript = this.emitSubagentTranscript(
       parent,
       transcriptPath,

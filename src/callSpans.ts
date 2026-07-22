@@ -42,6 +42,8 @@ export type AgentCall = CallScope & {
   prompt: string;
   agentId?: string;
   phase: AgentPhase;
+  /** Chat responses already emitted from this Agent's Stop snapshots. */
+  seenResponses: Set<string>;
 };
 
 type OpenCall = ToolCall | AgentCall;
@@ -54,6 +56,8 @@ export type CallState = {
    * reconstructed session state remains live. */
   toolUseTombstones: Set<string>;
   agentTombstones: Set<string>;
+  /** Dedupe state for Stop snapshots whose Agent call is still ambiguous. */
+  uncorrelatedAgentResponses: Map<string, Set<string>>;
 };
 
 export function newCallState(): CallState {
@@ -62,6 +66,7 @@ export function newCallState(): CallState {
     byAgentId: new Map(),
     toolUseTombstones: new Set(),
     agentTombstones: new Set(),
+    uncorrelatedAgentResponses: new Map(),
   };
 }
 
@@ -90,14 +95,17 @@ export function beginCall(
   let call: OpenCall;
   if (args.toolName === 'Agent' && typeof agentType === 'string') {
     const prompt = typeof args.toolInput['prompt'] === 'string' ? args.toolInput['prompt'] : '';
+    const span = startAgentSpan(parent, agentType, prompt);
+    span.setAttributes({ [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: args.toolUseId });
     call = {
       kind: 'agent',
-      span: startAgentSpan(parent, agentType, prompt),
+      span,
       toolUseId: args.toolUseId,
       agentType,
       prompt,
       promptId: args.promptId,
       phase: { kind: 'running' },
+      seenResponses: new Set(),
     };
   } else {
     const span = parent.startTool({
@@ -151,6 +159,7 @@ export function recoverAgentCall(
     promptId: args.promptId,
     agentId: args.agentId,
     phase: args.event === 'SubagentStop' ? { kind: 'awaiting-post' } : { kind: 'running' },
+    seenResponses: new Set(),
   };
   state.byAgentId.set(args.agentId, call);
   return call;
@@ -190,14 +199,36 @@ export function settleRecoveredAgent(
 
   const [call] = matches;
   backfillAgentPrompt(call, args.prompt);
-  state.toolUseTombstones.add(args.toolUseId);
+  call.toolUseId = args.toolUseId;
+  call.span.setAttributes({ [ATTR.WEAVE_SUBAGENT_SPAWNING_TOOL_CALL_ID]: args.toolUseId });
+  state.byToolUseId.set(args.toolUseId, call);
   if (call.phase.kind === 'running') {
     call.phase = { kind: 'awaiting-stop', outcome };
   } else if (call.phase.kind === 'awaiting-post') {
     finishAgentSpan(call.span, outcome);
-    completeAgent(state, call);
+    completeCall(state, args.toolUseId, call);
   }
   return 'settled';
+}
+
+/** Prefer lifecycle-owned response dedupe, retaining a fallback only while
+ * correlation is ambiguous. */
+export function responseKeysForAgent(
+  state: CallState,
+  agentId: string,
+  call?: AgentCall,
+): Set<string> {
+  const uncorrelated = state.uncorrelatedAgentResponses.get(agentId);
+  if (!call) {
+    const seen = uncorrelated ?? new Set<string>();
+    state.uncorrelatedAgentResponses.set(agentId, seen);
+    return seen;
+  }
+  if (uncorrelated) {
+    for (const key of uncorrelated) call.seenResponses.add(key);
+    state.uncorrelatedAgentResponses.delete(agentId);
+  }
+  return call.seenResponses;
 }
 
 /** Apply the exact tool_use_id terminal event once. */

@@ -8,6 +8,10 @@ import * as path from 'path';
 import { isPathWithinBase } from './utils.js';
 
 const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+// Injected subagent context can make the first JSONL record much larger than a
+// normal prompt. Eight MiB comfortably covers that preamble while bounding the
+// synchronous work and memory used to correlate an id-less lifecycle hook.
+const TRANSCRIPT_SCAN_LIMIT_BYTES = 8 * 1024 * 1024;
 
 /**
  * Represents a Claude Code transcript file.
@@ -63,13 +67,15 @@ export class TranscriptFile {
   }
 }
 
-/** Read a bounded, validated transcript prefix without leaving an fd open. */
+/** Read a bounded transcript snapshot without leaving an fd open.
+ * If the bound cuts a record, exclude that partial JSONL line. */
 function readTranscriptPrefix(transcriptPath: string): string | undefined {
   let transcript: TranscriptFile | undefined;
   try {
     transcript = new TranscriptFile(transcriptPath);
     const fd = transcript.getFd();
-    const want = Math.min(fs.fstatSync(fd).size, 64 * 1024);
+    const fileSize = fs.fstatSync(fd).size;
+    const want = Math.min(fileSize, TRANSCRIPT_SCAN_LIMIT_BYTES);
     if (want === 0) return undefined;
     const buffer = Buffer.allocUnsafe(want);
     let read = 0;
@@ -77,6 +83,10 @@ function readTranscriptPrefix(transcriptPath: string): string | undefined {
       const count = fs.readSync(fd, buffer, read, want - read, read);
       if (count === 0) break;
       read += count;
+    }
+    if (read < fileSize) {
+      const lastNewline = read ? buffer.lastIndexOf(0x0a, read - 1) : -1;
+      read = lastNewline + 1;
     }
     return read ? buffer.toString('utf8', 0, read) : undefined;
   } catch {
@@ -114,7 +124,7 @@ export async function readSubagentPrompt(transcriptPath: string): Promise<string
 }
 
 /** Injected context uses array content; the dispatch prompt is the first
- * bare-string user message in the bounded prefix. */
+ * bare-string user message in the bounded scan. */
 function readTypedUserPrompt(transcriptPath: string): string | undefined {
   const prefix = readTranscriptPrefix(transcriptPath);
   if (!prefix) return undefined;
