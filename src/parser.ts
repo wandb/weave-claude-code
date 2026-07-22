@@ -12,23 +12,22 @@ export interface UsageSummary {
 }
 
 /**
- * Per-API-call detail for a single assistant message in the transcript.
- * Each entry corresponds to one LLM invocation within a turn, used to emit
- * one `chat <model>` span per call at Stop time.
+ * One assistant API response within a turn. Claude Code splits a response's
+ * thinking / text / tool_use blocks across transcript lines sharing a
+ * `message.id`; `buildTurn` folds those back into a single entry.
  */
 export interface AssistantCallDetail {
-  timestamp: string;            // ISO timestamp of the assistant message
-  prevTimestamp?: string;       // ISO timestamp of preceding transcript line (proxy for "request started")
+  timestamp: string;            // ISO timestamp of the response's last transcript line
+  prevTimestamp?: string;       // ISO timestamp of the line preceding it (proxy for "request started")
   model?: string;
-  usage: UsageSummary;          // per-call usage
+  usage: UsageSummary;
   reasoningTokens?: number;     // reasoning/thinking tokens, if any
-  contentBlocks: unknown[];     // raw assistant content blocks (text, tool_use, thinking, ...)
+  contentBlocks: unknown[];     // raw content blocks in transcript order (text, tool_use, thinking, ...)
   responseId?: string;          // provider message id
   finishReason?: string;        // stop_reason / finish_reason if present
 }
 
 export interface Turn {
-  totalUsage(): UsageSummary;
   primaryModel(): string | undefined;
   textBlocks(): string[];
   assistantCalls(): AssistantCallDetail[];
@@ -38,21 +37,12 @@ export interface ParsedSession {
   turns: Turn[];
 }
 
-export function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
+function rawToUsageSummary(raw: Record<string, number>): UsageSummary {
   return {
     input_tokens: raw['input_tokens'] ?? 0,
     output_tokens: raw['output_tokens'] ?? 0,
     cache_read_input_tokens: raw['cache_read_input_tokens'],
     cache_creation_input_tokens: raw['cache_creation_input_tokens'],
-  };
-}
-
-export function addUsage(a: UsageSummary, b: UsageSummary): UsageSummary {
-  return {
-    input_tokens: a.input_tokens + b.input_tokens,
-    output_tokens: a.output_tokens + b.output_tokens,
-    cache_read_input_tokens: (a.cache_read_input_tokens ?? 0) + (b.cache_read_input_tokens ?? 0),
-    cache_creation_input_tokens: (a.cache_creation_input_tokens ?? 0) + (b.cache_creation_input_tokens ?? 0),
   };
 }
 
@@ -107,20 +97,19 @@ function buildSession(lines: unknown[]): ParsedSession {
   let prevTimestamp: string | undefined;
 
   for (const line of lines) {
-    const entry = line as Record<string, unknown>;
-    const message = entry['message'] as Record<string, unknown> | undefined;
-    const type = entry['type'] as string | undefined;
-    const role = (message?.['role'] as string | undefined) ?? type;
-    const timestamp = entry['timestamp'] as string | undefined;
+    const { message, type, role: rawRole, timestamp } = readTranscriptLine(line);
+    const role = rawRole ?? type;
 
     if (role === 'assistant') {
-      currentAssistantLines.push({ line: entry, prevTimestamp });
+      // `role === 'assistant'` implies the line is an object (it carried either
+      // a `message.role` or a top-level `type`), so the {} fallback is unreachable.
+      currentAssistantLines.push({ line: isObject(line) ? line : {}, prevTimestamp });
     } else if (role === 'user') {
       const rawContent = message?.['content'];
-      const content = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
 
       // A user message with text content marks the end of the previous turn.
-      const hasText = typeof rawContent === 'string' || content.some(block => block['type'] === 'text');
+      const hasText = typeof rawContent === 'string'
+        || (Array.isArray(rawContent) ? rawContent : []).some(isTextBlock);
       if (hasText && currentAssistantLines.length > 0) {
         turns.push(buildTurn(currentAssistantLines));
         currentAssistantLines = [];
@@ -138,17 +127,16 @@ function buildSession(lines: unknown[]): ParsedSession {
 }
 
 function buildTurn(assistantLines: AssistantLine[]): Turn {
-  const calls: AssistantCallDetail[] = assistantLines.map(({ line, prevTimestamp }) => {
-    const message = line['message'] as Record<string, unknown> | undefined;
+  const calls: AssistantCallDetail[] = [];
+  for (const { line, prevTimestamp } of assistantLines) {
+    const { message } = readTranscriptLine(line);
     const rawUsage = (message?.['usage'] ?? line['usage'] ?? {}) as Record<string, number>;
     const usage = rawToUsageSummary(rawUsage);
     const reasoningTokens = typeof rawUsage['reasoning_tokens'] === 'number' ? rawUsage['reasoning_tokens'] : undefined;
     const model = (message?.['model'] ?? line['model']) as string | undefined;
     const rawContent = message?.['content'];
-    // `content` is either an array of blocks (the common assistant shape), a
-    // bare string (legacy single-text format), or missing. Fall back to [] for
-    // the missing / unknown case so downstream code sees a well-typed empty
-    // list instead of `undefined`.
+    // A bare-string `content` is the legacy single-text format; synthesize a
+    // text block so downstream sees a uniform block list (missing/other → []).
     const contentBlocks: unknown[] = Array.isArray(rawContent)
       ? (rawContent as unknown[])
       : typeof rawContent === 'string'
@@ -158,29 +146,27 @@ function buildTurn(assistantLines: AssistantLine[]): Turn {
     const stopReason = (message?.['stop_reason'] ?? message?.['finish_reason']) as string | undefined;
     const timestamp = (line['timestamp'] as string | undefined) ?? '';
 
-    return {
-      timestamp,
-      prevTimestamp,
-      model,
-      usage,
-      reasoningTokens,
-      contentBlocks,
-      responseId,
-      finishReason: stopReason,
-    };
-  });
+    // Fold split lines (shared message.id) into one call per API response.
+    // Split lines duplicate the response usage — keep the last line's, which
+    // accompanies stop_reason; keep the first line's prevTimestamp as start.
+    const prev = calls.at(-1);
+    if (responseId && prev?.responseId === responseId) {
+      prev.contentBlocks.push(...contentBlocks);
+      prev.timestamp = timestamp;
+      prev.usage = usage;
+      prev.reasoningTokens = reasoningTokens ?? prev.reasoningTokens;
+      prev.model ??= model;
+      prev.finishReason ??= stopReason;
+      continue;
+    }
+    calls.push({ timestamp, prevTimestamp, model, usage, reasoningTokens, contentBlocks, responseId, finishReason: stopReason });
+  }
 
-  const totalUsageValue = calls.reduce<UsageSummary>(
-    (acc, call) => addUsage(acc, call.usage),
-    { input_tokens: 0, output_tokens: 0 },
-  );
-
-  const model = calls.map(call => call.model).filter(Boolean).pop();
+  const model = calls.filter(call => call.model).at(-1)?.model;
 
   const texts = calls.flatMap(call => extractAssistantTextBlocks(call.contentBlocks));
 
   return {
-    totalUsage: () => totalUsageValue,
     primaryModel: () => model,
     textBlocks: () => texts,
     assistantCalls: () => calls,
@@ -198,6 +184,31 @@ type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input?: unknow
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
+}
+
+/** Structural shape of a single JSONL transcript line we care about. */
+type TranscriptLine = {
+  message?: Record<string, unknown>;
+  type?: string;
+  role?: string;
+  timestamp?: string;
+};
+
+/**
+ * Decode one raw JSONL transcript line into the fields the parser reads,
+ * narrowing each with a runtime check instead of an `as` cast. `role` is the
+ * raw `message.role` (callers fall back to `type` for lines that carry only a
+ * top-level `type`). Fields absent or of the wrong type come back undefined.
+ */
+function readTranscriptLine(line: unknown): TranscriptLine {
+  if (!isObject(line)) return {};
+  const message = isObject(line['message']) ? line['message'] : undefined;
+  return {
+    message,
+    type: typeof line['type'] === 'string' ? line['type'] : undefined,
+    role: typeof message?.['role'] === 'string' ? message['role'] : undefined,
+    timestamp: typeof line['timestamp'] === 'string' ? line['timestamp'] : undefined,
+  };
 }
 
 export function isTextBlock(block: unknown): block is TextBlock {
