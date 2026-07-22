@@ -7,6 +7,8 @@ import { VERSION } from './setup.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import { ATTR, buildIntegrationAttrs } from './genaiSpans.js';
 import type { CompactionAttrs } from './genaiSpans.js';
+import { newCallState } from './callSpans.js';
+import type { CallState } from './callSpans.js';
 
 export type TurnTrace = {
   span: weave.Turn;
@@ -35,6 +37,9 @@ export type SessionState = {
   turns: Set<TurnTrace>;
   currentTurn?: TurnTrace;
   turnsByPromptId: Map<string, TurnTrace>;
+
+  /** Open ordinary tool calls, keyed by Claude's protocol identity. */
+  calls: CallState;
 
   /** Compaction attrs buffered while no turn span is open. */
   pendingCompaction?: CompactionAttrs;
@@ -84,6 +89,7 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     conversation,
     turns: new Set(),
     turnsByPromptId: new Map(),
+    calls: newCallState(),
     systemInstructions: new Map(),
   };
 }
