@@ -449,6 +449,29 @@ export class GlobalDaemon {
 
   // ── event handlers ────────────────────────────────────────────────────────
 
+  /** Resolve the conversation id, build the SessionState, register it, and drain
+   *  buffered instructions. Shared by SessionStart and post-restart rebuild. */
+  private async buildSession(
+    sessionId: string,
+    transcript: TranscriptFile,
+    opts: { source: string; cwd: string; initialRequestModel?: string },
+  ): Promise<SessionState> {
+    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, opts.source);
+    const session = newSessionState({
+      sessionId,
+      conversationId,
+      transcript,
+      cwd: opts.cwd,
+      source: opts.source,
+      initialRequestModel: opts.initialRequestModel,
+      agentName: this.config.agentName,
+      tracingEnabled: this.tracingEnabled,
+    });
+    this.sessions.set(sessionId, session);
+    this.drainPendingInstructions(session);
+    return session;
+  }
+
   private async handleSessionStart(sessionId: string, input: SessionStartHookInput): Promise<void> {
     if (this.sessions.has(sessionId)) return; // idempotent
 
@@ -466,30 +489,17 @@ export class GlobalDaemon {
       return;
     }
 
-    const source = input.source;
-    const initialRequestModel = input.model;
-    const cwd = input.cwd;
-
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
+    const session = await this.buildSession(sessionId, transcript, {
+      source: input.source,
+      cwd: input.cwd,
+      initialRequestModel: input.model,
     });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
 
-    const resumed = conversationId !== sessionId;
-    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${conversationId})` : ''}`);
+    const resumed = session.conversationId !== sessionId;
+    this.log('INFO', `Session created: ${sessionId}${resumed ? ` (resumed; conversation=${session.conversationId})` : ''}`);
     this.log(
       'DEBUG',
-      `SessionStart details: session=${sessionId} conversation=${conversationId} source=${source} model=${initialRequestModel ?? 'unknown'} cwd=${cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
+      `SessionStart details: session=${sessionId} conversation=${session.conversationId} source=${session.source} model=${session.initialRequestModel ?? 'unknown'} cwd=${session.cwd || '(empty)'} transcript_path=${transcript.resolvedPath} transcript_file=${path.basename(transcript.resolvedPath)} active_sessions=${this.sessions.size}`,
     );
   }
 
@@ -574,23 +584,10 @@ export class GlobalDaemon {
     const source = (raw['source'] as string | undefined) ?? 'reconstructed';
     const cwd = input.cwd;
     const initialRequestModel = raw['model'] as string | undefined;
-    const conversationId = await this.resolveConversationId(sessionId, transcript.resolvedPath, source);
-
-    const session = newSessionState({
-      sessionId,
-      conversationId,
-      transcript,
-      cwd,
-      source,
-      initialRequestModel,
-      agentName: this.config.agentName,
-      tracingEnabled: this.tracingEnabled,
-    });
-    this.sessions.set(sessionId, session);
-    this.drainPendingInstructions(session);
+    const session = await this.buildSession(sessionId, transcript, { source, cwd, initialRequestModel });
     this.log(
       'INFO',
-      `Session reconstructed after restart: ${sessionId} (conversation=${conversationId})`,
+      `Session reconstructed after restart: ${sessionId} (conversation=${session.conversationId})`,
     );
     return session;
   }
