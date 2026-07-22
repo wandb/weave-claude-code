@@ -53,7 +53,7 @@ function turnSpans(spans: ReadableSpan[]): ReadableSpan[] {
   return spans.filter(span => span.attributes[ATTR.OPERATION_NAME] === 'invoke_agent');
 }
 
-test('ordinary tool calls are traced once while Agent-owned calls remain deferred', async (t) => {
+test('ordinary tool calls are traced once', async (t) => {
   const exporter = await initWeaveInMemory();
   exporter.reset();
   const sessionId = 'ordinary-tool';
@@ -78,23 +78,6 @@ test('ordinary tool calls are traced once while Agent-owned calls remain deferre
   await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...tool });
   await daemon.routeEvent({ hook_event_name: 'PostToolUse', ...tool, tool_response: 'duplicate' });
 
-  const agent = {
-    session_id: sessionId,
-    tool_use_id: 'agent-1',
-    tool_name: 'Agent',
-    tool_input: { subagent_type: 'Explore', prompt: 'inspect it' },
-  };
-  await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...agent });
-  await daemon.routeEvent({ hook_event_name: 'PostToolUse', ...agent, tool_response: 'done' });
-  const child = {
-    session_id: sessionId,
-    agent_id: 'untraced-agent',
-    tool_use_id: 'child-read',
-    tool_name: 'Read',
-    tool_input: { file_path: '/tmp/child.txt' },
-  };
-  await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...child });
-  await daemon.routeEvent({ hook_event_name: 'PostToolUse', ...child, tool_response: 'child' });
   await daemon.routeEvent({ hook_event_name: 'SessionEnd', session_id: sessionId, reason: 'clear' });
   await flushWeave();
 

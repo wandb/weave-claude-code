@@ -63,44 +63,74 @@ export class TranscriptFile {
   }
 }
 
-/**
- * Open `transcriptPath` read-only (no symlink following, regular file only)
- * and read the first line as JSON. Returns the parsed object or undefined on
- * any failure (missing file, unparseable line, empty file). Caller-safe for
- * ancestor transcripts in the fork chain: opens its own fd and closes it
- * before returning.
- */
-export function readFirstTranscriptLine(transcriptPath: string): Record<string, unknown> | undefined {
-  const resolved = path.resolve(transcriptPath);
-  if (!isPathWithinBase(resolved, os.homedir())) return undefined;
-
-  let fd: number | undefined;
+/** Read a bounded, validated transcript prefix without leaving an fd open. */
+function readTranscriptPrefix(transcriptPath: string): string | undefined {
+  let transcript: TranscriptFile | undefined;
   try {
-    fd = fs.openSync(resolved, O_RDONLY_NOFOLLOW);
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size === 0) return undefined;
-
-    const want = Math.min(stat.size, 64 * 1024);
-    const buf = Buffer.allocUnsafe(want);
+    transcript = new TranscriptFile(transcriptPath);
+    const fd = transcript.getFd();
+    const want = Math.min(fs.fstatSync(fd).size, 64 * 1024);
+    if (want === 0) return undefined;
+    const buffer = Buffer.allocUnsafe(want);
     let read = 0;
     while (read < want) {
-      const n = fs.readSync(fd, buf, read, want - read, read);
-      if (n === 0) break;
-      read += n;
+      const count = fs.readSync(fd, buffer, read, want - read, read);
+      if (count === 0) break;
+      read += count;
     }
-    if (read === 0) return undefined;
-
-    const text = buf.toString('utf8', 0, read);
-    const nl = text.indexOf('\n');
-    const line = nl === -1 ? text : text.slice(0, nl);
-    if (!line.trim()) return undefined;
-
-    return JSON.parse(line) as Record<string, unknown>;
+    return read ? buffer.toString('utf8', 0, read) : undefined;
   } catch {
     return undefined;
   } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
-    }
+    transcript?.close();
   }
+}
+
+/** Read the first transcript line as JSON without leaving an fd open. */
+export function readFirstTranscriptLine(transcriptPath: string): Record<string, unknown> | undefined {
+  const line = readTranscriptPrefix(transcriptPath)?.split('\n', 1)[0];
+  if (!line?.trim()) return undefined;
+  try {
+    return JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+export function subagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
+  const projectDir = path.dirname(parentTranscriptPath);
+  const sessionId = path.basename(parentTranscriptPath, '.jsonl');
+  return path.join(projectDir, sessionId, 'subagents', `agent-${agentId}.jsonl`);
+}
+
+/** Read the dispatch prompt used to join an id-less lifecycle hook to Agent. */
+export async function readSubagentPrompt(transcriptPath: string): Promise<string | undefined> {
+  for (const delay of [0, 50, 100, 150]) {
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    const prompt = readTypedUserPrompt(transcriptPath);
+    if (prompt) return prompt;
+  }
+  return undefined;
+}
+
+/** Injected context uses array content; the dispatch prompt is the first
+ * bare-string user message in the bounded prefix. */
+function readTypedUserPrompt(transcriptPath: string): string | undefined {
+  const prefix = readTranscriptPrefix(transcriptPath);
+  if (!prefix) return undefined;
+  for (const raw of prefix.split('\n')) {
+    if (!raw.trim()) continue;
+    let line: Record<string, unknown>;
+    try {
+      line = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (line['type'] !== 'user') continue;
+    const message = line['message'];
+    if (!message || typeof message !== 'object') continue;
+    const content = (message as Record<string, unknown>)['content'];
+    if (typeof content === 'string' && content) return content;
+  }
+  return undefined;
 }

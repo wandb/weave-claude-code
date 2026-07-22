@@ -38,8 +38,10 @@ export type SessionState = {
   currentTurn?: TurnTrace;
   turnsByPromptId: Map<string, TurnTrace>;
 
-  /** Open ordinary tool calls, keyed by Claude's protocol identity. */
+  /** One state machine owns ordinary tools and Agent lifecycle identities. */
   calls: CallState;
+  /** Response dedupe for blockable/repeated subagent Stop snapshots. */
+  seenAgentResponses: Map<string, Set<string>>;
 
   /** Compaction attrs buffered while no turn span is open. */
   pendingCompaction?: CompactionAttrs;
@@ -90,6 +92,7 @@ export function newSessionState(options: NewSessionStateOptions): SessionState {
     turns: new Set(),
     turnsByPromptId: new Map(),
     calls: newCallState(),
+    seenAgentResponses: new Map(),
     systemInstructions: new Map(),
   };
 }
