@@ -7,6 +7,7 @@ import * as path from 'path';
 import type {
   HookInput,
   InstructionsLoadedHookInput,
+  PreToolUseHookInput,
   PreCompactHookInput,
   SessionEndHookInput,
   SessionStartHookInput,
@@ -14,12 +15,19 @@ import type {
   UserPromptSubmitHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import * as weave from 'weave';
+import type { ToolDescriptor, ToolOutcome } from './callLifecycle.js';
 import type { CompactionAttrs } from './genaiSpans.js';
 import { snippet } from './genaiSpans.js';
 import { TracedSession } from './tracedSession.js';
 import { TranscriptFile } from './transcriptFile.js';
 
 type TraceLog = (level: 'DEBUG' | 'INFO' | 'ERROR', message: string) => void;
+
+type HookInputFor<Event extends HookInput['hook_event_name']> = Extract<
+  HookInput,
+  { hook_event_name: Event }
+>;
+type PostToolResultHookInput = HookInputFor<'PostToolUse' | 'PostToolUseFailure'>;
 
 function parseHookInput(payload: unknown): HookInput | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
@@ -85,6 +93,13 @@ export class TraceRuntime {
         return;
       case 'UserPromptSubmit':
         await this.handleUserPromptSubmit(sessionId, input);
+        return;
+      case 'PreToolUse':
+        await this.handlePreToolUse(sessionId, input);
+        return;
+      case 'PostToolUse':
+      case 'PostToolUseFailure':
+        await this.handlePostToolResult(sessionId, input);
         return;
       case 'PreCompact':
         this.handlePreCompact(sessionId, input);
@@ -252,6 +267,40 @@ export class TraceRuntime {
     } else {
       this.log('INFO', `PreCompact buffered; will attach to next turn (session ${sessionId})`);
     }
+  }
+
+  private async handlePreToolUse(
+    sessionId: string,
+    input: PreToolUseHookInput,
+  ): Promise<void> {
+    if (input.tool_name === 'Agent' || input.agent_id) return;
+    const session = await this.getOrReconstructSession(sessionId, input);
+    if (!session) return;
+    session.startTool(input.prompt_id, this.toolDescriptor(input));
+  }
+
+  private async handlePostToolResult(
+    sessionId: string,
+    input: PostToolResultHookInput,
+  ): Promise<void> {
+    if (input.tool_name === 'Agent' || input.agent_id) return;
+    const session = await this.getOrReconstructSession(sessionId, input);
+    if (!session) return;
+
+    const outcome: ToolOutcome = input.hook_event_name === 'PostToolUse'
+      ? { kind: 'success', value: input.tool_response }
+      : { kind: 'failure', error: input.error };
+    session.finishTool(input.prompt_id, this.toolDescriptor(input), outcome);
+  }
+
+  private toolDescriptor(
+    input: Pick<PreToolUseHookInput, 'tool_use_id' | 'tool_name' | 'tool_input'>,
+  ): ToolDescriptor {
+    return {
+      toolUseId: input.tool_use_id,
+      name: input.tool_name,
+      input: input.tool_input as Record<string, unknown>,
+    };
   }
 
   private async handleStop(sessionId: string, input: StopHookInput): Promise<void> {

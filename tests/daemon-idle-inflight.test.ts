@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Active root work pins the daemon across its idle window. A blockable Stop
-// keeps that root reopenable but makes it quiescent; later call-state slices
-// extend the same predicate for tools and subagents.
+// Active root or tool work pins the daemon across its idle window. A blockable
+// Stop keeps its root reopenable but makes it quiescent when no call is open.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -64,6 +63,31 @@ test('daemon idles out once a stopped turn is quiescent', async () => {
     // active work it must not pin the daemon open indefinitely.
     const shuttingDown = await d.waitForLog(/Inactivity timeout — shutting down/, 3500);
     assert.ok(shuttingDown, `daemon should idle out after the turn becomes quiescent; log was:\n${d.readLog()}`);
+  } finally {
+    await d.stop();
+  }
+});
+
+test('an open tool keeps a stopped turn alive', async () => {
+  const d = await startTestDaemon({ env: { WEAVE_INACTIVITY_MS: '1000' } });
+  try {
+    const sessionId = 'inflight-tool';
+    const transcript = writeTranscript(d.home, sessionId);
+    await d.send({ hook_event_name: 'SessionStart', session_id: sessionId, transcript_path: transcript });
+    await d.send({
+      hook_event_name: 'UserPromptSubmit', session_id: sessionId,
+      transcript_path: transcript, prompt: 'a background tool',
+    });
+    await d.send({
+      hook_event_name: 'PreToolUse', session_id: sessionId,
+      transcript_path: transcript, tool_use_id: 'long-read',
+      tool_name: 'Read', tool_input: { file_path: '/tmp/slow' },
+    });
+    await d.send({ hook_event_name: 'Stop', session_id: sessionId, transcript_path: transcript });
+
+    const stayedUp = await d.waitForLog(/work in flight — staying up/, 3000);
+    assert.ok(stayedUp, `daemon should hold open for the tool; log was:\n${d.readLog()}`);
+    assert.equal(d.hasExited(), false);
   } finally {
     await d.stop();
   }
