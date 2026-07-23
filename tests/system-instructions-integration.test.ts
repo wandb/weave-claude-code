@@ -62,6 +62,7 @@ test('buffers InstructionsLoaded fired before SessionStart, then accumulates in 
     await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'PROJECT', 'session_start'));
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
     await flushWeave();
 
     const [turn] = turnRoots(exporter.getFinishedSpans());
@@ -92,6 +93,7 @@ test('re-loading the same file replaces its content rather than duplicating', as
     await d.routeEvent(loadInstr(sid, '/x/CLAUDE.md', 'V2', 'compact'));
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
     await flushWeave();
 
     const [turn] = turnRoots(exporter.getFinishedSpans());
@@ -119,6 +121,7 @@ test('stamps system instructions on every turn root (no session span to hang the
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'turn two' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
     await flushWeave();
 
     const turns = turnRoots(exporter.getFinishedSpans());
@@ -142,6 +145,7 @@ test('omits gen_ai.system_instructions when no instructions were loaded', async 
     await d.routeEvent({ hook_event_name: 'SessionStart', session_id: sid, transcript_path: file, source: 'startup', cwd: '/x' });
     await d.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: 'do it' });
     await d.routeEvent({ hook_event_name: 'Stop', session_id: sid });
+    await d.routeEvent({ hook_event_name: 'SessionEnd', session_id: sid, reason: 'clear' });
     await flushWeave();
 
     const [turn] = turnRoots(exporter.getFinishedSpans());
