@@ -17,11 +17,21 @@ export type CallOutcome =
   | { kind: 'success'; value: unknown }
   | { kind: 'failure'; error: unknown };
 
+export type CallOwner =
+  | { kind: 'root' }
+  | { kind: 'agent'; id: string }
+  | { kind: 'unknown' };
+
 type CallScope = {
   /** `undefined` is the single foreground legacy stream; a later legacy
    * prompt is a hard boundary because the protocol supplies no prompt id. */
   promptId?: string;
+  owner: CallOwner;
 };
+
+export function callOwnerFor(agentId?: string): CallOwner {
+  return agentId ? { kind: 'agent', id: agentId } : { kind: 'root' };
+}
 
 type ToolCall = CallScope & {
   kind: 'tool';
@@ -37,7 +47,7 @@ type AgentPhase =
 export type AgentCall = CallScope & {
   kind: 'agent';
   span: SubAgent;
-  toolUseId: string;
+  toolUseId?: string;
   /** Display name chosen from AgentInput; `name` is only an instance alias. */
   agentType: string;
   /** Lifecycle identity, unknown when AgentInput omitted `subagent_type`. */
@@ -45,6 +55,8 @@ export type AgentCall = CallScope & {
   prompt: string;
   agentId?: string;
   phase: AgentPhase;
+  /** Chat responses already emitted from this Agent's Stop snapshots. */
+  seenResponses: Set<string>;
 };
 
 type OpenCall = ToolCall | AgentCall;
@@ -56,6 +68,9 @@ export type CallState = {
   /** Prevent duplicate or delayed hooks from reopening calls while this
    * reconstructed session state remains live. */
   toolUseTombstones: Set<string>;
+  agentTombstones: Set<string>;
+  /** Dedupe state for Stop snapshots whose Agent call is still ambiguous. */
+  uncorrelatedAgentResponses: Map<string, Set<string>>;
 };
 
 export function newCallState(): CallState {
@@ -63,12 +78,14 @@ export function newCallState(): CallState {
     byToolUseId: new Map(),
     byAgentId: new Map(),
     toolUseTombstones: new Set(),
+    agentTombstones: new Set(),
+    uncorrelatedAgentResponses: new Map(),
   };
 }
 
-/** Every live call has a tool identity; Agent calls also have a lifecycle index. */
+/** Normal agents appear in both indexes; return every live call once. */
 export function openCalls(state: CallState): OpenCall[] {
-  return [...state.byToolUseId.values()];
+  return [...new Set([...state.byToolUseId.values(), ...state.byAgentId.values()])];
 }
 
 type BeginCallArgs = CallScope & {
@@ -101,7 +118,9 @@ export function beginCall(
       declaredAgentType: declaredAgentTypeFor(args.toolInput),
       prompt,
       promptId: args.promptId,
+      owner: args.owner,
       phase: { kind: 'running' },
+      seenResponses: new Set(),
     };
   } else {
     const span = parent.startTool({
@@ -116,7 +135,12 @@ export function beginCall(
       attributes[ATTR.AGENT_NAME] = parent.name;
     }
     span.setAttributes(attributes);
-    call = { kind: 'tool', span, promptId: args.promptId };
+    call = {
+      kind: 'tool',
+      span,
+      promptId: args.promptId,
+      owner: args.owner,
+    };
   }
 
   state.byToolUseId.set(args.toolUseId, call);
@@ -140,6 +164,66 @@ function startAgentSpan(parent: SpanParent, agentName: string, prompt: string): 
     span.setAttributes({ [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]) });
   }
   return span;
+}
+
+type RecoverAgentArgs = Pick<CallScope, 'promptId'> & {
+  agentId: string;
+  agentType: string;
+  prompt: string;
+  event: 'SubagentStart' | 'SubagentStop';
+};
+
+/** Recreate an Agent marker when a lifecycle hook is first after restart. */
+export function recoverAgentCall(
+  state: CallState,
+  parent: SpanParent,
+  args: RecoverAgentArgs,
+): AgentCall {
+  const span = startAgentSpan(parent, args.agentType, args.prompt);
+  span.setAttributes({ [ATTR.WEAVE_DISPLAY_NAME]: `Agent: ${args.agentType}` });
+  span.record({ agentId: args.agentId });
+  const call: AgentCall = {
+    kind: 'agent',
+    span,
+    agentType: args.agentType,
+    declaredAgentType: args.agentType,
+    prompt: args.prompt,
+    promptId: args.promptId,
+    owner: { kind: 'unknown' },
+    agentId: args.agentId,
+    phase: args.event === 'SubagentStop' ? { kind: 'awaiting-post' } : { kind: 'running' },
+    seenResponses: new Set(),
+  };
+  state.byAgentId.set(args.agentId, call);
+  return call;
+}
+
+export function backfillAgentPrompt(call: AgentCall, prompt: string): void {
+  if (call.prompt.trim() || !prompt.trim()) return;
+  call.prompt = prompt;
+  call.span.setAttributes({
+    [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]),
+  });
+}
+
+/** Prefer lifecycle-owned response dedupe, retaining a fallback only while
+ * correlation is ambiguous. */
+export function responseKeysForAgent(
+  state: CallState,
+  agentId: string,
+  call?: AgentCall,
+): Set<string> {
+  const uncorrelated = state.uncorrelatedAgentResponses.get(agentId);
+  if (!call) {
+    const seen = uncorrelated ?? new Set<string>();
+    state.uncorrelatedAgentResponses.set(agentId, seen);
+    return seen;
+  }
+  if (uncorrelated) {
+    for (const key of uncorrelated) call.seenResponses.add(key);
+    state.uncorrelatedAgentResponses.delete(agentId);
+  }
+  return call.seenResponses;
 }
 
 /** Apply the exact tool_use_id terminal event once. */
@@ -208,7 +292,8 @@ function errorType(error: unknown): string {
 
 export type AgentMatch =
   | { kind: 'found'; call: AgentCall }
-  | { kind: 'missing' };
+  | { kind: 'missing' }
+  | { kind: 'ambiguous' };
 
 function matchingPrompt(candidates: AgentCall[], prompt: string | undefined): AgentCall[] {
   if (prompt === undefined) return candidates;
@@ -225,10 +310,13 @@ export function matchAgent(
   const candidates = [...state.byToolUseId.values()].filter((call): call is AgentCall =>
     call.kind === 'agent'
     && !call.agentId
-    && call.promptId === promptId);
-  const matches = matchingPrompt(candidates, prompt).filter(call =>
-    call.declaredAgentType === undefined || call.declaredAgentType === agentType);
+    && call.promptId === promptId
+    && (call.declaredAgentType === undefined || call.declaredAgentType === agentType));
+  const matches = matchingPrompt(candidates, prompt);
   if (matches.length === 1) return { kind: 'found', call: matches[0] };
+  if (matches.length > 1 || (matches.length === 0 && candidates.length > 1)) {
+    return { kind: 'ambiguous' };
+  }
   return { kind: 'missing' };
 }
 
@@ -257,7 +345,8 @@ export function recordAgentStop(
   if (match.call.phase.kind === 'awaiting-post') return;
 
   finishAgentSpan(match.call.span, match.call.phase.outcome);
-  completeCall(state, match.call.toolUseId, match.call);
+  if (match.call.toolUseId) completeCall(state, match.call.toolUseId, match.call);
+  else completeAgent(state, match.call);
 }
 
 function completeCall(state: CallState, toolUseId: string, call: OpenCall): void {
@@ -269,6 +358,7 @@ function completeCall(state: CallState, toolUseId: string, call: OpenCall): void
 function completeAgent(state: CallState, call: AgentCall): void {
   if (!call.agentId) return;
   if (state.byAgentId.get(call.agentId) === call) state.byAgentId.delete(call.agentId);
+  state.agentTombstones.add(call.agentId);
 }
 
 /** Close unfinished children before their owning turns. */
@@ -283,6 +373,21 @@ export function finalizeOpenCalls(state: CallState, reason: string): string[] {
     }
     completeCall(state, toolUseId, call);
     closed.push(toolUseId);
+  }
+  const recovered = [...state.byAgentId.entries()]
+    .filter(([, call]) => call.toolUseId === undefined)
+    .reverse();
+  for (const [agentId, call] of recovered) {
+    if (call.phase.kind === 'awaiting-stop') {
+      finishAgentSpan(call.span, call.phase.outcome);
+    } else if (call.phase.kind === 'awaiting-post') {
+      call.span.end();
+    } else {
+      call.span.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: reason });
+      call.span.end({ error: new Error(`call did not complete (${reason})`) });
+    }
+    completeAgent(state, call);
+    closed.push(`agent:${agentId}`);
   }
   return closed;
 }
