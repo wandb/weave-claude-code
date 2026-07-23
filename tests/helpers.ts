@@ -7,6 +7,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import * as weave from 'weave';
@@ -116,6 +117,67 @@ export type DaemonDriver = {
   routeEvent(p: Record<string, unknown>): Promise<void>;
   drain(reason: string): Promise<void>;
 };
+
+export type TranscriptHarness = {
+  file: string;
+  append(...entries: unknown[]): void;
+  subagent(agentId: string, ...entries: unknown[]): string;
+};
+
+/** JSONL fixture that can create Claude's colocated subagent transcripts. */
+export function makeTranscript(
+  t: TestContext,
+  sessionId: string,
+  label = 'trace',
+): TranscriptHarness {
+  const dir = fs.mkdtempSync(path.join(os.homedir(), `.weave-${label}-`));
+  const file = path.join(dir, `${sessionId}.jsonl`);
+  fs.writeFileSync(file, '');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const write = (target: string, entries: unknown[]) => {
+    fs.appendFileSync(
+      target,
+      entries.map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry)).join('\n') + '\n',
+    );
+  };
+  return {
+    file,
+    append: (...entries) => write(file, entries),
+    subagent: (agentId, ...entries) => {
+      const target = path.join(dir, sessionId, 'subagents', `agent-${agentId}.jsonl`);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      write(target, entries);
+      return target;
+    },
+  };
+}
+
+export function userEntry(text: string): Record<string, unknown> {
+  return { type: 'user', message: { role: 'user', content: text } };
+}
+
+export function assistantEntry(
+  id: string,
+  content: Record<string, unknown> | Array<Record<string, unknown>>,
+  options: {
+    model?: string;
+    usage?: Record<string, number>;
+    finishReason?: string;
+  } = {},
+): Record<string, unknown> {
+  return {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      id,
+      model: options.model ?? 'claude-opus-4-8',
+      usage: options.usage ?? { input_tokens: 100, output_tokens: 50 },
+      content: Array.isArray(content) ? content : [content],
+      ...(options.finishReason ? { stop_reason: options.finishReason } : {}),
+    },
+  };
+}
 
 export function makeGenaiDaemon(agentName = 'claude-code'): DaemonDriver {
   const logFile = path.join(os.tmpdir(), `wcp-genai-${process.pid}.log`);
