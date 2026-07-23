@@ -29,6 +29,24 @@ function parseLines(lines: unknown[]): ParsedSession {
   }
 }
 
+test('rejects a transcript that shrinks below its captured boundary', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'weave-parser-boundary-'));
+  const file = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: 'captured' },
+  })}\n`);
+  const capturedBytes = fs.statSync(file).size;
+  const fd = fs.openSync(file, 'r');
+  try {
+    fs.truncateSync(file, capturedBytes - 1);
+    assert.equal(parseSessionFd(fd, capturedBytes), null);
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function assistant(
   id: string | undefined,
   timestamp: string,

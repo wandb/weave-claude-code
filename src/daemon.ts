@@ -295,8 +295,9 @@ export class GlobalDaemon {
         return;
       }
 
-      socket.end();
       void this.routeEvent(payload);
+      // Capture receipt-time transcript evidence before acknowledging the hook.
+      socket.end();
     });
 
     socket.on('error', (err: Error) => {

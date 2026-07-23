@@ -47,6 +47,8 @@ import type { SpanParent } from './genaiSpans.js';
 import { parseSessionFd } from './parser.js';
 import { TracedSession } from './tracedSession.js';
 import { TeamCoordinator } from './teamCoordinator.js';
+import type { TeamCompletion } from './teamCoordinator.js';
+import type { TeamTranscriptSnapshot } from './teamTranscripts.js';
 import {
   TranscriptFile,
   readSubagentPrompt,
@@ -63,6 +65,8 @@ type PostToolResultHookInput = HookInputFor<'PostToolUse' | 'PostToolUseFailure'
 type RecoverCallHookInput = HookInputFor<
   'PermissionDenied' | 'PostToolUse' | 'PostToolUseFailure'
 >;
+
+const MAX_RECENT_TRANSCRIPTS = 512;
 
 function mergeSubagentOutput(transcriptText?: string, lastMessage?: string): string | undefined {
   const transcript = transcriptText?.trim();
@@ -93,6 +97,9 @@ export class TraceRuntime {
   private readonly sessions = new Map<string, TracedSession>();
   private eventQueue = Promise.resolve();
   private eventSequence = 0;
+  /** Hooks can wait in the queue before their sessions are reconstructed. Keep
+   * recently observed roots available for receipt-time Team snapshots. */
+  private readonly recentTranscripts = new Set<string>();
   /** InstructionsLoaded can arrive before SessionStart. */
   private readonly pendingInstructions = new Map<string, Map<string, string>>();
   private readonly teams = new TeamCoordinator();
@@ -110,25 +117,60 @@ export class TraceRuntime {
     }
 
     const sequence = ++this.eventSequence;
-    const next = this.eventQueue.then(() => this.route(input, sequence));
+    this.rememberTranscript(input);
+    const transcriptSnapshots = input.hook_event_name === 'TeammateIdle'
+      ? this.teams.snapshotTranscripts(
+        input.session_id,
+        input.transcript_path,
+        this.sessions.values(),
+        this.recentTranscripts.values(),
+      )
+      : undefined;
+    const next = this.eventQueue.then(() =>
+      this.route(input, sequence, transcriptSnapshots));
     this.eventQueue = next;
     await next;
   }
 
-  private async route(input: HookInput, sequence: number): Promise<void> {
+  private rememberTranscript(input: HookInput): void {
+    const transcriptPath = input.transcript_path;
+    if (typeof transcriptPath !== 'string') return;
+    try {
+      const resolvedPath = new TranscriptFile(transcriptPath).resolvedPath;
+      this.recentTranscripts.delete(resolvedPath);
+      this.recentTranscripts.add(resolvedPath);
+      if (this.recentTranscripts.size > MAX_RECENT_TRANSCRIPTS) {
+        const oldest = this.recentTranscripts.values().next().value;
+        if (oldest !== undefined) this.recentTranscripts.delete(oldest);
+      }
+    } catch {
+      // Event processing reports invalid transcript paths.
+    }
+  }
+
+  private async route(
+    input: HookInput,
+    sequence: number,
+    transcriptSnapshots?: TeamTranscriptSnapshot[],
+  ): Promise<void> {
     const sessionId = input.session_id;
     this.log(
       'INFO',
       `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`,
     );
     try {
-      await weave.runIsolated(() => this.dispatchEvent(input, sequence));
+      await weave.runIsolated(() =>
+        this.dispatchEvent(input, sequence, transcriptSnapshots));
     } catch (err) {
       this.log('ERROR', `Error handling ${input.hook_event_name}: ${err}`);
     }
   }
 
-  private async dispatchEvent(input: HookInput, sequence: number): Promise<void> {
+  private async dispatchEvent(
+    input: HookInput,
+    sequence: number,
+    transcriptSnapshots?: TeamTranscriptSnapshot[],
+  ): Promise<void> {
     const sessionId = input.session_id;
     switch (input.hook_event_name) {
       case 'SessionStart':
@@ -154,13 +196,18 @@ export class TraceRuntime {
         await this.handlePostToolResult(sessionId, input, sequence);
         return;
       case 'SubagentStart':
-        await this.handleSubagentStart(sessionId, input);
+        await this.handleSubagentStart(sessionId, input, sequence);
         return;
       case 'SubagentStop':
-        await this.handleSubagentStop(sessionId, input);
+        await this.handleSubagentStop(sessionId, input, sequence);
         return;
       case 'TeammateIdle':
-        await this.handleTeammateIdle(input, sequence);
+        await this.handleTeammateIdle(
+          sessionId,
+          input,
+          sequence,
+          transcriptSnapshots,
+        );
         return;
       case 'PreCompact':
         this.handlePreCompact(sessionId, input);
@@ -356,7 +403,13 @@ export class TraceRuntime {
       toolInput: input.tool_input as Record<string, unknown>,
     });
     if (call?.kind === 'agent') {
-      this.teams.registerDispatch(session, call, sequence);
+      const team = this.teams.registerDispatch(session, call, sequence);
+      if (team) {
+        this.log(
+          'INFO',
+          `Team member registered: ${team.teamName ?? 'implicit'}::${team.memberName} (queue depth ${team.depth})`,
+        );
+      }
     }
     if (call && !input.agent_id) call.root.phase = 'active';
   }
@@ -428,12 +481,13 @@ export class TraceRuntime {
     const existing = session.calls.byToolUseId.get(input.tool_use_id);
     const call = existing ?? await this.recoverCall(session, input);
     if (!existing && call?.kind === 'agent') {
-      this.teams.registerDispatch(session, call, sequence);
+      this.teams.registerDispatch(session, call, sequence, true);
     }
     if (call?.kind === 'agent') {
-      const update = this.teams.postOutcome(call, outcome);
+      const update = await this.teams.postOutcome(call, outcome);
+      this.settleTeamCompletions(update.completions);
       if (update.handled) {
-        this.settleTeamCompletions(update.completions, session);
+        if (!update.completions.length) this.settleSession(session);
         return;
       }
     }
@@ -473,7 +527,7 @@ export class TraceRuntime {
     if (!session || session.calls.toolUseTombstones.has(input.tool_use_id)) return;
     const call = await this.recoverCall(session, input);
     const completions = call?.kind === 'agent'
-      ? this.teams.deny(call, input.reason)
+      ? await this.teams.deny(call, input.reason)
       : undefined;
     if (!completions) denyCall(session.calls, input.tool_use_id, input.reason);
     this.settleTeamCompletions(completions ?? [], session);
@@ -482,6 +536,7 @@ export class TraceRuntime {
   private async handleSubagentStart(
     sessionId: string,
     input: SubagentStartHookInput,
+    sequence: number,
   ): Promise<void> {
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session
@@ -499,16 +554,39 @@ export class TraceRuntime {
       return;
     }
 
+    const teamLifecycle = this.teams.classifyLifecycle(
+      session,
+      input.agent_type,
+      transcriptPath,
+    );
+    if (
+      match.kind === 'missing'
+      && (teamLifecycle === 'dispatch' || teamLifecycle === 'ambiguous')
+    ) {
+      return;
+    }
+
+    let lifecycle: TracedAgent;
     if (match.kind === 'found') {
       bindAgent(session.calls, match, input.agent_id, input.agent_type);
+      lifecycle = match.call;
     } else {
-      this.recoverAgent(
+      lifecycle = this.recoverAgent(
         session,
         input.agent_id,
         input.agent_type,
         input.prompt_id,
         prompt ?? '',
         'SubagentStart',
+      );
+    }
+    if (lifecycle.toolUseId === undefined && teamLifecycle === 'idle') {
+      this.teams.registerIdle(
+        session,
+        lifecycle,
+        input.agent_type,
+        transcriptPath,
+        sequence,
       );
     }
     this.log('INFO', `Subagent started: agentId=${input.agent_id} type=${input.agent_type}`);
@@ -556,6 +634,7 @@ export class TraceRuntime {
   private async handleSubagentStop(
     sessionId: string,
     input: SubagentStopHookInput,
+    sequence: number,
   ): Promise<void> {
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session || session.calls.agentTombstones.has(input.agent_id)) return;
@@ -580,6 +659,18 @@ export class TraceRuntime {
       );
     }
 
+    const teamLifecycle = this.teams.classifyLifecycle(
+      session,
+      input.agent_type,
+      transcriptPath,
+    );
+    if (
+      match.kind === 'missing'
+      && (teamLifecycle === 'dispatch' || teamLifecycle === 'ambiguous')
+    ) {
+      return;
+    }
+
     const turn = session.turnForPrompt(input.prompt_id);
     const recovered = match.kind === 'missing'
       ? this.recoverAgent(
@@ -592,12 +683,29 @@ export class TraceRuntime {
       )
       : undefined;
     const lifecycle = match.kind === 'found' ? match.call : recovered;
-    if (lifecycle && this.teams.has(lifecycle)) {
-      this.log(
-        'DEBUG',
-        `Subagent stopped: agentId=${input.agent_id} awaiting TeammateIdle`,
+    if (
+      lifecycle
+      && lifecycle.toolUseId === undefined
+      && teamLifecycle === 'idle'
+    ) {
+      this.teams.registerIdle(
+        session,
+        lifecycle,
+        input.agent_type,
+        transcriptPath,
+        sequence,
       );
-      return;
+    }
+    if (lifecycle) {
+      const update = await this.teams.stop(lifecycle, transcriptPath);
+      this.settleTeamCompletions(update.completions);
+      if (update.handled) {
+        this.log(
+          'DEBUG',
+          `Subagent stopped: agentId=${input.agent_id} awaiting TeammateIdle`,
+        );
+        return;
+      }
     }
     const parent = match.kind === 'found'
       ? match.call.span
@@ -648,14 +756,18 @@ export class TraceRuntime {
   }
 
   private async handleTeammateIdle(
+    sessionId: string,
     input: TeammateIdleHookInput,
     sequence: number,
+    transcriptSnapshots?: TeamTranscriptSnapshot[],
   ): Promise<void> {
     const result = await this.teams.recordIdle({
       sequence,
+      sessionId,
       teamName: input.team_name,
       memberName: input.teammate_name,
-      transcriptPath: input.transcript_path,
+      idleTranscriptPath: input.transcript_path,
+      transcriptSnapshots,
     });
     if (!result.completions.length) {
       this.log(
@@ -723,9 +835,15 @@ export class TraceRuntime {
   }
 
   private settleTeamCompletions(
-    completions: Array<{ owner: TracedSession }>,
+    completions: TeamCompletion[],
     fallback?: TracedSession,
   ): void {
+    for (const completion of completions) {
+      this.log(
+        'DEBUG',
+        `Team completed: ${completion.teamName ?? 'unknown'}::${completion.memberName} (${completion.mode})`,
+      );
+    }
     const owners = new Set(completions.map(completion => completion.owner));
     if (!owners.size && fallback) owners.add(fallback);
     for (const owner of owners) this.settleSession(owner);

@@ -2,53 +2,26 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-import { test, type TestContext } from 'node:test';
-import assert from 'node:assert/strict';
-import { ATTR } from '../src/genaiSpans.ts';
+import type { TestContext } from 'node:test';
 import {
+  ATTR,
+  MEMBER,
+  TEAM,
+  assert,
   assistantEntry,
+  coordinator,
+  dispatch,
   flushWeave,
   initWeaveInMemory,
   makeGenaiDaemon,
   makeTranscript,
+  postDispatch,
+  preDispatch,
   spanParentId,
+  teammateEntries,
+  test,
   userEntry,
-} from './helpers.ts';
-
-const TEAM = 'review-team';
-const MEMBER = 'reviewer';
-
-function teammateEntries(sessionId: string, text: string, responseId: string) {
-  return [
-    { type: 'agent-setting', agentSetting: MEMBER, sessionId },
-    { type: 'user', teamName: TEAM, message: { role: 'user', content: `task: ${text}` } },
-    assistantEntry(responseId, { type: 'text', text }),
-  ];
-}
-
-async function coordinator(t: TestContext, label: string, promptId?: string) {
-  const exporter = await initWeaveInMemory();
-  exporter.reset();
-  const sid = `team-${label}`;
-  const transcript = makeTranscript(t, sid, label);
-  transcript.append(userEntry('delegate reviews'));
-  const daemon = makeGenaiDaemon();
-  await daemon.routeEvent({
-    hook_event_name: 'SessionStart',
-    session_id: sid,
-    transcript_path: transcript.file,
-    source: 'startup',
-    cwd: '/x',
-  });
-  await daemon.routeEvent({
-    hook_event_name: 'UserPromptSubmit',
-    session_id: sid,
-    transcript_path: transcript.file,
-    prompt: 'delegate reviews',
-    ...(promptId ? { prompt_id: promptId } : {}),
-  });
-  return { exporter, daemon, sid, transcript };
-}
+} from './agent-team-test-helpers.ts';
 
 const teamInput = (prompt: string): Record<string, unknown> => ({
   subagent_type: MEMBER,
@@ -56,48 +29,6 @@ const teamInput = (prompt: string): Record<string, unknown> => ({
   team_name: TEAM,
   name: MEMBER,
 });
-
-async function preDispatch(
-  daemon: ReturnType<typeof makeGenaiDaemon>,
-  sid: string,
-  toolUseId: string,
-  input: Record<string, unknown>,
-) {
-  await daemon.routeEvent({
-    hook_event_name: 'PreToolUse',
-    session_id: sid,
-    tool_use_id: toolUseId,
-    tool_name: 'Agent',
-    tool_input: input,
-  });
-}
-
-async function postDispatch(
-  daemon: ReturnType<typeof makeGenaiDaemon>,
-  sid: string,
-  toolUseId: string,
-  input: Record<string, unknown>,
-) {
-  await daemon.routeEvent({
-    hook_event_name: 'PostToolUse',
-    session_id: sid,
-    tool_use_id: toolUseId,
-    tool_name: 'Agent',
-    tool_input: input,
-    tool_response: 'dispatched',
-  });
-}
-
-async function dispatch(
-  daemon: ReturnType<typeof makeGenaiDaemon>,
-  sid: string,
-  toolUseId: string,
-  prompt: string,
-) {
-  const input = teamInput(prompt);
-  await preDispatch(daemon, sid, toolUseId, input);
-  await postDispatch(daemon, sid, toolUseId, input);
-}
 
 async function idle(
   t: TestContext,
