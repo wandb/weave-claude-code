@@ -74,6 +74,7 @@ test('ordinary tool calls are traced once while Agent-owned calls remain deferre
     tool_input: { file_path: '/tmp/input.txt' },
   };
   await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...tool });
+  await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...tool });
   await daemon.routeEvent({ hook_event_name: 'PostToolUse', ...tool, tool_response: 'contents' });
   await daemon.routeEvent({ hook_event_name: 'PreToolUse', ...tool });
   await daemon.routeEvent({ hook_event_name: 'PostToolUse', ...tool, tool_response: 'duplicate' });
