@@ -198,6 +198,15 @@ test('an identical prompt submitted during transcript lag does not replay prior 
   await daemon.routeEvent({
     hook_event_name: 'Stop', session_id: sessionId, prompt_id: 'prompt-b',
   });
+  await flushWeave();
+
+  const laggingSpans = exporter.getFinishedSpans();
+  assert.equal(turns(laggingSpans).length, 1, 'only the completed first root exports during lag');
+  assert.deepEqual(
+    chats(laggingSpans).map(span => span.attributes[ATTR.RESPONSE_ID]),
+    ['response-a'],
+    'the lagging second root does not replay the first response',
+  );
 
   transcript.append(
     userEntry('same prompt'),
