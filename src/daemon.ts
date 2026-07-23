@@ -45,6 +45,9 @@ const MAX_SOCKET_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
 export class GlobalDaemon {
   private server?: net.Server;
+  /** Socket inode bound by this process; a successor may reuse the path while
+   * this daemon drains. */
+  private ownedSocketInode?: number;
   private running = false;
   private lastActivity = Date.now();
   private readonly inactivityMs =
@@ -64,6 +67,13 @@ export class GlobalDaemon {
   }
 
   async start(): Promise<void> {
+    // Install cleanup before any await can expose a partially started daemon.
+    this.running = true;
+    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
+    process.on('SIGINT', () => void this.shutdown('SIGINT'));
+    process.on('SIGHUP', () => void this.shutdown('SIGHUP'));
+    process.on('exit', () => this.releaseOwnedSocket());
+
     if (this.config.weaveProject && this.config.apiKey) {
       try {
         await this.initWeave();
@@ -87,19 +97,7 @@ export class GlobalDaemon {
     }
 
     await this.bindSocketWithHerdProtection();
-    this.running = true;
     this.log('INFO', `Daemon started — socket: ${this.socketPath}`);
-
-    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
-    process.on('SIGINT', () => void this.shutdown('SIGINT'));
-    process.on('SIGHUP', () => void this.shutdown('SIGHUP'));
-    process.on('exit', () => {
-      try {
-        if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath);
-      } catch {
-        // The next hook's socket probe handles stale-socket cleanup.
-      }
-    });
 
     const checkEveryMs = Math.min(
       60_000,
@@ -135,10 +133,11 @@ export class GlobalDaemon {
         reject(err);
       };
       server.once('error', onError);
+      this.server = server;
       server.listen(this.socketPath, () => {
         process.umask(previousUmask);
         server.removeListener('error', onError);
-        this.server = server;
+        this.captureSocketOwnership();
         resolve();
       });
     });
@@ -167,6 +166,31 @@ export class GlobalDaemon {
           // Another process already cleaned it; retry the bind.
         }
       }
+    }
+  }
+
+  /** Capture an early bind only while this process's server is still live. */
+  private captureSocketOwnership(): void {
+    if (this.ownedSocketInode !== undefined || !this.server?.listening) return;
+    try {
+      this.ownedSocketInode = fs.statSync(this.socketPath).ino;
+    } catch {
+      // The socket was already removed.
+    }
+  }
+
+  /** Remove only the socket inode this daemon created. */
+  private releaseOwnedSocket(): void {
+    this.captureSocketOwnership();
+    const owned = this.ownedSocketInode;
+    this.ownedSocketInode = undefined;
+    if (owned === undefined) return;
+    try {
+      if (fs.statSync(this.socketPath).ino === owned) {
+        fs.unlinkSync(this.socketPath);
+      }
+    } catch {
+      // The socket was already removed.
     }
   }
 
@@ -311,7 +335,21 @@ export class GlobalDaemon {
 
   private async drain(reason: string): Promise<void> {
     this.log('INFO', `Shutdown: ${reason}`);
-    this.server?.close();
+    // The path can become visible just before listen's callback records it.
+    this.captureSocketOwnership();
+    let serverClosed: Promise<void> | undefined;
+    if (this.server?.listening) {
+      // Node stops listening and unlinks a Unix socket when close() is called;
+      // the callback only waits for already accepted connections.
+      serverClosed = new Promise<void>(resolve =>
+        this.server!.close(() => resolve()));
+      // A successor may now bind this path, so never inspect it again.
+      this.ownedSocketInode = undefined;
+    } else {
+      this.releaseOwnedSocket();
+    }
+    await serverClosed;
+    await this.traceRuntime.waitForPendingEvents();
     this.traceRuntime.finalizeForShutdown();
     if (this.tracingEnabled) {
       try {
@@ -321,9 +359,6 @@ export class GlobalDaemon {
       }
     }
     this.traceRuntime.closeTranscripts();
-    if (fs.existsSync(this.socketPath)) {
-      fs.unlinkSync(this.socketPath);
-    }
   }
 
   private log(level: 'DEBUG' | 'INFO' | 'ERROR', message: string): void {

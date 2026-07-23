@@ -29,6 +29,11 @@ import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 
 type TraceLog = (level: 'DEBUG' | 'INFO' | 'ERROR', message: string) => void;
 
+/** Keep forced parent closes after children opened during this clock tick. */
+function spanCloseTime(): Date {
+  return new Date(Date.now() + 1);
+}
+
 export type TurnTrace = {
   kind: 'turn';
   span: weave.Turn;
@@ -182,21 +187,22 @@ export class TracedSession {
   finishAtSessionEnd(promptId: string | undefined): number {
     const parsed = this.parseTranscript();
     this.reconcileFinalTurn(promptId, parsed);
-    return this.finishTurns('session_ended', parsed);
+    return this.finishTurns('session_ended', parsed, spanCloseTime());
   }
 
   finishOpenTurns(orphanReason: string): number {
-    return this.finishTurns(orphanReason, this.parseTranscript());
+    return this.finishTurns(orphanReason, this.parseTranscript(), spanCloseTime());
   }
 
   private finishTurns(
     orphanReason: string,
     parsed: ParsedSession | null,
+    endTime: Date,
   ): number {
     const turnCount = this.turns.size;
     for (const turn of [...this.turns]) {
       this.recordFinalTurnOutput(turn, orphanReason, parsed);
-      this.closeTurn(turn, orphanReason);
+      this.closeTurn(turn, orphanReason, endTime);
     }
     return turnCount;
   }
@@ -364,14 +370,27 @@ export class TracedSession {
 
   private finalizeTurn(turn: TurnTrace, orphanReason: string): void {
     this.recordFinalTurnOutput(turn, orphanReason, this.parseTranscript());
-    this.closeTurn(turn, orphanReason);
+    this.closeTurn(
+      turn,
+      orphanReason,
+      turn.children.size ? spanCloseTime() : undefined,
+    );
   }
 
-  private closeTurn(turn: TurnTrace, orphanReason: string): void {
-    for (const toolUseId of finalizeOpenCalls(this.calls, [turn], orphanReason)) {
+  private closeTurn(
+    turn: TurnTrace,
+    orphanReason: string,
+    endTime?: Date,
+  ): void {
+    for (const toolUseId of finalizeOpenCalls(
+      this.calls,
+      [turn],
+      orphanReason,
+      endTime,
+    )) {
       this.log('DEBUG', `Closed pending call: ${toolUseId}`);
     }
-    turn.span.end();
+    turn.span.end(endTime ? { endTime } : undefined);
     this.turns.delete(turn);
     if (this.currentTurn === turn) this.currentTurn = undefined;
   }

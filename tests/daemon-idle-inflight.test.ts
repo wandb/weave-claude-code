@@ -92,3 +92,48 @@ test('an open tool keeps a stopped turn alive', async () => {
     await d.stop();
   }
 });
+
+test('shutdown drains queued hooks before finalizing', async () => {
+  const d = await startTestDaemon();
+  try {
+    const sessionId = 'shutdown-queued-hooks';
+    const transcript = writeTranscript(d.home, sessionId);
+    await d.send({
+      hook_event_name: 'SessionStart',
+      session_id: sessionId,
+      transcript_path: transcript,
+    });
+    await d.send({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      transcript_path: transcript,
+      prompt: 'queue work',
+    });
+    assert.ok(await d.waitForLog(/Created turn span/));
+
+    // Stop remains in its transcript retry loop while the tool queues behind it.
+    await d.send({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      transcript_path: transcript,
+      last_assistant_message: 'not flushed yet',
+    });
+    await d.send({
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      transcript_path: transcript,
+      tool_use_id: 'queued-tool',
+      tool_name: 'Read',
+      tool_input: { file_path: '/x' },
+    });
+    d.proc.kill('SIGTERM');
+
+    assert.ok(
+      await d.waitForExit(5000),
+      `daemon did not exit; log was:\n${d.readLog()}`,
+    );
+    assert.match(d.readLog(), /Closed pending call: queued-tool/);
+  } finally {
+    await d.stop();
+  }
+});

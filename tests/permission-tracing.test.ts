@@ -167,6 +167,11 @@ test('Agent permission events stay on its invoke-agent span', async (t) => {
   const agent = exporter.getFinishedSpans().find(span =>
     span.attributes[ATTR.AGENT_NAME] === 'Explore');
   assert.ok(agent);
+  assert.equal(agent.attributes[ATTR.WEAVE_ORPHAN_REASON], undefined);
+  assert.equal(
+    agent.attributes[ATTR.OUTPUT_MESSAGES],
+    JSON.stringify([{ role: 'assistant', content: 'done' }]),
+  );
   assert.ok(requestedPermission(agent));
   assert.equal(resolvedPermission(agent)?.attributes[ATTR.EVT_PERMISSION_APPROVED], true);
 });
