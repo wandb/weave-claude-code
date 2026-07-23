@@ -15,12 +15,8 @@ import {
   setCompactionAttrs,
 } from './genaiSpans.js';
 import type { CompactionAttrs } from './genaiSpans.js';
-import { ToolLifecycle } from './callLifecycle.js';
-import type {
-  ToolDescriptor,
-  ToolOutcome,
-  TracedTool,
-} from './callLifecycle.js';
+import { finalizeOpenCalls, newCallState } from './callLifecycle.js';
+import type { TracedCall } from './callLifecycle.js';
 import {
   assistantResponses,
   extractAssistantTextBlocks,
@@ -34,13 +30,14 @@ import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 type TraceLog = (level: 'DEBUG' | 'INFO' | 'ERROR', message: string) => void;
 
 export type TurnTrace = {
+  kind: 'turn';
   span: weave.Turn;
   promptId?: string;
   userText?: string;
   /** A Stop snapshot is quiescent but remains reopenable because hooks block. */
   phase: 'active' | 'stopped';
   /** Calls are owned by their parent span; hook ids are only lookup indexes. */
-  children: Set<TracedTool>;
+  children: Set<TracedCall>;
   /** Number of provider responses already present when this prompt began. */
   responseOffset: number;
   /** Frozen when a newer prompt starts, preventing cross-turn replay. */
@@ -78,7 +75,7 @@ export class TracedSession {
   /** File path → latest loaded contents, preserving first-load order. */
   private readonly systemInstructions = new Map<string, string>();
   private readonly turns = new Set<TurnTrace>();
-  private readonly tools = new ToolLifecycle();
+  readonly calls = newCallState();
   private currentTurn?: TurnTrace;
   private pendingCompaction?: CompactionAttrs;
 
@@ -123,27 +120,6 @@ export class TracedSession {
 
   setInstruction(filePath: string, content: string): void {
     this.systemInstructions.set(filePath, content);
-  }
-
-  startTool(promptId: string | undefined, tool: ToolDescriptor): boolean {
-    const turn = this.ensureTurn(promptId);
-    const traced = this.tools.start(turn, tool);
-    if (traced) turn.phase = 'active';
-    return Boolean(traced);
-  }
-
-  finishTool(
-    promptId: string | undefined,
-    tool: ToolDescriptor,
-    outcome: ToolOutcome,
-  ): boolean {
-    const finished = this.tools.finishOrRecover(
-      () => this.ensureTurn(promptId),
-      tool,
-      outcome,
-    );
-    if (finished) this.finalizeIdleSupersededTurns();
-    return finished;
   }
 
   submitPrompt(
@@ -226,7 +202,7 @@ export class TracedSession {
   }
 
   hasInFlightWork(): boolean {
-    return this.tools.hasOpenTools()
+    return [...this.turns].some(turn => turn.children.size > 0)
       || [...this.turns].some(turn => turn.phase === 'active');
   }
 
@@ -234,7 +210,7 @@ export class TracedSession {
     this.transcript.close();
   }
 
-  private turnForPrompt(promptId: string | undefined): TurnTrace | undefined {
+  turnForPrompt(promptId: string | undefined): TurnTrace | undefined {
     return promptId === undefined
       ? this.currentTurn
       : [...this.turns].find(turn => turn.promptId === promptId);
@@ -275,6 +251,7 @@ export class TracedSession {
       [ATTR.WEAVE_SOURCE]: this.source,
     });
     const turn: TurnTrace = {
+      kind: 'turn',
       span,
       promptId: options.promptId,
       userText: cursor.userText,
@@ -288,7 +265,7 @@ export class TracedSession {
     return turn;
   }
 
-  private ensureTurn(promptId: string | undefined): TurnTrace {
+  ensureTurn(promptId: string | undefined): TurnTrace {
     return this.turnForPrompt(promptId) ?? this.startTurn({
       promptId,
       // An exact prompt_id must not claim the last transcript turn. A legacy
@@ -391,15 +368,15 @@ export class TracedSession {
   }
 
   private closeTurn(turn: TurnTrace, orphanReason: string): void {
-    for (const toolUseId of this.tools.finalizeChildren(turn, orphanReason)) {
-      this.log('DEBUG', `Closed pending tool: ${toolUseId}`);
+    for (const toolUseId of finalizeOpenCalls(this.calls, [turn], orphanReason)) {
+      this.log('DEBUG', `Closed pending call: ${toolUseId}`);
     }
     turn.span.end();
     this.turns.delete(turn);
     if (this.currentTurn === turn) this.currentTurn = undefined;
   }
 
-  private finalizeIdleSupersededTurns(): void {
+  finishSupersededTurns(): void {
     for (const turn of [...this.turns]) {
       if (turn.responseLimit !== undefined && turn.children.size === 0) {
         this.finalizeTurn(turn, 'superseded_by_next_prompt');
