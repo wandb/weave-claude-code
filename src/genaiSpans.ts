@@ -5,9 +5,13 @@
 // Attribute-key constants and formatting helpers typed against the `weave` SDK.
 
 import type { Attributes } from '@opentelemetry/api';
-import type { MessagePart, Tool, Turn, Usage } from 'weave';
+import type { MessagePart, SubAgent, Tool, Turn, Usage } from 'weave';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
 import type { UsageSummary } from './parser.js';
+
+/** Weave's two public invoke-agent handles that can own chat, tool, and
+ * subagent spans. The SDK does not currently export a common parent type. */
+export type SpanParent = Turn | SubAgent;
 
 // Attribute keys: `gen_ai.*` from the OTel GenAI semconv
 // (https://github.com/open-telemetry/semantic-conventions-genai); `weave.*`

@@ -5,7 +5,7 @@
 import * as path from 'path';
 import * as weave from 'weave';
 import { VERSION } from './setup.js';
-import { parseSessionFd, extractAssistantTextBlocks, isTextBlock } from './parser.js';
+import { isTextBlock } from './parser.js';
 import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
 import { sha256Hex } from './utils.js';
 import { ATTR, buildIntegrationAttrs, addPermissionResolvedEvent } from './genaiSpans.js';
@@ -59,15 +59,6 @@ export function extractUserMessageContent(line: Record<string, unknown> | undefi
     return parts.length > 0 ? parts.join('') : undefined;
   }
   return undefined;
-}
-
-export function lastAssistantTextEndsWith(
-  result: NonNullable<ReturnType<typeof parseSessionFd>>,
-  suffix: string,
-): boolean {
-  const call = result.turns.at(-1)?.assistantCalls().at(-1);
-  if (!call) return false;
-  return extractAssistantTextBlocks(call.contentBlocks).join('\n').trimEnd().endsWith(suffix);
 }
 
 export type LoadedInstruction = { filePath: string; content: string };
