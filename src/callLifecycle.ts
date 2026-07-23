@@ -4,10 +4,18 @@
 
 import type { Attributes } from '@opentelemetry/api';
 import type { SubAgent, Tool } from 'weave';
-import { ATTR, assistantOutputMessages, jsonStr, toolDisplayName } from './genaiSpans.js';
+import {
+  ATTR,
+  addPermissionRequestEvent,
+  addPermissionResolvedEvent,
+  assistantOutputMessages,
+  jsonStr,
+  toolDisplayName,
+} from './genaiSpans.js';
 import type { SpanParent } from './genaiSpans.js';
 import { VERSION } from './setup.js';
 import type { TurnTrace } from './tracedSession.js';
+import { deepEqual } from './utils.js';
 
 export type CallOutcome =
   | { kind: 'success'; value: unknown }
@@ -20,13 +28,19 @@ type CallScope = {
   root: TurnTrace;
 };
 
-type TracedTool = CallScope & {
+type PermissionContext = {
+  name: string;
+  input: Record<string, unknown>;
+  permissionRequested: boolean;
+};
+
+type TracedTool = CallScope & PermissionContext & {
   kind: 'tool';
   span: Tool;
   toolUseId: string;
 };
 
-export type TracedAgent = CallScope & {
+export type TracedAgent = CallScope & PermissionContext & {
   kind: 'agent';
   span: SubAgent;
   toolUseId?: string;
@@ -100,6 +114,9 @@ export function beginCall(
       kind: 'agent',
       span,
       toolUseId: args.toolUseId,
+      name: args.toolName,
+      input: args.toolInput,
+      permissionRequested: false,
       agentType,
       declaredAgentType: declaredAgentTypeFor(args.toolInput),
       prompt,
@@ -124,6 +141,9 @@ export function beginCall(
       kind: 'tool',
       span,
       toolUseId: args.toolUseId,
+      name: args.toolName,
+      input: args.toolInput,
+      permissionRequested: false,
       parent,
       root,
     };
@@ -172,6 +192,9 @@ export function recoverAgentCall(
   const call: TracedAgent = {
     kind: 'agent',
     span,
+    name: 'Agent',
+    input: { subagent_type: args.agentType, prompt: args.prompt },
+    permissionRequested: false,
     agentType: args.agentType,
     declaredAgentType: args.agentType,
     prompt: args.prompt,
@@ -189,6 +212,7 @@ export function recoverAgentCall(
 export function backfillAgentPrompt(call: TracedAgent, prompt: string): void {
   if (call.prompt.trim() || !prompt.trim()) return;
   call.prompt = prompt;
+  call.input = { ...call.input, prompt };
   call.span.setAttributes({
     [ATTR.INPUT_MESSAGES]: jsonStr([{ role: 'user', content: prompt }]),
   });
@@ -214,6 +238,64 @@ export function responseKeysForAgent(
   return call.seenResponses;
 }
 
+type PermissionRequest = {
+  promptId?: string;
+  parent?: CallParent;
+  toolName: string;
+  toolInput: unknown;
+  suggestions?: unknown;
+};
+
+export type PermissionAttribution = 'recorded' | 'missing' | 'ambiguous';
+
+/** PermissionRequest has no tool_use_id, so record it only for one exact call. */
+export function recordPermissionRequest(
+  state: CallState,
+  request: PermissionRequest,
+): PermissionAttribution {
+  const candidates = [...state.byToolUseId.values()].filter(call =>
+    !call.permissionRequested
+    && call.name === request.toolName
+    && call.root.promptId === request.promptId
+    && call.parent === request.parent);
+  const exact = candidates.filter(call => deepEqual(call.input, request.toolInput));
+  // PreToolUse hooks may update the input before PermissionRequest. Fall back
+  // to scope only when it still identifies exactly one call.
+  const matches = exact.length ? exact : candidates;
+  if (matches.length !== 1) return matches.length === 0 ? 'missing' : 'ambiguous';
+
+  const [call] = matches;
+  call.permissionRequested = true;
+  addPermissionRequestEvent(call.span, {
+    suggestions: request.suggestions,
+    timestamp: new Date(),
+  });
+  return 'recorded';
+}
+
+function resolvePermission(call: TracedCall, approved: boolean): void {
+  if (approved && !call.permissionRequested) return;
+  addPermissionResolvedEvent(call.span, { approved, timestamp: new Date() });
+  call.permissionRequested = false;
+}
+
+/** PermissionDenied is a standalone auto-mode classifier decision. Manual
+ * dialogs do not emit this hook, so no preceding request event is required. */
+export function denyCall(state: CallState, toolUseId: string, reason: string): void {
+  const call = state.byToolUseId.get(toolUseId);
+  if (!call) return;
+
+  resolvePermission(call, false);
+  if (call.kind === 'tool') {
+    call.span.result = reason;
+    call.span.setAttributes({ [ATTR.ERROR_TYPE]: 'permission_denied' });
+    call.span.end({ error: new Error(reason) });
+  } else {
+    finishAgentSpan(call, { kind: 'failure', error: reason }, 'permission_denied');
+  }
+  completeCall(state, call);
+}
+
 /** Apply the exact tool_use_id terminal event once. */
 export function recordCallOutcome(
   state: CallState,
@@ -228,11 +310,13 @@ export function recordCallOutcome(
     completeCall(state, call);
     return;
   }
+  resolvePermission(call, true);
   call.outcome ??= outcome;
   finishAgentIfReady(state, call);
 }
 
 function finishToolCall(call: TracedTool, outcome: CallOutcome): void {
+  resolvePermission(call, true);
   if (outcome.kind === 'success') {
     call.span.result = jsonStr(outcome.value);
     call.span.end();
@@ -244,7 +328,11 @@ function finishToolCall(call: TracedTool, outcome: CallOutcome): void {
   call.span.end({ error: new Error(error) });
 }
 
-function finishAgentSpan(call: TracedAgent, outcome: CallOutcome): void {
+function finishAgentSpan(
+  call: TracedAgent,
+  outcome: CallOutcome,
+  failureType?: string,
+): void {
   const output = outcome.kind === 'success' ? outcome.value : outcome.error;
   if (output !== undefined && output !== null && output !== '') {
     const text = typeof output === 'string' ? output : jsonStr(output);
@@ -254,7 +342,7 @@ function finishAgentSpan(call: TracedAgent, outcome: CallOutcome): void {
     call.span.end();
     return;
   }
-  call.span.setAttributes({ [ATTR.ERROR_TYPE]: errorType(outcome.error) });
+  call.span.setAttributes({ [ATTR.ERROR_TYPE]: failureType ?? errorType(outcome.error) });
   call.span.end({
     error: new Error(typeof outcome.error === 'string' ? outcome.error : 'subagent failed'),
   });
