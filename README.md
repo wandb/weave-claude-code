@@ -252,8 +252,8 @@ matches the Weave Agents chat view's reference structure, where nested
 subagent. The spawning tool_use_id is preserved on the inner
 `invoke_agent` span as `weave.claude_code.subagent.spawning_tool_call_id`.
 
-Permission requests appear as `weave.permission_request` span events on the
-parent `execute_tool` span; context-window compaction is stamped as
+Permission requests appear as `weave.permission_request` events on the
+corresponding tool or agent call span; context-window compaction is stamped as
 `weave.compaction.{summary,items_before,items_after}` attributes on the
 turn span open at compaction time (or the next turn if compaction fires
 between turns).
