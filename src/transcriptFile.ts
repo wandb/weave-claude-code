@@ -9,8 +9,10 @@ import { isPathWithinBase } from './utils.js';
 
 const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
 // Injected subagent context can make the first JSONL record much larger than a
-// normal prompt. Bound the synchronous work used to correlate an Agent hook.
-const TRANSCRIPT_SCAN_LIMIT_BYTES = 8 * 1024 * 1024;
+// normal prompt. Eight MiB comfortably covers that preamble while bounding the
+// synchronous work and memory used to correlate an id-less lifecycle hook.
+export const TRANSCRIPT_SCAN_LIMIT_BYTES = 8 * 1024 * 1024;
+export type ReadBudget = { remaining: number };
 
 export type TranscriptHead = Record<string, unknown> & {
   version?: string;
@@ -73,19 +75,22 @@ export class TranscriptFile {
 
 /** Read a bounded transcript snapshot without leaving an fd open.
  * If the bound cuts a record, exclude that partial JSONL line. */
-function readTranscriptPrefix(transcriptPath: string): string | undefined {
+export function readTranscriptPrefix(
+  transcriptPath: string,
+  limitBytes = TRANSCRIPT_SCAN_LIMIT_BYTES,
+): string | undefined {
   let transcript: TranscriptFile | undefined;
   try {
     transcript = new TranscriptFile(transcriptPath);
     const fd = transcript.getFd();
     const fileSize = fs.fstatSync(fd).size;
-    const want = Math.min(fileSize, TRANSCRIPT_SCAN_LIMIT_BYTES);
-    if (!want) return undefined;
+    const want = Math.min(fileSize, limitBytes);
+    if (want === 0) return undefined;
     const buffer = Buffer.allocUnsafe(want);
     let read = 0;
     while (read < want) {
       const count = fs.readSync(fd, buffer, read, want - read, read);
-      if (!count) break;
+      if (count === 0) break;
       read += count;
     }
     if (read < fileSize) {
@@ -101,20 +106,60 @@ function readTranscriptPrefix(transcriptPath: string): string | undefined {
 }
 
 /** Read the first transcript line as JSON without leaving an fd open. */
-export function readFirstTranscriptLine(transcriptPath: string): TranscriptHead | undefined {
-  const line = readTranscriptPrefix(transcriptPath)?.split('\n', 1)[0];
-  if (!line?.trim()) return undefined;
+export function readFirstTranscriptLine(
+  transcriptPath: string,
+  limitBytes = TRANSCRIPT_SCAN_LIMIT_BYTES,
+  budget?: ReadBudget,
+): TranscriptHead | undefined {
+  let transcript: TranscriptFile | undefined;
   try {
+    transcript = new TranscriptFile(transcriptPath);
+    const fd = transcript.getFd();
+    const fileSize = fs.fstatSync(fd).size;
+    const want = Math.min(
+      fileSize,
+      limitBytes,
+      Math.max(0, budget?.remaining ?? limitBytes),
+    );
+    if (!want) return undefined;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, want));
+    const parts: Buffer[] = [];
+    let offset = 0;
+    let length = 0;
+    let complete = false;
+    while (offset < want) {
+      const count = fs.readSync(fd, chunk, 0, Math.min(chunk.length, want - offset), offset);
+      if (!count) break;
+      offset += count;
+      if (budget) budget.remaining -= count;
+      const newline = chunk.subarray(0, count).indexOf(0x0a);
+      const keep = newline < 0 ? count : newline;
+      parts.push(Buffer.from(chunk.subarray(0, keep)));
+      length += keep;
+      if (newline >= 0) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete && offset < fileSize) return undefined;
+    const line = Buffer.concat(parts, length).toString('utf8');
+    if (!line.trim()) return undefined;
     return JSON.parse(line) as TranscriptHead;
   } catch {
     return undefined;
+  } finally {
+    transcript?.close();
   }
 }
 
 export function subagentTranscriptPath(parentTranscriptPath: string, agentId: string): string {
+  return path.join(subagentsDirectory(parentTranscriptPath), `agent-${agentId}.jsonl`);
+}
+
+export function subagentsDirectory(parentTranscriptPath: string): string {
   const projectDir = path.dirname(parentTranscriptPath);
   const sessionId = path.basename(parentTranscriptPath, '.jsonl');
-  return path.join(projectDir, sessionId, 'subagents', `agent-${agentId}.jsonl`);
+  return path.join(projectDir, sessionId, 'subagents');
 }
 
 /** Read the dispatch prompt used to join an id-less lifecycle hook to Agent. */

@@ -38,8 +38,8 @@ export interface ParsedSession {
   turns: ParsedTurn[];
 }
 
-export function parseSessionFd(fd: number): ParsedSession | null {
-  return parseSessionReader(() => readUtf8FromFd(fd));
+export function parseSessionFd(fd: number, maxBytes?: number): ParsedSession | null {
+  return parseSessionReader(() => readUtf8FromFd(fd, maxBytes));
 }
 
 function parseSessionReader(read: () => string): ParsedSession | null {
@@ -55,8 +55,12 @@ function parseSessionReader(read: () => string): ParsedSession | null {
   }
 }
 
-function readUtf8FromFd(fd: number): string {
-  const size = fs.fstatSync(fd).size;
+function readUtf8FromFd(fd: number, maxBytes?: number): string {
+  const fileSize = fs.fstatSync(fd).size;
+  if (maxBytes !== undefined && fileSize < maxBytes) {
+    throw new Error('transcript shortened before bounded read');
+  }
+  const size = maxBytes ?? fileSize;
   if (size === 0) return '';
 
   const buffer = Buffer.allocUnsafe(size);
@@ -65,6 +69,9 @@ function readUtf8FromFd(fd: number): string {
     const count = fs.readSync(fd, buffer, bytesRead, size - bytesRead, bytesRead);
     if (count === 0) break;
     bytesRead += count;
+  }
+  if (maxBytes !== undefined && bytesRead !== size) {
+    throw new Error('transcript shortened during bounded read');
   }
   return buffer.toString('utf8', 0, bytesRead);
 }
