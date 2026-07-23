@@ -76,6 +76,7 @@ export class TracedSession {
   readonly cwd: string;
   readonly source: string;
   readonly initialRequestModel?: string;
+  readonly conversation: weave.Conversation;
 
   /** File path → latest loaded contents, preserving first-load order. */
   private readonly systemInstructions = new Map<string, string>();
@@ -83,6 +84,7 @@ export class TracedSession {
   readonly calls = newCallState();
   private currentTurn?: TurnTrace;
   private pendingCompaction?: CompactionAttrs;
+  private endRequested = false;
 
   private constructor(
     options: NewSessionOptions,
@@ -108,8 +110,6 @@ export class TracedSession {
     });
   }
 
-  private readonly conversation: weave.Conversation;
-
   static async create(options: NewSessionOptions): Promise<TracedSession> {
     const conversationId = await resolveConversationId(
       options.sessionId,
@@ -130,10 +130,12 @@ export class TracedSession {
   submitPrompt(
     promptId: string | undefined,
     prompt: string,
+    defer: (call: TracedCall) => boolean = () => false,
   ): { created: boolean; replacedOpenTurn: boolean } {
     if (promptId !== undefined && this.turnForPrompt(promptId)) {
       return { created: false, replacedOpenTurn: false };
     }
+    this.endRequested = false;
 
     const previous = this.currentTurn;
     let responseOffsetFloor: number | undefined;
@@ -142,7 +144,9 @@ export class TracedSession {
         parseSessionFd(this.transcript.getFd()) ?? { turns: [] },
       ).length;
       responseOffsetFloor = previous.responseLimit;
-      if (promptId === undefined || previous.children.size === 0) {
+      if (promptId === undefined) {
+        this.finalizeTurn(previous, 'superseded_by_next_prompt', defer);
+      } else if (previous.children.size === 0) {
         this.finalizeTurn(previous, 'superseded_by_next_prompt');
       }
     }
@@ -184,32 +188,54 @@ export class TracedSession {
     };
   }
 
-  finishAtSessionEnd(promptId: string | undefined): number {
+  finishAtSessionEnd(
+    promptId: string | undefined,
+    defer: (call: TracedCall) => boolean = () => false,
+  ): { turnCount: number; deferred: boolean } {
+    this.endRequested = true;
     const parsed = this.parseTranscript();
     this.reconcileFinalTurn(promptId, parsed);
-    return this.finishTurns('session_ended', parsed, spanCloseTime());
+    const turnCount = this.finishTurns(
+      'session_ended',
+      parsed,
+      spanCloseTime(),
+      defer,
+    );
+    return { turnCount, deferred: this.hasOpenCalls() };
   }
 
-  finishOpenTurns(orphanReason: string): number {
-    return this.finishTurns(orphanReason, this.parseTranscript(), spanCloseTime());
+  finishOpenTurns(
+    orphanReason: string,
+    endTime = spanCloseTime(),
+  ): number {
+    return this.finishTurns(orphanReason, this.parseTranscript(), endTime);
   }
 
   private finishTurns(
     orphanReason: string,
     parsed: ParsedSession | null,
     endTime: Date,
+    defer: (call: TracedCall) => boolean = () => false,
   ): number {
     const turnCount = this.turns.size;
     for (const turn of [...this.turns]) {
       this.recordFinalTurnOutput(turn, orphanReason, parsed);
-      this.closeTurn(turn, orphanReason, endTime);
+      this.closeTurn(turn, orphanReason, endTime, defer);
     }
     return turnCount;
   }
 
   hasInFlightWork(): boolean {
-    return [...this.turns].some(turn => turn.children.size > 0)
+    return this.hasOpenCalls()
       || [...this.turns].some(turn => turn.phase === 'active');
+  }
+
+  completeDeferredEnd(): boolean {
+    this.finishSupersededTurns();
+    if (!this.endRequested || this.hasOpenCalls()) return false;
+    const endTime = spanCloseTime();
+    for (const turn of [...this.turns]) this.endTurn(turn, endTime);
+    return true;
   }
 
   close(): void {
@@ -368,12 +394,17 @@ export class TracedSession {
     });
   }
 
-  private finalizeTurn(turn: TurnTrace, orphanReason: string): void {
+  private finalizeTurn(
+    turn: TurnTrace,
+    orphanReason: string,
+    defer: (call: TracedCall) => boolean = () => false,
+  ): void {
     this.recordFinalTurnOutput(turn, orphanReason, this.parseTranscript());
     this.closeTurn(
       turn,
       orphanReason,
       turn.children.size ? spanCloseTime() : undefined,
+      defer,
     );
   }
 
@@ -381,15 +412,22 @@ export class TracedSession {
     turn: TurnTrace,
     orphanReason: string,
     endTime?: Date,
+    defer: (call: TracedCall) => boolean = () => false,
   ): void {
     for (const toolUseId of finalizeOpenCalls(
       this.calls,
       [turn],
       orphanReason,
       endTime,
+      defer,
     )) {
       this.log('DEBUG', `Closed pending call: ${toolUseId}`);
     }
+    if (turn.children.size) return;
+    this.endTurn(turn, endTime);
+  }
+
+  private endTurn(turn: TurnTrace, endTime?: Date): void {
     turn.span.end(endTime ? { endTime } : undefined);
     this.turns.delete(turn);
     if (this.currentTurn === turn) this.currentTurn = undefined;
@@ -401,6 +439,10 @@ export class TracedSession {
         this.finalizeTurn(turn, 'superseded_by_next_prompt');
       }
     }
+  }
+
+  private hasOpenCalls(): boolean {
+    return [...this.turns].some(turn => turn.children.size > 0);
   }
 
   private parseTranscript(): ParsedSession | null {
