@@ -47,7 +47,8 @@ function parseSessionReader(read: () => string): ParsedSession | null {
     const lines = read()
       .split('\n')
       .filter(line => line.trim())
-      .map(line => JSON.parse(line) as unknown);
+      .map(line => decodeTranscriptLine(JSON.parse(line) as unknown))
+      .filter((line): line is TranscriptLine => line !== undefined);
     return buildSession(lines);
   } catch {
     return null;
@@ -68,34 +69,46 @@ function readUtf8FromFd(fd: number): string {
   return buffer.toString('utf8', 0, bytesRead);
 }
 
+type JsonRecord = Record<string, unknown>;
+
 type TranscriptLine = {
-  message?: Record<string, unknown>;
-  type?: string;
+  raw: JsonRecord;
+  message?: JsonRecord;
   role?: string;
   timestamp?: string;
 };
 
 type AssistantLine = {
-  line: Record<string, unknown>;
   previousTimestamp?: string;
+  timestamp?: string;
+  id?: string;
+  model?: string;
+  usage: UsageSummary;
+  reasoningTokens?: number;
+  content: unknown[];
+  finishReason?: string;
 };
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function readTranscriptLine(value: unknown): TranscriptLine {
-  if (!isObject(value)) return {};
-  const message = isObject(value['message']) ? value['message'] : undefined;
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function decodeTranscriptLine(value: unknown): TranscriptLine | undefined {
+  if (!isRecord(value)) return undefined;
+  const message = isRecord(value['message']) ? value['message'] : undefined;
   return {
+    raw: value,
     message,
-    type: typeof value['type'] === 'string' ? value['type'] : undefined,
-    role: typeof message?.['role'] === 'string' ? message['role'] : undefined,
-    timestamp: typeof value['timestamp'] === 'string' ? value['timestamp'] : undefined,
+    role: readString(message?.['role']) ?? readString(value['type']),
+    timestamp: readString(value['timestamp']),
   };
 }
 
-function buildSession(lines: unknown[]): ParsedSession {
+function buildSession(lines: TranscriptLine[]): ParsedSession {
   const turns: ParsedTurn[] = [];
   let assistantLines: AssistantLine[] = [];
   let turnStarted = false;
@@ -103,14 +116,12 @@ function buildSession(lines: unknown[]): ParsedSession {
   let turnUserText: string | undefined;
   let previousTimestamp: string | undefined;
 
-  for (const value of lines) {
-    const decoded = readTranscriptLine(value);
-    const role = decoded.role ?? decoded.type;
-
-    if (role === 'assistant' && isObject(value)) {
-      assistantLines.push({ line: value, previousTimestamp });
-    } else if (role === 'user') {
-      const content = decoded.message?.['content'];
+  for (const line of lines) {
+    const assistant = decodeAssistantLine(line, previousTimestamp);
+    if (assistant) {
+      assistantLines.push(assistant);
+    } else if (line.role === 'user') {
+      const content = line.message?.['content'];
       // Typed prompts are bare strings. Array-form user content is injected
       // context (tool results, skills, reminders), so it stays in this turn.
       if (typeof content === 'string' && content) {
@@ -119,12 +130,12 @@ function buildSession(lines: unknown[]): ParsedSession {
         }
         assistantLines = [];
         turnStarted = true;
-        turnStartTime = decoded.timestamp;
+        turnStartTime = line.timestamp;
         turnUserText = content;
       }
     }
 
-    if (decoded.timestamp) previousTimestamp = decoded.timestamp;
+    if (line.timestamp) previousTimestamp = line.timestamp;
   }
 
   if (turnStarted || assistantLines.length > 0) {
@@ -134,7 +145,7 @@ function buildSession(lines: unknown[]): ParsedSession {
 }
 
 function readUsage(value: unknown): Record<string, number> {
-  if (!isObject(value)) return {};
+  if (!isRecord(value)) return {};
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
   );
@@ -149,6 +160,34 @@ function toUsage(raw: Record<string, number>): UsageSummary {
   };
 }
 
+function normalizeContent(value: unknown): unknown[] {
+  return Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? [{ type: 'text', text: value }]
+      : [];
+}
+
+function decodeAssistantLine(
+  line: TranscriptLine,
+  previousTimestamp?: string,
+): AssistantLine | undefined {
+  if (line.role !== 'assistant') return undefined;
+
+  const { raw, message } = line;
+  const rawUsage = readUsage(message?.['usage'] ?? raw['usage']);
+  return {
+    previousTimestamp,
+    timestamp: line.timestamp,
+    id: readString(message?.['id'] ?? raw['id']),
+    model: readString(message?.['model'] ?? raw['model']),
+    usage: toUsage(rawUsage),
+    reasoningTokens: rawUsage['reasoning_tokens'],
+    content: normalizeContent(message?.['content']),
+    finishReason: readString(message?.['stop_reason'] ?? message?.['finish_reason']),
+  };
+}
+
 function buildTurn(
   lines: AssistantLine[],
   startTime?: string,
@@ -156,43 +195,27 @@ function buildTurn(
 ): ParsedTurn {
   const responses: AssistantResponse[] = [];
 
-  for (const { line, previousTimestamp } of lines) {
-    const { message, timestamp } = readTranscriptLine(line);
-    const rawUsage = readUsage(message?.['usage'] ?? line['usage']);
-    const rawContent = message?.['content'];
-    const content = Array.isArray(rawContent)
-      ? rawContent
-      : typeof rawContent === 'string'
-        ? [{ type: 'text', text: rawContent }]
-        : [];
-    const idValue = message?.['id'] ?? line['id'];
-    const modelValue = message?.['model'] ?? line['model'];
-    const finishValue = message?.['stop_reason'] ?? message?.['finish_reason'];
-    const id = typeof idValue === 'string' ? idValue : undefined;
-    const model = typeof modelValue === 'string' ? modelValue : undefined;
-    const finishReason = typeof finishValue === 'string' ? finishValue : undefined;
-    const reasoningTokens = rawUsage['reasoning_tokens'];
-
+  for (const line of lines) {
     const previous = responses.at(-1);
-    if (id && previous?.id === id) {
-      previous.content.push(...content);
-      previous.endTime = timestamp;
-      previous.usage = toUsage(rawUsage);
-      previous.reasoningTokens = reasoningTokens ?? previous.reasoningTokens;
-      previous.model = model ?? previous.model;
-      previous.finishReason = finishReason ?? previous.finishReason;
+    if (line.id && previous?.id === line.id) {
+      previous.content.push(...line.content);
+      previous.endTime = line.timestamp;
+      previous.usage = line.usage;
+      previous.reasoningTokens = line.reasoningTokens ?? previous.reasoningTokens;
+      previous.model = line.model ?? previous.model;
+      previous.finishReason = line.finishReason ?? previous.finishReason;
       continue;
     }
 
     responses.push({
-      startTime: previousTimestamp,
-      endTime: timestamp,
-      model,
-      usage: toUsage(rawUsage),
-      reasoningTokens,
-      content,
-      id,
-      finishReason,
+      startTime: line.previousTimestamp,
+      endTime: line.timestamp,
+      model: line.model,
+      usage: line.usage,
+      reasoningTokens: line.reasoningTokens,
+      content: line.content,
+      id: line.id,
+      finishReason: line.finishReason,
     });
   }
 
@@ -236,19 +259,19 @@ type ToolUseBlock = Pick<AnthropicToolUseBlock, 'type' | 'id' | 'name'>
   & Partial<Pick<AnthropicToolUseBlock, 'input'>>;
 
 export function isTextBlock(block: unknown): block is TextBlock {
-  return isObject(block) && block['type'] === 'text' && typeof block['text'] === 'string';
+  return isRecord(block) && block['type'] === 'text' && typeof block['text'] === 'string';
 }
 
 export function isThinkingBlock(block: unknown): block is ThinkingBlock {
-  return isObject(block) && block['type'] === 'thinking' && typeof block['thinking'] === 'string';
+  return isRecord(block) && block['type'] === 'thinking' && typeof block['thinking'] === 'string';
 }
 
 export function isRedactedThinkingBlock(block: unknown): block is RedactedThinkingBlock {
-  return isObject(block) && block['type'] === 'redacted_thinking';
+  return isRecord(block) && block['type'] === 'redacted_thinking';
 }
 
 export function isToolUseBlock(block: unknown): block is ToolUseBlock {
-  return isObject(block)
+  return isRecord(block)
     && block['type'] === 'tool_use'
     && typeof block['id'] === 'string'
     && typeof block['name'] === 'string';

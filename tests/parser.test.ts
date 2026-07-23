@@ -178,3 +178,76 @@ test('folds only consecutive assistant lines with the same response id', () => {
     ['shared', 'other', 'shared', undefined, undefined],
   );
 });
+
+test('narrows transcript records while preserving top-level assistant fallbacks', () => {
+  const session = parseLines([
+    null,
+    [],
+    'ignored',
+    7,
+    {
+      type: 'user',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'go' },
+    },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: [],
+      id: 'top-level-id',
+      model: 'top-level-model',
+      usage: {
+        input_tokens: 3,
+        output_tokens: 4,
+        reasoning_tokens: 2,
+        ignored: 'not-a-number',
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'assistant',
+        id: 42,
+        model: false,
+        usage: { input_tokens: 'invalid', output_tokens: 5 },
+        content: 42,
+        stop_reason: 42,
+      },
+    },
+  ]);
+
+  assert.equal(session.turns.length, 1);
+  assert.deepEqual(session.turns[0].responses, [
+    {
+      startTime: '2026-01-01T00:00:00.000Z',
+      endTime: '2026-01-01T00:00:01.000Z',
+      model: 'top-level-model',
+      usage: {
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_read_input_tokens: undefined,
+        cache_creation_input_tokens: undefined,
+      },
+      reasoningTokens: 2,
+      content: [],
+      id: 'top-level-id',
+      finishReason: undefined,
+    },
+    {
+      startTime: '2026-01-01T00:00:01.000Z',
+      endTime: '2026-01-01T00:00:02.000Z',
+      model: undefined,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 5,
+        cache_read_input_tokens: undefined,
+        cache_creation_input_tokens: undefined,
+      },
+      reasoningTokens: undefined,
+      content: [],
+      id: undefined,
+      finishReason: undefined,
+    },
+  ]);
+});
