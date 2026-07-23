@@ -38,7 +38,7 @@ export type SessionState = {
   currentTurn?: TurnTrace;
   turnsByPromptId: Map<string, TurnTrace>;
 
-  /** Open ordinary tool calls, keyed by Claude's protocol identity. */
+  /** One state machine owns ordinary tools and Agent lifecycle identities. */
   calls: CallState;
 
   /** Compaction attrs buffered while no turn span is open. */

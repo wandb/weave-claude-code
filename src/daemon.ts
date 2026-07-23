@@ -30,7 +30,12 @@ import {
   lastAssistantTextEndsWith,
   parseSessionFd,
 } from './parser.js';
-import { TranscriptFile, readFirstTranscriptLine } from './transcriptFile.js';
+import {
+  TranscriptFile,
+  readFirstTranscriptLine,
+  readSubagentPrompt,
+  subagentTranscriptPath,
+} from './transcriptFile.js';
 import {
   ATTR,
   CompactionAttrs,
@@ -39,6 +44,7 @@ import {
   parseTimestamp,
   snippet,
 } from './genaiSpans.js';
+import type { SpanParent } from './genaiSpans.js';
 import { resolveDaemonConfig, daemonConfigFingerprint, missingConfig } from './config.js';
 import type { DaemonConfig } from './config.js';
 import { emitChatSpans } from './chatSpans.js';
@@ -46,11 +52,14 @@ import { newSessionState, turnForPrompt } from './sessionState.js';
 import type { SessionState, TurnTrace } from './sessionState.js';
 import {
   beginCall,
+  bindAgent,
   finalizeOpenCalls,
+  matchAgent,
   openCalls,
+  recordAgentStop,
   settleCall,
 } from './callSpans.js';
-import type { CallOutcome } from './callSpans.js';
+import type { AgentMatch, CallOutcome } from './callSpans.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -705,32 +714,59 @@ export class GlobalDaemon {
   }
 
   private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
-    if (input.tool_name === 'Agent' || input.agent_id) return;
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) return;
+    if (!input.agent_id && !turnForPrompt(session, input.prompt_id)) {
+      this.ensureTurn(session, input.prompt_id);
+    }
 
-    const turn = this.ensureTurn(session, input.prompt_id);
-    const call = beginCall(session.calls, turn.span, {
+    const resolved = this.resolveCallParent(session, input.agent_id, input.prompt_id);
+    if (!resolved) {
+      this.log(
+        'ERROR',
+        `PreToolUse: unknown parent session=${sessionId} tool=${input.tool_name} agent=${input.agent_id ?? 'root'}`,
+      );
+      return;
+    }
+    const call = beginCall(session.calls, resolved.parent, {
       toolUseId: input.tool_use_id,
       toolName: input.tool_name,
       toolInput: this.asRecord(input.tool_input),
-      promptId: turn.promptId,
+      promptId: resolved.promptId,
     });
-    if (call) turn.phase = 'active';
+    if (call && !input.agent_id) {
+      const turn = turnForPrompt(session, input.prompt_id);
+      if (turn) turn.phase = 'active';
+    }
   }
 
-  /** Recreate a tool span when its exact terminal hook is the first event
-   * observed after a daemon restart. */
+  private resolveCallParent(
+    session: SessionState,
+    agentId: string | undefined,
+    promptId: string | undefined,
+  ): { parent: SpanParent; promptId?: string } | undefined {
+    if (agentId) {
+      const agent = session.calls.byAgentId.get(agentId);
+      return agent ? { parent: agent.span, promptId: agent.promptId } : undefined;
+    }
+    const turn = turnForPrompt(session, promptId);
+    return turn ? { parent: turn.span, promptId: turn.promptId } : undefined;
+  }
+
+  /** Recreate a call from its exact tool_use_id after a restart. */
   private recoverCall(session: SessionState, input: PostToolResultHookInput): void {
     if (session.calls.byToolUseId.has(input.tool_use_id)
-      || session.calls.toolUseTombstones.has(input.tool_use_id)) return;
+      || session.calls.toolUseTombstones.has(input.tool_use_id)
+      || input.tool_name === 'Agent') return;
+    if (!input.agent_id) this.ensureTurn(session, input.prompt_id);
 
-    const turn = this.ensureTurn(session, input.prompt_id);
-    beginCall(session.calls, turn.span, {
+    const resolved = this.resolveCallParent(session, input.agent_id, input.prompt_id);
+    if (!resolved) return;
+    beginCall(session.calls, resolved.parent, {
       toolUseId: input.tool_use_id,
       toolName: input.tool_name,
       toolInput: this.asRecord(input.tool_input),
-      promptId: turn.promptId,
+      promptId: resolved.promptId,
     });
   }
 
@@ -738,7 +774,6 @@ export class GlobalDaemon {
     sessionId: string,
     input: PostToolResultHookInput,
   ): Promise<void> {
-    if (input.tool_name === 'Agent' || input.agent_id) return;
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session || session.calls.toolUseTombstones.has(input.tool_use_id)) return;
 
@@ -756,16 +791,100 @@ export class GlobalDaemon {
     this.log('DEBUG', `PermissionRequest (not yet traced): session=${sessionId} tool=${input.tool_name}`);
   }
 
+  private async correlateAgent(
+    session: SessionState,
+    agentType: string,
+    transcriptPath: string,
+    promptId: string | undefined,
+  ): Promise<AgentMatch> {
+    const prompt = await readSubagentPrompt(transcriptPath);
+    return matchAgent(session.calls, agentType, prompt, promptId);
+  }
+
   private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    this.log('DEBUG', `SubagentStart (not yet traced): session=${sessionId} agent=${input.agent_id}`);
+    const session = await this.getOrReconstructSession(sessionId, input);
+    if (!session || session.calls.byAgentId.has(input.agent_id)) return;
+
+    const transcriptPath = subagentTranscriptPath(
+      session.transcript.resolvedPath,
+      input.agent_id,
+    );
+    const match = await this.correlateAgent(
+      session,
+      input.agent_type,
+      transcriptPath,
+      input.prompt_id,
+    );
+    if (match.kind !== 'found') {
+      this.log(
+        'ERROR',
+        `SubagentStart: unmatched dispatch agentId=${input.agent_id} type=${input.agent_type}`,
+      );
+      return;
+    }
+
+    bindAgent(session.calls, match, input.agent_id, input.agent_type);
+    this.log('INFO', `Subagent started: agentId=${input.agent_id} type=${input.agent_type}`);
+  }
+
+  private emitSubagentTranscript(
+    parent: SpanParent,
+    transcriptPath: string,
+    agentType: string,
+    seen?: Set<string>,
+  ): { model?: string } {
+    let transcript: TranscriptFile | undefined;
+    try {
+      transcript = new TranscriptFile(transcriptPath);
+      const turn = parseSessionFd(transcript.getFd())?.turns.at(-1);
+      if (!turn) return {};
+      emitChatSpans(parent, turn.responses, { agentName: agentType, seen });
+      return { model: turn.model };
+    } catch (error) {
+      this.log('DEBUG', `SubagentStop: could not parse transcript: ${error}`);
+      return {};
+    } finally {
+      transcript?.close();
+    }
   }
 
   private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
     const session = await this.getOrReconstructSession(sessionId, input);
     if (!session) return;
-    this.log('DEBUG', `SubagentStop (not yet traced): session=${sessionId} agent=${input.agent_id}`);
+
+    const transcriptPath = input.agent_transcript_path
+      ?? subagentTranscriptPath(session.transcript.resolvedPath, input.agent_id);
+    const active = session.calls.byAgentId.get(input.agent_id);
+    const match: AgentMatch = active
+      ? { kind: 'found', call: active }
+      : await this.correlateAgent(session, input.agent_type, transcriptPath, input.prompt_id);
+
+    if (match.kind !== 'found') {
+      this.log('ERROR', `SubagentStop: unmatched agentId=${input.agent_id} type=${input.agent_type}`);
+      return;
+    }
+
+    if (!match.call.agentId) {
+      bindAgent(session.calls, match, input.agent_id, input.agent_type);
+      this.log('INFO', `SubagentStop: late-matched agentId=${input.agent_id} type=${input.agent_type}`);
+    }
+
+    const transcript = this.emitSubagentTranscript(
+      match.call.span,
+      transcriptPath,
+      input.agent_type,
+    );
+
+    if (transcript.model) {
+      match.call.span.setAttributes({ [ATTR.RESPONSE_MODEL]: transcript.model });
+    }
+    recordAgentStop(session.calls, match);
+    this.finalizeIdleSupersededTurns(session);
+
+    this.log(
+      'DEBUG',
+      `Subagent stopped: agentId=${input.agent_id} type=${input.agent_type} model=${transcript.model ?? 'unknown'}`,
+    );
   }
 
   private async handleTeammateIdle(sessionId: string, input: TeammateIdleHookInput): Promise<void> {
