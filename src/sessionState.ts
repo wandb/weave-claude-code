@@ -63,10 +63,10 @@ type NewSessionStateOptions = {
 };
 
 export function newSessionState(options: NewSessionStateOptions): SessionState {
-  const version = readFirstTranscriptLine(options.transcript.resolvedPath)?.['version'];
+  const version = readFirstTranscriptLine(options.transcript.resolvedPath)?.version;
   const integrationAttrs = buildIntegrationAttrs({
     version: VERSION,
-    meta: { claude_code_app_version: typeof version === 'string' ? version : undefined },
+    meta: { claude_code_app_version: version },
   });
   const conversation = weave.startConversation({
     conversationId: options.conversationId,

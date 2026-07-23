@@ -454,10 +454,8 @@ export class GlobalDaemon {
       const attempts = depth === 0 ? MAX_HEAD_READ_ATTEMPTS : 1;
       for (let i = 0; i < attempts; i++) {
         const head = readFirstTranscriptLine(currentPath);
-        const ff = head?.['forkedFrom'] as Record<string, unknown> | undefined;
-        const ffId = ff?.['sessionId'];
-        if (typeof ffId === 'string' && ffId) {
-          parent = ffId;
+        if (head?.forkedFrom?.sessionId) {
+          parent = head.forkedFrom.sessionId;
           break;
         }
         if (head !== undefined) break; // head parseable but no fork — root
@@ -561,7 +559,7 @@ export class GlobalDaemon {
   private drainPendingInstructions(session: SessionState): void {
     const pending = this.pendingInstructions.get(session.sessionId);
     this.pendingInstructions.delete(session.sessionId);
-    if (!pending?.size) return;
+    if (!pending) return;
     for (const [filePath, content] of pending) session.systemInstructions.set(filePath, content);
     this.log('DEBUG', `Drained ${pending.size} buffered instruction file(s) into session ${session.sessionId}`);
   }
@@ -680,7 +678,7 @@ export class GlobalDaemon {
 
   private async handlePreToolUse(sessionId: string, input: PreToolUseHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracingEnabled) return;
+    if (!session) return;
     this.log('DEBUG', `PreToolUse (not yet traced): session=${sessionId} tool=${input.tool_name}`);
   }
 
@@ -692,13 +690,13 @@ export class GlobalDaemon {
 
   private async handleSubagentStart(sessionId: string, input: SubagentStartHookInput): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.tracingEnabled) return;
+    if (!session) return;
     this.log('DEBUG', `SubagentStart (not yet traced): session=${sessionId} agent=${input.agent_id}`);
   }
 
   private async handleSubagentStop(sessionId: string, input: SubagentStopHookInput): Promise<void> {
     const session = await this.getOrReconstructSession(sessionId, input);
-    if (!session || !this.tracingEnabled) return;
+    if (!session) return;
     this.log('DEBUG', `SubagentStop (not yet traced): session=${sessionId} agent=${input.agent_id}`);
   }
 
@@ -765,8 +763,7 @@ export class GlobalDaemon {
   private endTurn(session: SessionState, turn: TurnTrace): void {
     turn.span.end();
     session.turns.delete(turn);
-    if (turn.promptId !== undefined
-      && session.turnsByPromptId.get(turn.promptId) === turn) {
+    if (turn.promptId !== undefined) {
       session.turnsByPromptId.delete(turn.promptId);
     }
     if (session.currentTurn === turn) session.currentTurn = undefined;

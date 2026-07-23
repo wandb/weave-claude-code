@@ -9,6 +9,11 @@ import { isPathWithinBase } from './utils.js';
 
 const O_RDONLY_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
 
+export type TranscriptHead = Record<string, unknown> & {
+  version?: string;
+  forkedFrom?: { sessionId: string };
+};
+
 /**
  * Represents a Claude Code transcript file.
  *
@@ -70,7 +75,7 @@ export class TranscriptFile {
  * ancestor transcripts in the fork chain: opens its own fd and closes it
  * before returning.
  */
-export function readFirstTranscriptLine(transcriptPath: string): Record<string, unknown> | undefined {
+export function readFirstTranscriptLine(transcriptPath: string): TranscriptHead | undefined {
   const resolved = path.resolve(transcriptPath);
   if (!isPathWithinBase(resolved, os.homedir())) return undefined;
 
@@ -95,7 +100,7 @@ export function readFirstTranscriptLine(transcriptPath: string): Record<string, 
     const line = nl === -1 ? text : text.slice(0, nl);
     if (!line.trim()) return undefined;
 
-    return JSON.parse(line) as Record<string, unknown>;
+    return JSON.parse(line) as TranscriptHead;
   } catch {
     return undefined;
   } finally {
