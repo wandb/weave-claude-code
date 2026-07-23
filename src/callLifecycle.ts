@@ -52,12 +52,20 @@ export type TracedAgent = CallScope & PermissionContext & {
   agentId?: string;
   outcome?: CallOutcome;
   stopSeen: boolean;
+  /** A protocol-specific terminal event can decide the result before nested
+   * calls have drained. */
+  completion?: AgentCompletion;
   children: Set<TracedCall>;
   /** Chat responses already emitted from this Agent's Stop snapshots. */
   seenResponses: Set<string>;
 };
 
 export type TracedCall = TracedTool | TracedAgent;
+
+type AgentCompletion = (
+  | { outcome: CallOutcome; failureType?: string }
+  | { orphanReason: string }
+) & { endTime?: Date };
 
 /** Secondary indexes for the identities exposed by Claude's hooks. */
 export type CallState = {
@@ -99,7 +107,8 @@ export function beginCall(
   parent: CallParent,
   args: BeginCallArgs,
 ): TracedCall | undefined {
-  if (parent.kind === 'agent' && parent.stopSeen && parent.outcome) return undefined;
+  if (parent.kind === 'agent'
+    && (parent.completion || (parent.stopSeen && parent.outcome))) return undefined;
   if (state.byToolUseId.has(args.toolUseId)
     || state.toolUseTombstones.has(args.toolUseId)) return undefined;
 
@@ -290,10 +299,13 @@ export function denyCall(state: CallState, toolUseId: string, reason: string): v
     call.span.result = reason;
     call.span.setAttributes({ [ATTR.ERROR_TYPE]: 'permission_denied' });
     call.span.end({ error: new Error(reason) });
+    completeCall(state, call);
   } else {
-    finishAgentSpan(call, { kind: 'failure', error: reason }, 'permission_denied');
+    finishAgentCall(state, call, {
+      outcome: { kind: 'failure', error: reason },
+      failureType: 'permission_denied',
+    });
   }
-  completeCall(state, call);
 }
 
 /** Apply the exact tool_use_id terminal event once. */
@@ -312,6 +324,24 @@ export function recordCallOutcome(
   }
   resolvePermission(call, true);
   call.outcome ??= outcome;
+  finishAgentIfReady(state, call);
+}
+
+/** Record an Agent result whose protocol has a later terminal event. */
+export function deferAgentOutcome(call: TracedAgent, outcome: CallOutcome): void {
+  resolvePermission(call, true);
+  call.outcome ??= outcome;
+}
+
+/** Complete an Agent from a protocol-specific terminal event. */
+export function finishAgentCall(
+  state: CallState,
+  call: TracedAgent,
+  completion: { outcome: CallOutcome; failureType?: string } | { orphanReason: string },
+  endTime?: Date,
+): void {
+  if ('outcome' in completion) resolvePermission(call, true);
+  call.completion ??= { ...completion, ...(endTime ? { endTime } : {}) };
   finishAgentIfReady(state, call);
 }
 
@@ -347,6 +377,23 @@ function finishAgentSpan(
   call.span.end({
     error: new Error(typeof outcome.error === 'string' ? outcome.error : 'subagent failed'),
     ...(endTime ? { endTime } : {}),
+  });
+}
+
+function endAgent(call: TracedAgent, completion: AgentCompletion): void {
+  if ('outcome' in completion) {
+    finishAgentSpan(
+      call,
+      completion.outcome,
+      completion.failureType,
+      completion.endTime,
+    );
+    return;
+  }
+  call.span.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: completion.orphanReason });
+  call.span.end({
+    error: new Error(`call did not complete (${completion.orphanReason})`),
+    ...(completion.endTime ? { endTime: completion.endTime } : {}),
   });
 }
 
@@ -410,8 +457,11 @@ export function recordAgentStop(
 }
 
 function finishAgentIfReady(state: CallState, call: TracedAgent): void {
-  if (!call.stopSeen || !call.outcome || call.children.size) return;
-  finishAgentSpan(call, call.outcome);
+  if (call.children.size) return;
+  const completion = call.completion
+    ?? (call.stopSeen && call.outcome ? { outcome: call.outcome } : undefined);
+  if (!completion) return;
+  endAgent(call, completion);
   completeCall(state, call);
 }
 
@@ -441,15 +491,43 @@ export function finalizeOpenCalls(
   roots: Iterable<TurnTrace>,
   reason: string,
   endTime?: Date,
+  defer: (call: TracedCall) => boolean = () => false,
 ): string[] {
   const closed: string[] = [];
+  const finalCompletion = (call: TracedAgent, at?: Date): AgentCompletion => {
+    if (call.completion) {
+      return at && !call.completion.endTime
+        ? { ...call.completion, endTime: at }
+        : call.completion;
+    }
+    if (call.outcome) {
+      return { outcome: call.outcome, ...(at ? { endTime: at } : {}) };
+    }
+    if (!call.toolUseId && call.stopSeen) {
+      return {
+        outcome: { kind: 'success', value: undefined },
+        ...(at ? { endTime: at } : {}),
+      };
+    }
+    return { orphanReason: reason, ...(at ? { endTime: at } : {}) };
+  };
+  const awaitChildren = (completion: AgentCompletion): AgentCompletion =>
+    'outcome' in completion
+      ? {
+        outcome: completion.outcome,
+        ...(completion.failureType ? { failureType: completion.failureType } : {}),
+      }
+      : { orphanReason: completion.orphanReason };
   const closeChildren = (parent: CallParent) => {
     for (const call of [...parent.children].reverse()) {
       if (call.kind === 'agent') closeChildren(call);
-      if (call.kind === 'agent' && call.outcome) {
-        finishAgentSpan(call, call.outcome, undefined, endTime);
-      } else if (call.kind === 'agent' && !call.toolUseId && call.stopSeen) {
-        call.span.end(endTime ? { endTime } : undefined);
+      if (defer(call)) continue;
+      if (call.kind === 'agent' && call.children.size) {
+        call.completion = awaitChildren(finalCompletion(call));
+        continue;
+      }
+      if (call.kind === 'agent') {
+        endAgent(call, finalCompletion(call, endTime));
       } else {
         call.span.setAttributes({ [ATTR.WEAVE_ORPHAN_REASON]: reason });
         call.span.end({
