@@ -16,9 +16,9 @@
     "setup-hooks": "node scripts/install-git-hooks.mjs"
   },
   "dependencies": {
+    "@coreweave/forge-sdk": "file:.context/coreweave-forge-sdk-0.1.0.tgz",
     "@opentelemetry/api": "^1.9.1",
-    "uuidv7": "1.2.1",
-    "weave": "^0.16.6"
+    "uuidv7": "1.2.1"
   },
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.178",
@@ -28,7 +28,7 @@
     "typescript": "^6.0.2"
   },
   "engines": {
-    "node": ">=18.19.0"
+    "node": "^18.19.0 || >=20.6.0"
   },
   "files": [
     "dist/",

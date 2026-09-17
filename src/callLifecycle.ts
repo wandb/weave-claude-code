@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-import type { SubAgent, Tool } from 'weave';
+import type { SubAgent, Tool } from '@coreweave/forge-sdk/agentlens/tracing';
 import {
   ATTR,
   addPermissionRequestEvent,

@@ -20,9 +20,9 @@ test('contentBlocksToParts: interleaved text and tool_use map to ordered parts',
 
   assert.deepEqual(parts, [
     { type: 'text', content: 'Now let me add the method' },
-    { type: 'tool_call', toolCallId: 'toolu_01', toolName: 'Edit', arguments: '{"file_path":"/foo.ts"}' },
+    { type: 'tool_call', id: 'toolu_01', name: 'Edit', arguments: '{"file_path":"/foo.ts"}' },
     { type: 'text', content: 'Now let me add the test' },
-    { type: 'tool_call', toolCallId: 'toolu_02', toolName: 'Edit', arguments: '{"file_path":"/foo.test.ts"}' },
+    { type: 'tool_call', id: 'toolu_02', name: 'Edit', arguments: '{"file_path":"/foo.test.ts"}' },
     { type: 'text', content: 'All done' },
   ]);
 });

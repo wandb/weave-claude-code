@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Attributes } from '@opentelemetry/api';
-import * as weave from 'weave';
+import * as tracing from '@coreweave/forge-sdk/agentlens/tracing';
 import { emitChatSpans } from './chatSpans.js';
 import {
   ATTR,
@@ -37,7 +37,7 @@ function spanCloseTime(): Date {
 
 export type TurnTrace = {
   kind: 'turn';
-  span: weave.Turn;
+  span: tracing.Turn;
   promptId?: string;
   userText?: string;
   /** A Stop snapshot is quiescent but remains reopenable because hooks block. */
@@ -87,7 +87,7 @@ export class Session {
   readonly cwd: string;
   readonly source: string;
   readonly initialRequestModel?: string;
-  readonly conversation: weave.Conversation;
+  readonly conversation: tracing.Conversation;
 
   /** File path → latest loaded contents, preserving first-load order. */
   private readonly systemInstructions = new Map<string, string>();
@@ -115,7 +115,7 @@ export class Session {
       version: VERSION,
       meta: { claude_code_app_version: version },
     });
-    this.conversation = weave.startConversation({
+    this.conversation = tracing.startConversation({
       conversationId,
       agentName: options.agentName,
       attributes: { ...integrationAttrs, [ATTR.WEAVE_PLUGIN_VERSION]: VERSION },

@@ -67,8 +67,8 @@ test('emits each normalized response once without regrouping its content', () =>
         { type: 'text', content: 'editing' },
         {
           type: 'tool_call',
-          toolCallId: 'tool-1',
-          toolName: 'Edit',
+          id: 'tool-1',
+          name: 'Edit',
           arguments: '{"file_path":"/x"}',
         },
       ],

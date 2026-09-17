@@ -118,6 +118,10 @@ test('Stop snapshots only new normalized responses and SessionEnd closes the roo
   await flushWeave();
 
   const spans = exporter.getFinishedSpans();
+  for (const span of spans) {
+    assert.equal(span.attributes['weave.source'], 'forge-integration');
+    assert.equal(span.resource.attributes['weave.sdk.name'], 'forge');
+  }
   const [turn] = turns(spans);
   const responseSpans = chats(spans);
   assert.ok(turn);
