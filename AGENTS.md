@@ -47,9 +47,11 @@ Three request-shape traps that produce believable but wrong conclusions:
   (`gen_ai.tool.call.arguments.command`). Do not infer the wire format from a
   flattened view.
 
+Here `tracing` is imported from `@coreweave/forge-sdk/agentlens/tracing`.
+
 For an end-to-end check, drive the real `Daemon` with the real OTLP exporter
-(`weave.init(project)` with no span-processor override), route synthetic hook
-events through `routeEvent`, `await weave.flushOTel()`, then read the spans back
+(`tracing.init(project)` with no span-processor override), route synthetic hook
+events through `routeEvent`, `await tracing.forceFlush()`, then read the spans back
 with the query above. `tests/helpers.ts` has the in-memory equivalent for unit
 tests.
 

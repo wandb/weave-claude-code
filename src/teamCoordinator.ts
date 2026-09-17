@@ -3,7 +3,7 @@
 // SPDX-PackageName: weave-claude-code
 
 import * as path from 'path';
-import type * as weave from 'weave';
+import type * as tracing from '@coreweave/forge-sdk/agentlens/tracing';
 import { deferAgentOutcome, denyCall, finishAgentCall } from './callLifecycle.js';
 import type { ToolResult, TracedAgent } from './callLifecycle.js';
 import { emitChatSpans } from './chatSpans.js';
@@ -100,7 +100,7 @@ function transcriptFor(
   return hook ? { path: hook, strong: false } : undefined;
 }
 function emitTeammate(
-  conversation: weave.Conversation, memberName: string, turns: ParsedTurn[],
+  conversation: tracing.Conversation, memberName: string, turns: ParsedTurn[],
 ): { model?: string; text?: string } {
   const responses = turns.flatMap(turn => turn.responses);
   const model = turns.filter(turn => turn.model).at(-1)?.model;

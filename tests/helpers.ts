@@ -10,7 +10,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import * as weave from 'weave';
+import * as tracing from '@coreweave/forge-sdk/agentlens/tracing';
 
 import { MARKETPLACE_NAME, type Settings } from '../src/setup.ts';
 import { Daemon } from '../src/daemon.ts';
@@ -99,15 +99,14 @@ let genaiExporter: InMemorySpanExporter | undefined;
 
 export async function initWeaveInMemory(): Promise<InMemorySpanExporter> {
   if (!genaiExporter) {
-    // weave.init requires credentials even with an in-memory exporter.
     const settings: Settings = {
       log_file: '', daemon_socket: '', weave_project: 'e/p', wandb_api_key: 'fake-key-for-test',
       agent_name: null, debug: false, installed_at: '', version: '0.0.0-test',
     };
     process.env.WANDB_API_KEY = resolveApiKey(settings).value ?? '';
     genaiExporter = new InMemorySpanExporter();
-    await weave.init(resolveProject(settings).value ?? 'e/p', {
-      genai: { spanProcessor: new SimpleSpanProcessor(genaiExporter) },
+    await tracing.init(resolveProject(settings).value ?? 'e/p', {
+      spanProcessor: new SimpleSpanProcessor(genaiExporter),
     });
   }
   return genaiExporter;
@@ -217,7 +216,7 @@ export function transcriptAssistantLine(
 }
 
 export function flushWeave(): Promise<void> {
-  return weave.flushOTel();
+  return tracing.flushOTel();
 }
 
 /** Support both current and older OTel parent-span fields. */
@@ -294,7 +293,10 @@ export async function startTestDaemon(
   );
 
   const proc = spawn(process.execPath, ['--import', 'tsx', CLI, 'daemon'], {
-    env: { ...process.env, HOME: home, WANDB_BASE_URL: 'http://127.0.0.1:1', ...opts.env },
+    env: {
+      ...process.env, HOME: home, WANDB_BASE_URL: 'http://127.0.0.1:1',
+      OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '1000', ...opts.env,
+    },
     stdio: 'ignore',
   });
   let exited = false;

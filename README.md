@@ -7,6 +7,13 @@
 
 Track Claude Code sessions in [Weave](https://wandb.ai/) for observability and debugging. Every session, turn, tool call, and subagent is automatically logged as a structured trace — no code changes required.
 
+## Tracing SDK
+
+Tracing uses `@coreweave/forge-sdk/agentlens/tracing`. Every emitted span carries
+`weave.source = forge-integration`, plus the existing integration name, version,
+and host metadata. CLI commands, settings, and environment variables are unchanged.
+Forge reports `weave.sdk.name = forge` on the OTLP resource.
+
 ## Quick Start
 
 **1. Install the CLI**

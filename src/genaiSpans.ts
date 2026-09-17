@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-PackageName: weave-claude-code
 
-// Attribute-key constants and formatting helpers typed against the `weave` SDK.
+// Attribute-key constants and formatting helpers typed against the Forge SDK.
 
 import type { Attributes } from '@opentelemetry/api';
-import type { MessagePart, SubAgent, Tool, Turn, Usage } from 'weave';
+import type { MessagePart, SubAgent, Tool, Turn, Usage } from '@coreweave/forge-sdk/agentlens/tracing';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
 import type { UsageSummary } from './parser.js';
 
@@ -127,6 +127,7 @@ export function buildIntegrationAttrs(args: {
   meta?: Record<string, string | undefined>;
 }): Attributes {
   const attrs: Attributes = {
+    'weave.source': 'forge-integration',
     [ATTR.WEAVE_INTEGRATION_NAME]: INTEGRATION_NAME,
     [ATTR.WEAVE_INTEGRATION_VERSION]: args.version,
   };
@@ -153,8 +154,8 @@ export function contentBlocksToParts(blocks: unknown[]): MessagePart[] {
     } else if (isToolUseBlock(block)) {
       parts.push({
         type: 'tool_call',
-        toolCallId: block.id,
-        toolName: block.name,
+        id: block.id,
+        name: block.name,
         arguments: jsonStr(block.input),
       });
     }
@@ -162,7 +163,7 @@ export function contentBlocksToParts(blocks: unknown[]): MessagePart[] {
   return parts;
 }
 
-/** Anthropic usage → `weave.Usage`. OTel inputTokens is the TOTAL prompt, so sum
+/** Anthropic usage → `Usage`. OTel inputTokens is the TOTAL prompt, so sum
  *  Anthropic's three disjoint fields (uncached + cache_read + cache_creation).
  *  https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md */
 export function buildUsage(usage: UsageSummary, reasoningTokens?: number): Usage {

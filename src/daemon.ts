@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import { diag, DiagLogLevel } from '@opentelemetry/api';
-import * as weave from 'weave';
+import * as tracing from '@coreweave/forge-sdk/agentlens/tracing';
 import {
   daemonConfigFingerprint,
   missingConfig,
@@ -212,9 +212,6 @@ export class Daemon {
       );
     }
 
-    process.env['WF_TRACE_SERVER_URL'] = this.config.baseUrl;
-    process.env['WANDB_API_KEY'] = this.config.apiKey;
-
     const otelDiag = (message: string, ...args: unknown[]) => {
       const line = `otel: ${message}${args.length ? ` ${args.map(String).join(' ')}` : ''}`;
       this.exportHealth.record(line);
@@ -231,7 +228,11 @@ export class Daemon {
       DiagLogLevel.WARN,
     );
 
-    await weave.init(this.config.weaveProject);
+    await tracing.init(this.config.weaveProject, {
+      apiKey: this.config.apiKey,
+      baseUrl: this.config.baseUrl,
+      serviceName: 'weave-claude-code',
+    });
     this.tracingEnabled = true;
   }
 
@@ -358,9 +359,9 @@ export class Daemon {
     this.hookHandler.finalizeForShutdown();
     if (this.tracingEnabled) {
       try {
-        await weave.flushOTel();
+        await tracing.flushOTel();
       } catch (err) {
-        const line = `Error flushing Weave SDK: ${err}`;
+        const line = `Error flushing Forge SDK: ${err}`;
         this.exportHealth.record(line);
         this.log('ERROR', line);
       }

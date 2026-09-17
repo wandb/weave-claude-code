@@ -22,7 +22,7 @@ import type {
   TeammateIdleHookInput,
   UserPromptSubmitHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
-import * as weave from 'weave';
+import * as tracing from '@coreweave/forge-sdk/agentlens/tracing';
 import { emitChatSpans } from './chatSpans.js';
 import {
   backfillAgentPrompt,
@@ -193,7 +193,7 @@ export class HookHandler {
       `${input.hook_event_name} session=${sessionId}${input.agent_id ? ` agent=${input.agent_id}` : ''}`,
     );
     try {
-      await weave.runIsolated(() =>
+      await tracing.runIsolated(() =>
         this.dispatchEvent(input, sequence, transcriptSnapshots));
     } catch (err) {
       this.log('ERROR', `Error handling ${input.hook_event_name}: ${err}`);
@@ -1009,8 +1009,10 @@ export class HookHandler {
     for (const session of this.sessions.values()) {
       try {
         const endTime = new Date(Date.now() + 1);
-        this.teams.orphanSession(session.sessionId, 'daemon_shutdown', endTime);
-        session.finishOpenTurns('daemon_shutdown', endTime);
+        tracing.runIsolated(() => {
+          this.teams.orphanSession(session.sessionId, 'daemon_shutdown', endTime);
+          session.finishOpenTurns('daemon_shutdown', endTime);
+        });
       } catch (err) {
         this.log('ERROR', `Error finalizing session ${session.sessionId} at shutdown: ${err}`);
       }
