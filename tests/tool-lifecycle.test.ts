@@ -75,7 +75,7 @@ test('ordinary tool calls are traced once', async (t) => {
   exporter.reset();
   const sessionId = 'ordinary-tool';
   const transcript = makeTranscript(t, sessionId, 'read it');
-  const daemon = makeGenaiDaemon();
+  const daemon = makeGenaiDaemon('root-agent');
 
   await daemon.routeEvent({
     hook_event_name: 'SessionStart', session_id: sessionId,
@@ -106,6 +106,7 @@ test('ordinary tool calls are traced once', async (t) => {
   assert.ok(turn);
   assert.equal(tools[0].attributes['gen_ai.tool.call.id'], 'read-1');
   assert.equal(tools[0].attributes['gen_ai.tool.call.result'], 'contents');
+  assert.equal(tools[0].attributes[ATTR.AGENT_NAME], 'root-agent');
   assert.equal(spanParentId(tools[0]), turn.spanContext().spanId);
 });
 

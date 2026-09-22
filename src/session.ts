@@ -38,6 +38,8 @@ function spanCloseTime(): Date {
 export type TurnTrace = {
   kind: 'turn';
   span: weave.Turn;
+  /** Root `gen_ai.agent.name`; stamped on tool spans parented to this turn. */
+  agentName: string;
   promptId?: string;
   userText?: string;
   /** A Stop snapshot is quiescent but remains reopenable because hooks block. */
@@ -337,6 +339,7 @@ export class Session {
     const turn: TurnTrace = {
       kind: 'turn',
       span,
+      agentName: this.agentName,
       promptId: options.promptId,
       userText: cursor.userText,
       phase: 'active',
