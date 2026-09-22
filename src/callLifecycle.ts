@@ -155,9 +155,8 @@ export function beginCall(
       args: jsonStr(args.input),
       toolCallId: args.toolUseId,
     });
-    if (parent.kind === 'agent') {
-      span.setAttributes({ [ATTR.AGENT_NAME]: parent.agentType });
-    }
+    const agentName = parent.kind === 'agent' ? parent.agentType : parent.agentName;
+    span.setAttributes({ [ATTR.AGENT_NAME]: agentName });
     call = {
       kind: 'tool',
       span,
