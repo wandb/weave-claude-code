@@ -13,10 +13,14 @@ Each of these looks like a bug and is not. Check here before filing one.
   total prompt. The cache fields are also emitted separately as the breakdown,
   which reads like double counting but is not. See the comment and the semconv
   link at the function.
-- **`chat` spans appear only at Stop.** They are emitted from the Stop snapshot
-  via `recordTurnOutput`, so an in-flight turn legitimately has zero of them. A
-  long turn with many assistant messages and no `chat` spans yet is not data
-  loss. Wait for Stop before concluding anything.
+- **A turn's last `chat` span appears only at Stop.** Earlier responses are
+  sent at the next root `PreToolUse` once a later response exists in the
+  transcript (`Session.emitCompletedResponses`). The last response waits:
+  Claude Code runs a tool before writing the response's remaining blocks, and
+  writes lines later than their timestamps, so a response followed by nothing
+  may still grow, and a sent span cannot be amended. The first `chat` span
+  carries the user prompt as `gen_ai.input.messages` (only the prompt, not the
+  full model input) because the root span is exported only when the turn closes.
 - **`status_code: UNSET` on a successful span is correct.** OTel reserves `Ok`
   for explicit developer intent; UNSET is the success default. Failures already
   route through `span.end({ error })`, which sets ERROR plus `error.type`.

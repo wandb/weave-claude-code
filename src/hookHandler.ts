@@ -466,7 +466,10 @@ export class HookHandler {
         );
       }
     }
-    if (call && !input.agent_id) call.root.phase = 'active';
+    if (call && !input.agent_id) {
+      call.root.phase = 'active';
+      session.emitCompletedResponses(call.root);
+    }
   }
 
   /** Resolve a call's owning span. After restart, nested hooks can arrive
