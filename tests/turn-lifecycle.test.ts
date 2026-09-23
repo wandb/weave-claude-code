@@ -142,6 +142,41 @@ test('Stop snapshots only new normalized responses and SessionEnd closes the roo
   assert.equal(responseSpans[0].attributes[ATTR.USAGE_INPUT_TOKENS], 30);
 });
 
+test('the first chat span carries the prompt while Stop retains the root', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('where do traces go'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({
+    hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'where do traces go',
+  });
+  transcript.append(
+    assistantEntry('response-a', 'checking'),
+    assistantEntry('response-b', 'here', { finishReason: 'end_turn' }),
+  );
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await flushWeave();
+
+  const spans = exporter.getFinishedSpans();
+  assert.equal(turns(spans).length, 0);
+  assert.deepEqual(
+    chats(spans).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
+    [
+      ['response-a', JSON.stringify([
+        { role: 'user', parts: [{ type: 'text', content: 'where do traces go' }] },
+      ])],
+      ['response-b', undefined],
+    ],
+  );
+});
+
 test('a newer prompt closes an interrupted root without replaying its response', async (t) => {
   const exporter = await initWeaveInMemory();
   exporter.reset();

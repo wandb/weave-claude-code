@@ -447,6 +447,7 @@ export class Session {
     emitChatSpans(turn.span, responses, {
       agentName: this.agentName,
       seen: turn.seenResponses,
+      userMessage: turn.userText,
     });
 
     const text = responses.flatMap(response => extractAssistantTextBlocks(response.content));

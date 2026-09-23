@@ -16,6 +16,9 @@ type ChatOptions = {
   agentName?: string;
   /** Used by blockable/repeated stop hooks to emit each response once. */
   seen?: Set<string>;
+  /** Recorded on the first response's span: the root turn span is exported
+   * only when the turn closes, so live views need the prompt on a chat span. */
+  userMessage?: string;
 };
 
 function responseKey(response: AssistantResponse, index: number): string {
@@ -42,6 +45,9 @@ export function emitChatSpans(
     });
     const parts = contentBlocksToParts(response.content);
     llm.record({
+      ...(index === 0 && options.userMessage
+        ? { inputMessages: [{ role: 'user', parts: [{ type: 'text', content: options.userMessage }] }] }
+        : {}),
       ...(parts.length ? { outputMessages: [{ role: 'assistant', parts }] } : {}),
       usage: buildUsage(response.usage, response.reasoningTokens),
       outputType: 'text',
