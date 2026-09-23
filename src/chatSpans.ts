@@ -16,8 +16,8 @@ type ChatOptions = {
   agentName?: string;
   /** Used by blockable/repeated stop hooks to emit each response once. */
   seen?: Set<string>;
-  /** Recorded on the first response's span: the root turn span is exported
-   * only when the turn closes, so live views need the prompt on a chat span. */
+  /** Recorded on the turn's first emitted chat span: the root turn span is
+   * exported only when the turn closes, so live views need the prompt here. */
   userMessage?: string;
 };
 
@@ -33,6 +33,8 @@ export function emitChatSpans(
   responses: AssistantResponse[],
   options: ChatOptions = {},
 ): void {
+  // A non-empty `seen` means this turn already emitted the span carrying it.
+  let userMessage = options.seen?.size ? undefined : options.userMessage;
   for (const [index, response] of responses.entries()) {
     const key = responseKey(response, index);
     if (!response.model || options.seen?.has(key)) continue;
@@ -45,8 +47,8 @@ export function emitChatSpans(
     });
     const parts = contentBlocksToParts(response.content);
     llm.record({
-      ...(index === 0 && options.userMessage
-        ? { inputMessages: [{ role: 'user', parts: [{ type: 'text', content: options.userMessage }] }] }
+      ...(userMessage
+        ? { inputMessages: [{ role: 'user', parts: [{ type: 'text', content: userMessage }] }] }
         : {}),
       ...(parts.length ? { outputMessages: [{ role: 'assistant', parts }] } : {}),
       usage: buildUsage(response.usage, response.reasoningTokens),
@@ -57,5 +59,6 @@ export function emitChatSpans(
     if (options.agentName) llm.setAttributes({ [ATTR.AGENT_NAME]: options.agentName });
     llm.end({ endTime: parseTimestamp(response.endTime) ?? new Date() });
     options.seen?.add(key);
+    userMessage = undefined;
   }
 }

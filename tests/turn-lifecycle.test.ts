@@ -177,6 +177,61 @@ test('the first chat span carries the prompt while Stop retains the root', async
   );
 });
 
+test('a mid-turn transcript user line does not copy the prompt onto a replayed chat span', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt-offset-shift';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('hello'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'hello' });
+  transcript.append(assistantEntry('response-a', 'first'));
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  // A plain-string user line starts a new transcript turn without a UserPromptSubmit.
+  transcript.append(
+    userEntry('<task-notification><task-id>a</task-id></task-notification>'),
+    assistantEntry('response-b', 'second'),
+  );
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await daemon.routeEvent({ hook_event_name: 'SessionEnd', session_id: sessionId, reason: 'clear' });
+  await flushWeave();
+
+  const withPrompt = chats(exporter.getFinishedSpans())
+    .filter(span => span.attributes[ATTR.INPUT_MESSAGES] !== undefined)
+    .map(span => span.attributes[ATTR.RESPONSE_ID]);
+  assert.deepEqual(withPrompt, ['response-a']);
+});
+
+test('the prompt skips a first response that has no model', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt-no-model';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('hello'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'hello' });
+  const modelless = assistantEntry('response-a', 'first');
+  delete (modelless.message as Record<string, unknown>).model;
+  transcript.append(modelless, assistantEntry('response-b', 'second'));
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await flushWeave();
+
+  assert.deepEqual(
+    chats(exporter.getFinishedSpans()).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
+    [['response-b', JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'hello' }] }])]],
+  );
+});
+
 test('a newer prompt closes an interrupted root without replaying its response', async (t) => {
   const exporter = await initWeaveInMemory();
   exporter.reset();
