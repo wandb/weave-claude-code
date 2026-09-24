@@ -9,9 +9,9 @@ import * as weave from 'weave';
 import { emitChatSpans } from './chatSpans.js';
 import {
   ATTR,
-  assistantOutputMessages,
   buildIntegrationAttrs,
   parseTimestamp,
+  recordOutput,
   setCompactionAttrs,
 } from './genaiSpans.js';
 import type { CompactionAttrs } from './genaiSpans.js';
@@ -452,7 +452,6 @@ export class Session {
     const text = responses.flatMap(response => extractAssistantTextBlocks(response.content));
     if (!text.length && options.lastMessage) text.push(options.lastMessage);
     const attributes: Attributes = {};
-    if (text.length) attributes[ATTR.OUTPUT_MESSAGES] = assistantOutputMessages(text);
     const finishReasons = responses
       .map(response => response.finishReason)
       .filter((reason): reason is string => Boolean(reason));
@@ -460,8 +459,7 @@ export class Session {
     if (options.orphanReason) attributes[ATTR.WEAVE_ORPHAN_REASON] = options.orphanReason;
     if (Object.keys(attributes).length) turn.span.setAttributes(attributes);
 
-    const model = responses.filter(response => response.model).at(-1)?.model;
-    if (model) turn.span.record({ model });
+    recordOutput(turn.span, text, responses.filter(response => response.model).at(-1)?.model);
   }
 
   private recordFinalTurnOutput(

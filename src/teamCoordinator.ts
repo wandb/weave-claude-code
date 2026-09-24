@@ -7,7 +7,7 @@ import type * as weave from 'weave';
 import { deferAgentOutcome, denyCall, finishAgentCall } from './callLifecycle.js';
 import type { ToolResult, TracedAgent } from './callLifecycle.js';
 import { emitChatSpans } from './chatSpans.js';
-import { ATTR, assistantOutputMessages, parseTimestamp } from './genaiSpans.js';
+import { ATTR, parseTimestamp, recordOutput } from './genaiSpans.js';
 import type { ParsedTurn } from './parser.js';
 import type { Session } from './session.js';
 import { VERSION } from './setup.js';
@@ -111,9 +111,7 @@ function emitTeammate(
   });
   try {
     emitChatSpans(span, responses, { agentName: memberName });
-    const output = turns.flatMap(turn => turn.text);
-    if (output.length) span.setAttributes({ [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages(output) });
-    if (model) span.record({ model });
+    recordOutput(span, turns.flatMap(turn => turn.text), model);
     return { model, text: turns.at(-1)?.text.join('\n') || undefined };
   } finally {
     span.end({ endTime: parseTimestamp(responses.at(-1)?.endTime) ?? new Date() });

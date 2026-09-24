@@ -5,7 +5,7 @@
 // Attribute-key constants and formatting helpers typed against the `weave` SDK.
 
 import type { Attributes } from '@opentelemetry/api';
-import type { MessagePart, SubAgent, Tool, Turn, Usage } from 'weave';
+import type { Message, MessagePart, SubAgent, Tool, Turn, Usage } from 'weave';
 import { isTextBlock, isThinkingBlock, isRedactedThinkingBlock, isToolUseBlock } from './parser.js';
 import type { UsageSummary } from './parser.js';
 
@@ -107,10 +107,20 @@ export function jsonStr(v: unknown): string {
   }
 }
 
-/** `gen_ai.output.messages` JSON for plain assistant text(s), the shape used on
- *  turn and subagent `invoke_agent` spans (chat spans carry parts instead). */
-export function assistantOutputMessages(texts: string[]): string {
-  return jsonStr(texts.map((content) => ({ role: 'assistant', content })));
+function assistantMessages(texts: string[]): Message[] {
+  return texts.map((content) => ({ role: 'assistant', content }));
+}
+
+/** Record assistant text(s) and model onto a turn or subagent `invoke_agent`
+ *  span; the SDK serializes them at `end()` (chat spans carry parts instead).
+ *  Skipped when there is nothing to record, because `record()` warns once the
+ *  span has already ended. */
+export function recordOutput(span: SpanParent, texts: string[], model?: string): void {
+  if (!texts.length && !model) return;
+  span.record({
+    outputMessages: texts.length ? assistantMessages(texts) : undefined,
+    model,
+  });
 }
 
 /** Parse an ISO timestamp; returns undefined for missing or unparseable input. */

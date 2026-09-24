@@ -7,8 +7,8 @@ import {
   ATTR,
   addPermissionRequestEvent,
   addPermissionResolvedEvent,
-  assistantOutputMessages,
   jsonStr,
+  recordOutput,
 } from './genaiSpans.js';
 import type { SpanParent } from './genaiSpans.js';
 import { VERSION } from './setup.js';
@@ -377,7 +377,7 @@ function finishAgentSpan(
   const output = outcome.ok ? outcome.output : outcome.error;
   if (output !== undefined && output !== null && output !== '') {
     const text = typeof output === 'string' ? output : jsonStr(output);
-    call.span.setAttributes({ [ATTR.OUTPUT_MESSAGES]: assistantOutputMessages([text]) });
+    recordOutput(call.span, [text]);
   }
   if (outcome.ok) {
     call.span.end(endTime ? { endTime } : undefined);
