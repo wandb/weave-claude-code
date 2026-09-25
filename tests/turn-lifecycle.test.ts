@@ -220,9 +220,10 @@ test('the prompt skips a first response that has no model', async (t) => {
     transcript_path: transcript.file, source: 'startup', cwd: '/x',
   });
   await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'hello' });
-  const modelless = assistantEntry('response-a', 'first');
-  delete (modelless.message as Record<string, unknown>).model;
-  transcript.append(modelless, assistantEntry('response-b', 'second'));
+  transcript.append(
+    { type: 'assistant', message: { role: 'assistant', id: 'response-a' } },
+    assistantEntry('response-b', 'second'),
+  );
   await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
   await flushWeave();
 
@@ -271,8 +272,6 @@ async function startLiveSession(t: TestContext, sessionId: string) {
   return { exporter, transcript, daemon, preToolUse };
 }
 
-const PROMPT_MESSAGES = JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'list files' }] }]);
-
 test('a response is sent before Stop once the next response starts a tool', async (t) => {
   const { exporter, transcript, daemon, preToolUse } = await startLiveSession(t, 'live-chat-next-response');
   transcript.append(toolUseEntry('response-a', 'tool-1'));
@@ -284,7 +283,7 @@ test('a response is sent before Stop once the next response starts a tool', asyn
   assert.equal(turns(exporter.getFinishedSpans()).length, 0);
   assert.deepEqual(
     chats(exporter.getFinishedSpans()).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
-    [['response-a', PROMPT_MESSAGES]],
+    [['response-a', JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'list files' }] }])]],
   );
 
   transcript.append(toolResultEntry('tool-2'), assistantEntry('response-c', 'done', { finishReason: 'end_turn' }));
@@ -310,10 +309,13 @@ test('a response still streaming parallel tool calls is not sent early', async (
   const [first] = chats(exporter.getFinishedSpans());
   assert.ok(first);
   assert.equal(first.attributes[ATTR.RESPONSE_ID], 'response-a');
-  const toolCallIds = JSON.parse(String(first.attributes[ATTR.OUTPUT_MESSAGES]))[0].parts
-    .filter((part: { type: string }) => part.type === 'tool_call')
-    .map((part: { toolCallId: string }) => part.toolCallId);
-  assert.deepEqual(toolCallIds, ['tool-1', 'tool-2']);
+  assert.equal(first.attributes[ATTR.OUTPUT_MESSAGES], JSON.stringify([{
+    role: 'assistant',
+    parts: [
+      { type: 'tool_call', toolCallId: 'tool-1', toolName: 'Bash', arguments: '{"command":"ls"}' },
+      { type: 'tool_call', toolCallId: 'tool-2', toolName: 'Bash', arguments: '{"command":"ls"}' },
+    ],
+  }]));
 });
 
 test('a newer prompt closes an interrupted root without replaying its response', async (t) => {

@@ -439,9 +439,7 @@ export class Session {
     return assistantResponses(parsed).slice(turn.responseOffset, turn.responseLimit);
   }
 
-  /** Send chat spans before Stop so a live view sees the turn and its prompt.
-   * Only responses followed by a later one: Claude Code runs a tool before
-   * writing the response's remaining blocks, so the last may still grow. */
+  /** The last response waits for Stop: Claude Code may write more of it after running a tool. */
   emitCompletedResponses(turn: TurnTrace): void {
     const parsed = this.parseTranscript();
     if (!parsed) return;
