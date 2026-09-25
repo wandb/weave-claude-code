@@ -18,7 +18,7 @@
         "source": "github",
         "repo": "wandb/weave-claude-code",
         "ref": "v0.2.15",
-        "sha": "6802c447c6ab08b19b641231fc367954ffc48bd9"
+        "sha": "ae5e51e5a14db3553eddb48564b3be0da792bf97"
       },
       "category": "observability"
     }
