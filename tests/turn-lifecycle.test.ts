@@ -142,6 +142,182 @@ test('Stop snapshots only new normalized responses and SessionEnd closes the roo
   assert.equal(responseSpans[0].attributes[ATTR.USAGE_INPUT_TOKENS], 30);
 });
 
+test('the first chat span carries the prompt while Stop retains the root', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('where do traces go'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({
+    hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'where do traces go',
+  });
+  transcript.append(
+    assistantEntry('response-a', 'checking'),
+    assistantEntry('response-b', 'here', { finishReason: 'end_turn' }),
+  );
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await flushWeave();
+
+  const spans = exporter.getFinishedSpans();
+  assert.equal(turns(spans).length, 0);
+  assert.deepEqual(
+    chats(spans).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
+    [
+      ['response-a', JSON.stringify([
+        { role: 'user', parts: [{ type: 'text', content: 'where do traces go' }] },
+      ])],
+      ['response-b', undefined],
+    ],
+  );
+});
+
+test('a mid-turn transcript user line does not copy the prompt onto a replayed chat span', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt-offset-shift';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('hello'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'hello' });
+  transcript.append(assistantEntry('response-a', 'first'));
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  // A plain-string user line starts a new transcript turn without a UserPromptSubmit.
+  transcript.append(
+    userEntry('<task-notification><task-id>a</task-id></task-notification>'),
+    assistantEntry('response-b', 'second'),
+  );
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await daemon.routeEvent({ hook_event_name: 'SessionEnd', session_id: sessionId, reason: 'clear' });
+  await flushWeave();
+
+  const withPrompt = chats(exporter.getFinishedSpans())
+    .filter(span => span.attributes[ATTR.INPUT_MESSAGES] !== undefined)
+    .map(span => span.attributes[ATTR.RESPONSE_ID]);
+  assert.deepEqual(withPrompt, ['response-a']);
+});
+
+test('the prompt skips a first response that has no model', async (t) => {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const sessionId = 'root-live-prompt-no-model';
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('hello'));
+  const daemon = makeGenaiDaemon();
+
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'hello' });
+  transcript.append(
+    { type: 'assistant', message: { role: 'assistant', id: 'response-a' } },
+    assistantEntry('response-b', 'second'),
+  );
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: sessionId });
+  await flushWeave();
+
+  assert.deepEqual(
+    chats(exporter.getFinishedSpans()).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
+    [['response-b', JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'hello' }] }])]],
+  );
+});
+
+function toolUseEntry(id: string, toolUseId: string): Record<string, unknown> {
+  return {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      id,
+      model: 'claude-opus-4-8',
+      usage: { input_tokens: 100, output_tokens: 50 },
+      content: [{ type: 'tool_use', id: toolUseId, name: 'Bash', input: { command: 'ls' } }],
+      stop_reason: 'tool_use',
+    },
+  };
+}
+
+function toolResultEntry(toolUseId: string): Record<string, unknown> {
+  return {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'ok' }] },
+  };
+}
+
+async function startLiveSession(t: TestContext, sessionId: string) {
+  const exporter = await initWeaveInMemory();
+  exporter.reset();
+  const transcript = makeTranscript(t, sessionId);
+  transcript.append(userEntry('list files'));
+  const daemon = makeGenaiDaemon();
+  await daemon.routeEvent({
+    hook_event_name: 'SessionStart', session_id: sessionId,
+    transcript_path: transcript.file, source: 'startup', cwd: '/x',
+  });
+  await daemon.routeEvent({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'list files' });
+  const preToolUse = (toolUseId: string) => daemon.routeEvent({
+    hook_event_name: 'PreToolUse', session_id: sessionId,
+    tool_use_id: toolUseId, tool_name: 'Bash', tool_input: { command: 'ls' },
+  });
+  return { exporter, transcript, daemon, preToolUse };
+}
+
+test('a response is sent before Stop once the next response starts a tool', async (t) => {
+  const { exporter, transcript, daemon, preToolUse } = await startLiveSession(t, 'live-chat-next-response');
+  transcript.append(toolUseEntry('response-a', 'tool-1'));
+  await preToolUse('tool-1');
+  transcript.append(toolResultEntry('tool-1'), toolUseEntry('response-b', 'tool-2'));
+  await preToolUse('tool-2');
+  await flushWeave();
+
+  assert.equal(turns(exporter.getFinishedSpans()).length, 0);
+  assert.deepEqual(
+    chats(exporter.getFinishedSpans()).map(span => [span.attributes[ATTR.RESPONSE_ID], span.attributes[ATTR.INPUT_MESSAGES]]),
+    [['response-a', JSON.stringify([{ role: 'user', parts: [{ type: 'text', content: 'list files' }] }])]],
+  );
+
+  transcript.append(toolResultEntry('tool-2'), assistantEntry('response-c', 'done', { finishReason: 'end_turn' }));
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: 'live-chat-next-response' });
+  await flushWeave();
+  assert.deepEqual(
+    chats(exporter.getFinishedSpans()).map(span => span.attributes[ATTR.RESPONSE_ID]),
+    ['response-a', 'response-b', 'response-c'],
+  );
+});
+
+test('a response still streaming parallel tool calls is not sent early', async (t) => {
+  const { exporter, transcript, daemon, preToolUse } = await startLiveSession(t, 'live-chat-parallel');
+  // Claude Code runs tool-1 before writing the response's tool-2 block.
+  transcript.append(toolUseEntry('response-a', 'tool-1'));
+  await preToolUse('tool-1');
+  transcript.append(toolResultEntry('tool-1'), toolUseEntry('response-a', 'tool-2'));
+  await preToolUse('tool-2');
+  transcript.append(toolResultEntry('tool-2'), assistantEntry('response-b', 'done', { finishReason: 'end_turn' }));
+  await daemon.routeEvent({ hook_event_name: 'Stop', session_id: 'live-chat-parallel' });
+  await flushWeave();
+
+  const [first] = chats(exporter.getFinishedSpans());
+  assert.ok(first);
+  assert.equal(first.attributes[ATTR.RESPONSE_ID], 'response-a');
+  assert.equal(first.attributes[ATTR.OUTPUT_MESSAGES], JSON.stringify([{
+    role: 'assistant',
+    parts: [
+      { type: 'tool_call', toolCallId: 'tool-1', toolName: 'Bash', arguments: '{"command":"ls"}' },
+      { type: 'tool_call', toolCallId: 'tool-2', toolName: 'Bash', arguments: '{"command":"ls"}' },
+    ],
+  }]));
+});
+
 test('a newer prompt closes an interrupted root without replaying its response', async (t) => {
   const exporter = await initWeaveInMemory();
   exporter.reset();

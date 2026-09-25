@@ -439,6 +439,17 @@ export class Session {
     return assistantResponses(parsed).slice(turn.responseOffset, turn.responseLimit);
   }
 
+  /** The last response waits for Stop: Claude Code may write more of it after running a tool. */
+  emitCompletedResponses(turn: TurnTrace): void {
+    const parsed = this.parseTranscript();
+    if (!parsed) return;
+    emitChatSpans(turn.span, this.responsesForTurn(parsed, turn).slice(0, -1), {
+      agentName: this.agentName,
+      seen: turn.seenResponses,
+      userMessage: turn.userText,
+    });
+  }
+
   private recordTurnOutput(
     turn: TurnTrace,
     responses: AssistantResponse[],
@@ -447,6 +458,7 @@ export class Session {
     emitChatSpans(turn.span, responses, {
       agentName: this.agentName,
       seen: turn.seenResponses,
+      userMessage: turn.userText,
     });
 
     const text = responses.flatMap(response => extractAssistantTextBlocks(response.content));
